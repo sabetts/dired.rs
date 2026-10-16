@@ -13,9 +13,11 @@ directory. Moving around uses Emacs motions; visiting a file opens it in
 a read-only buffer (text files as text, binary files in a hex viewer
 like `hexl-mode`).
 
-Markdown, TOML, and INI files are syntax-highlighted with Emacs' default
-faces (for Markdown, `markdown-mode`; for TOML, `conf-toml-mode`; for INI,
-`conf-mode`).
+Markdown, TOML, and INI/conf files are syntax-highlighted with Emacs'
+default faces (for Markdown, `markdown-mode`; for TOML, `conf-toml-mode`;
+for INI/conf, `conf-mode`). Conf files are chosen by extension (`.ini`,
+`.conf`, `.cfg`, `.cf`) and, like Emacs, by name — so `.git/config` and
+`.gitconfig` are highlighted too.
 
 It clones a shallow subset of Emacs' dired within that scope. I've
 diverged in a few places where it made sense.

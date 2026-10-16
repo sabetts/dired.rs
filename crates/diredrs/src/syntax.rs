@@ -23,15 +23,33 @@ pub enum Lang {
     Ini,
 }
 
-/// The language to highlight a file as, chosen by extension.
+/// Emacs `files.el` matches `*config`, `*.conf`, `*.cfg`, `*.cf` (and a dotted
+/// suffix) by name to `conf-mode`.
+fn conf_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\.?c(?:on)?f(?:i?g)?(?:\.[a-z0-9._-]+)?$").unwrap())
+}
+
+/// The language to highlight a file as, chosen by name/extension.
 pub fn detect(path: &Path) -> Option<Lang> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "md" | "markdown" | "mdown" | "mkd" | "mkdn" => Some(Lang::Markdown),
-        "toml" => Some(Lang::Toml),
-        "ini" => Some(Lang::Ini),
-        _ => None,
+    let name = path.file_name()?.to_str()?;
+    let lower = name.to_ascii_lowercase();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        match ext.to_ascii_lowercase().as_str() {
+            "md" | "markdown" | "mdown" | "mkd" | "mkdn" => return Some(Lang::Markdown),
+            "toml" => return Some(Lang::Toml),
+            "ini" | "cf" | "cfg" | "conf" | "config" => return Some(Lang::Ini),
+            _ => {}
+        }
     }
+    // `~/.gitconfig` (and `*config`/`*.conf`/`*.cfg`/`*.cf`) use conf-mode.
+    // `conf-mode-maybe` defers `.xml` to xml-mode, which we do not highlight.
+    if (lower == "gitconfig" || lower == ".gitconfig" || conf_name_re().is_match(&lower))
+        && !lower.ends_with(".xml")
+    {
+        return Some(Lang::Ini);
+    }
+    None
 }
 
 /// Highlight every line of a file, one styled [`Line`] per input line.
@@ -732,6 +750,38 @@ mod tests {
         assert_eq!(detect(Path::new("c.toml")), Some(Lang::Toml));
         assert_eq!(detect(Path::new("c.INI")), Some(Lang::Ini));
         assert_eq!(detect(Path::new("x.rs")), None);
+    }
+
+    #[test]
+    fn detect_by_name() {
+        // Emacs `files.el` conf-mode associations.
+        assert_eq!(detect(Path::new("/home/u/.git/config")), Some(Lang::Ini));
+        assert_eq!(detect(Path::new("/home/u/.gitconfig")), Some(Lang::Ini));
+        assert_eq!(detect(Path::new("/etc/foo.conf")), Some(Lang::Ini));
+        assert_eq!(detect(Path::new("app.cfg")), Some(Lang::Ini));
+        assert_eq!(detect(Path::new("settings.config")), Some(Lang::Ini));
+        // `.xml` is left alone (conf-mode-maybe defers to xml-mode).
+        assert_eq!(detect(Path::new("config.xml")), None);
+        assert_eq!(detect(Path::new("main.rs")), None);
+    }
+
+    #[test]
+    fn ini_git_config_style() {
+        let f = faces();
+        let lines = hl(
+            Lang::Ini,
+            &[
+                "[core]",
+                "\trepositoryformatversion = 0",
+                "\tbare = false",
+                "[remote \"origin\"]",
+                "\turl = https://example.com/x.git",
+            ],
+        );
+        assert_eq!(style_at(&lines[0], 1), f.r#type); // core
+        assert_eq!(style_at(&lines[1], 1), f.variable); // key after a tab
+        assert_eq!(style_at(&lines[3], 1), f.r#type); // remote "origin"
+        assert_eq!(style_at(&lines[4], 1), f.variable); // url
     }
 
     #[test]
