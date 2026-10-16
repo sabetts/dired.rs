@@ -484,23 +484,40 @@ impl App {
         }
     }
 
-    /// Move point to the first or last file line.
-    fn dired_goto_edge(&mut self, first: bool) {
-        let row = self.current().dired.as_ref().and_then(|d| {
-            if first {
-                d.first_file_row()
-            } else {
-                d.first_file_row().map(|_| d.len() - 1)
+    /// Move to the next (`delta` +1) or previous (-1) directory line (`>` /
+    /// `<`), like Emacs' `dired-next-dirline` / `dired-prev-dirline`. Point
+    /// stays put when there is no such line.
+    fn dired_dir_line(&mut self, delta: isize) {
+        let idx = self.current;
+        let target = {
+            let Some(d) = self.buffers[idx].dired.as_ref() else {
+                return;
+            };
+            let len = d.entries.len() as isize;
+            let row = self.buffers[idx].buffer.point().row;
+            let start = match d.entry_index_at(row) {
+                Some(i) => i as isize + delta,
+                None if delta > 0 => 0,
+                None => len - 1,
+            };
+            let mut r = start;
+            let mut found = None;
+            while r >= 0 && r < len {
+                if d.entries[r as usize].is_dir {
+                    found = Some(r as usize);
+                    break;
+                }
+                r += delta;
             }
-        });
-        if let Some(row) = row {
-            let col = self
-                .current()
-                .dired
-                .as_ref()
-                .and_then(|d| d.filename_col(row))
-                .unwrap_or(0);
-            self.current_mut().buffer.set_point(Pos::new(row, col));
+            found
+        };
+        if let Some(i) = target {
+            let (row, col) = {
+                let d = self.buffers[idx].dired.as_ref().unwrap();
+                let row = d.row_of(i);
+                (row, d.filename_col(row).unwrap_or(0))
+            };
+            self.buffers[idx].buffer.set_point(Pos::new(row, col));
         }
     }
 
@@ -934,11 +951,11 @@ impl App {
                 true
             }
             KeyCode::Char('<') => {
-                self.dired_goto_edge(true);
+                self.dired_dir_line(-1);
                 true
             }
             KeyCode::Char('>') => {
-                self.dired_goto_edge(false);
+                self.dired_dir_line(1);
                 true
             }
             KeyCode::Char('m') => {
@@ -2511,7 +2528,7 @@ fn help_lines() -> Vec<String> {
         "  * .                 mark files by extension",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   cycle sorting: name / date / size",
-        "  < / >               first / last file line",
+        "  < / >               previous / next directory line",
         "",
         "Files and buffers",
         "  C-x C-f        find file (visit a file by path; TAB completes)",
@@ -2893,6 +2910,33 @@ mod tests {
         assert_eq!(app.mode_line_mode(), "Dired by size");
         press(&mut app, 's');
         assert_eq!(app.mode_line_mode(), "Dired by name");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn angle_brackets_move_between_directory_lines() {
+        let dir = temp_dir("dirline");
+        std::fs::create_dir(dir.join("adir")).unwrap();
+        std::fs::create_dir(dir.join("bdir")).unwrap();
+        std::fs::write(dir.join("file.txt"), b"x").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let name_at_point = |app: &App| -> String {
+            let i = app.dired_entry_at_point().unwrap();
+            app.current().dired.as_ref().unwrap().entries[i]
+                .name
+                .clone()
+        };
+        // Sorted by name: adir, bdir, file.txt. Point starts on adir.
+        assert_eq!(name_at_point(&app), "adir");
+        press(&mut app, '>'); // skips file.txt, lands on bdir
+        assert_eq!(name_at_point(&app), "bdir");
+        press(&mut app, '>'); // no further directory line: point stays
+        assert_eq!(name_at_point(&app), "bdir");
+        press(&mut app, '<'); // back to adir
+        assert_eq!(name_at_point(&app), "adir");
 
         std::fs::remove_dir_all(&dir).ok();
     }
