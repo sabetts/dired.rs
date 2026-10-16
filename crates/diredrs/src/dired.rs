@@ -12,10 +12,11 @@ use std::time::SystemTime;
 use chrono::{DateTime, Local};
 
 use crate::buffer::{Line, Span, Style};
+use crate::disk;
 use crate::theme::Theme;
 
-/// Rows occupied by the directory header and the `total` line.
-pub const HEADER_LINES: usize = 2;
+/// Rows occupied by the directory header line.
+pub const HEADER_LINES: usize = 1;
 
 /// How a file is marked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -92,8 +93,6 @@ pub struct Entry {
     pub is_exec: bool,
     /// Where the link points, for `name -> target` rendering.
     pub target: Option<String>,
-    /// 1K blocks, for the `total` line.
-    pub blocks: u64,
     /// Modification time, used to sort by date.
     pub mtime: Option<SystemTime>,
     pub mark: Mark,
@@ -128,6 +127,8 @@ pub struct Dired {
     human_sizes: bool,
     links_width: usize,
     size_width: usize,
+    /// Free space on the directory's filesystem, for the header line.
+    free_space: Option<u64>,
 }
 
 impl Dired {
@@ -166,7 +167,6 @@ impl Dired {
                 is_symlink,
                 is_exec,
                 target,
-                blocks: meta.len().div_ceil(1024),
                 mtime: modified,
                 mark: Mark::None,
             });
@@ -179,6 +179,7 @@ impl Dired {
             human_sizes,
             links_width: 2,
             size_width: 1,
+            free_space: disk::available_space(dir),
         };
         dired.recompute_widths();
         dired.resort();
@@ -229,12 +230,13 @@ impl Dired {
     /// Render the listing as styled lines (header, total, then one per entry).
     pub fn render(&self, theme: &Theme) -> Vec<Line> {
         let mut lines = Vec::with_capacity(self.entries.len() + HEADER_LINES);
-        lines.push(Line::styled(
-            format!("  {}:", self.dir.display()),
-            theme.header,
-        ));
-        let total: u64 = self.entries.iter().map(|e| e.blocks).sum();
-        lines.push(Line::styled(format!("  total {total}"), theme.header));
+        // Like Emacs' default (`dired-free-space` = `first`), the free space
+        // rides on the directory line and there is no separate `total` line.
+        let header = match self.free_space {
+            Some(free) => format!("  {}: ({} available)", self.dir.display(), format_iec(free)),
+            None => format!("  {}:", self.dir.display()),
+        };
+        lines.push(Line::styled(header, theme.header));
         for i in 0..self.entries.len() {
             lines.push(self.render_line(i, theme));
         }
@@ -338,6 +340,25 @@ fn format_size(bytes: u64, human: bool) -> String {
         format!("{value:.1}{}", UNITS[unit])
     } else {
         format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
+/// Format a byte count the way Emacs shows free disk space (an IEC unit with a
+/// space and at most one decimal place): `512 B`, `1 KiB`, `1.5 GiB`,
+/// `658 GiB`.
+fn format_iec(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let frac = value.fract();
+    if value < 10.0 && (0.05..0.95).contains(&frac) {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
     }
 }
 
@@ -482,9 +503,11 @@ mod tests {
         let theme = Theme::for_background(crate::theme::Background::Dark);
         let lines = d.render(&theme);
         assert_eq!(lines.len(), HEADER_LINES + 2);
-        assert!(lines[0].text().ends_with(':'));
-        assert!(lines[1].text().starts_with("  total "));
-        assert!(lines[2].text().contains("alpha.txt"));
+        // Header carries the directory; the file lines follow directly (no
+        // `total` line).
+        assert!(lines[0].text().contains(&dir.display().to_string()));
+        assert!(lines[1].text().contains("alpha.txt"));
+        assert!(lines[2].text().contains("sub"));
         // The name begins right after the head (permissions at column 2).
         assert_eq!(
             d.filename_col(HEADER_LINES).unwrap(),
@@ -558,9 +581,36 @@ mod tests {
         fs::write(dir.join("one"), b"x").unwrap();
         let d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.entry_index_at(0), None);
-        assert_eq!(d.entry_index_at(1), None);
-        assert_eq!(d.entry_index_at(2), Some(0));
-        assert_eq!(d.first_file_row(), Some(2));
+        assert_eq!(d.entry_index_at(1), Some(0));
+        assert_eq!(d.entry_index_at(2), None);
+        assert_eq!(d.first_file_row(), Some(1));
+    }
+
+    #[test]
+    fn header_shows_free_space() {
+        let dir = temp_dir("freespace");
+        fs::write(dir.join("f"), b"x").unwrap();
+        let d = Dired::read(&dir, true, true).unwrap();
+        let theme = Theme::for_background(crate::theme::Background::Dark);
+        let lines = d.render(&theme);
+        // Header plus one file line, no `total` line.
+        assert_eq!(lines.len(), HEADER_LINES + 1);
+        // Availability is environment-dependent; when known it is shown.
+        if d.free_space.is_some() {
+            let first = lines[0].text();
+            assert!(first.contains(&format!("{}:", dir.display())));
+            assert!(first.contains(" available)"), "{first}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn format_iec_units() {
+        assert_eq!(format_iec(512), "512 B");
+        assert_eq!(format_iec(1024), "1 KiB");
+        assert_eq!(format_iec(1587), "1.5 KiB");
+        assert_eq!(format_iec(1024 * 1024 * 1024), "1 GiB");
+        assert_eq!(format_iec(658 * 1024 * 1024 * 1024), "658 GiB");
     }
 
     #[test]

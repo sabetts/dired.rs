@@ -5,6 +5,7 @@ mod app;
 mod buffer;
 mod config;
 mod dired;
+mod disk;
 mod file;
 mod hexl;
 mod input;

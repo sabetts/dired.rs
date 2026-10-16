@@ -2866,8 +2866,8 @@ mod tests {
         let mut app = App::new(Config::default());
         assert!(app.human_sizes);
         app.open_dired(dir.clone());
-        // Row 2 is the first file line.
-        assert!(app.current().buffer.line(2).text().contains("2.0K"));
+        // Row 1 is the first file line (header is row 0).
+        assert!(app.current().buffer.line(1).text().contains("2.0K"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
