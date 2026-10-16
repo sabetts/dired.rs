@@ -208,6 +208,13 @@ impl Buffer {
         self.lines[row].text()
     }
 
+    /// Replace the line at `row` (used to redraw a single listing entry).
+    pub fn set_line(&mut self, row: usize, line: Line) {
+        if row < self.lines.len() {
+            self.lines[row] = line;
+        }
+    }
+
     pub fn last_row(&self) -> usize {
         self.lines.len() - 1
     }

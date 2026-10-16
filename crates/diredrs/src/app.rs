@@ -60,6 +60,18 @@ pub enum Prompt {
         cursor: usize,
         selected: usize,
     },
+    /// A yes/no confirmation in the echo area.
+    Confirm {
+        message: String,
+        action: PendingAction,
+    },
+}
+
+/// A deferred action awaiting confirmation.
+#[derive(Debug, Clone, Copy)]
+pub enum PendingAction {
+    DeleteFlagged,
+    DeleteMarked,
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, or `C-h`).
@@ -457,6 +469,150 @@ impl App {
         self.kill_buffer(idx);
     }
 
+    /// Set the mark of the entry at point and move `advance` file lines.
+    fn dired_set_mark(&mut self, mark: Mark, advance: isize) {
+        let Some(i) = self.dired_entry_at_point() else {
+            self.message = Some("No file on this line".to_string());
+            return;
+        };
+        let idx = self.current;
+        if self.buffers[idx].dired.as_ref().unwrap().entries[i].mark != mark {
+            self.buffers[idx].dired.as_mut().unwrap().entries[i].mark = mark;
+            let theme = self.theme;
+            let row = self.buffers[idx].dired.as_ref().unwrap().row_of(i);
+            let line = self.buffers[idx]
+                .dired
+                .as_ref()
+                .unwrap()
+                .render_line(i, &theme);
+            self.buffers[idx].buffer.set_line(row, line);
+        }
+        if advance != 0 {
+            self.dired_move(advance, 1);
+        }
+    }
+
+    /// Swap `*` marks with unmarked (`t`).
+    fn dired_toggle_marks(&mut self) {
+        let idx = self.current;
+        if let Some(d) = self.buffers[idx].dired.as_mut() {
+            for entry in &mut d.entries {
+                entry.mark = match entry.mark {
+                    Mark::None => Mark::Marked,
+                    Mark::Marked => Mark::None,
+                    Mark::Flagged => Mark::Flagged,
+                };
+            }
+        }
+        self.dired_rebuild(idx);
+    }
+
+    /// Remove every mark (`U`).
+    fn dired_unmark_all(&mut self) {
+        let idx = self.current;
+        if let Some(d) = self.buffers[idx].dired.as_mut() {
+            for entry in &mut d.entries {
+                entry.mark = Mark::None;
+            }
+        }
+        self.dired_rebuild(idx);
+    }
+
+    /// Re-render a listing in place, keeping point.
+    fn dired_rebuild(&mut self, idx: usize) {
+        let theme = self.theme;
+        let lines = self.buffers[idx]
+            .dired
+            .as_ref()
+            .map(|d| d.render(&theme))
+            .unwrap_or_default();
+        let pos = self.buffers[idx].buffer.point();
+        self.buffers[idx].buffer.set_content(lines);
+        self.buffers[idx].buffer.set_point(pos);
+    }
+
+    /// Paths of every entry carrying `mark`.
+    fn dired_paths(&self, mark: Mark) -> Vec<PathBuf> {
+        self.current()
+            .dired
+            .as_ref()
+            .map(|d| {
+                d.entries
+                    .iter()
+                    .filter(|e| e.mark == mark)
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Copy the marked (or current) file names to the kill ring (`w`). With a
+    /// numeric argument, copy absolute paths.
+    fn dired_copy_names(&mut self) {
+        let absolute = self.numeric_arg.take().is_some();
+        let marked = self.dired_paths(Mark::Marked);
+        let chosen: Vec<PathBuf> = if !marked.is_empty() {
+            marked
+        } else if let Some(i) = self.dired_entry_at_point() {
+            vec![self.current().dired.as_ref().unwrap().entries[i]
+                .path
+                .clone()]
+        } else {
+            self.message = Some("No file on this line".to_string());
+            return;
+        };
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|p| {
+                if absolute {
+                    p.display().to_string()
+                } else {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                }
+            })
+            .collect();
+        let text = names.join(" ");
+        self.kill_new(&text, false);
+        self.message = Some(format!("Copied: {text}"));
+    }
+
+    /// Ask before deleting the files carrying `mark`.
+    fn dired_start_delete(&mut self, mark: Mark) {
+        let count = self.dired_paths(mark).len();
+        if count == 0 {
+            self.message = Some(
+                match mark {
+                    Mark::Flagged => "No files flagged for deletion",
+                    _ => "No files marked",
+                }
+                .to_string(),
+            );
+            return;
+        }
+        let (action, what) = match mark {
+            Mark::Flagged => (PendingAction::DeleteFlagged, "flagged"),
+            _ => (PendingAction::DeleteMarked, "marked"),
+        };
+        self.prompt = Prompt::Confirm {
+            message: format!("Delete {count} {what} file(s)? (y or n) "),
+            action,
+        };
+    }
+
+    /// Run a confirmed action.
+    fn run_pending(&mut self, action: PendingAction) {
+        let mark = match action {
+            PendingAction::DeleteFlagged => Mark::Flagged,
+            PendingAction::DeleteMarked => Mark::Marked,
+        };
+        let paths = self.dired_paths(mark);
+        let summary = delete_paths(paths);
+        self.dired_revert();
+        self.message = Some(summary);
+    }
+
     /// Dispatch plain Dired keys. Returns `true` when the key was handled.
     fn handle_dired_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode;
@@ -491,6 +647,42 @@ impl App {
             }
             KeyCode::Char('>') => {
                 self.dired_goto_edge(false);
+                true
+            }
+            KeyCode::Char('m') => {
+                self.dired_set_mark(Mark::Marked, 1);
+                true
+            }
+            KeyCode::Char('u') => {
+                self.dired_set_mark(Mark::None, 1);
+                true
+            }
+            KeyCode::Backspace => {
+                self.dired_set_mark(Mark::None, -1);
+                true
+            }
+            KeyCode::Char('d') => {
+                self.dired_set_mark(Mark::Flagged, 1);
+                true
+            }
+            KeyCode::Char('t') => {
+                self.dired_toggle_marks();
+                true
+            }
+            KeyCode::Char('U') => {
+                self.dired_unmark_all();
+                true
+            }
+            KeyCode::Char('x') => {
+                self.dired_start_delete(Mark::Flagged);
+                true
+            }
+            KeyCode::Char('D') => {
+                self.dired_start_delete(Mark::Marked);
+                true
+            }
+            KeyCode::Char('w') => {
+                self.dired_copy_names();
                 true
             }
             _ => false,
@@ -778,7 +970,7 @@ impl App {
     fn prompt_move(&mut self, count: usize, delta: isize) {
         let selected = match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => selected,
-            Prompt::None => return,
+            Prompt::None | Prompt::Confirm { .. } => return,
         };
         if count == 0 {
             *selected = 0;
@@ -792,7 +984,7 @@ impl App {
         let (input, cursor) = match &mut self.prompt {
             Prompt::SwitchBuffer { input, cursor, .. }
             | Prompt::KillBuffer { input, cursor, .. } => (input, cursor),
-            Prompt::None => return None,
+            Prompt::None | Prompt::Confirm { .. } => return None,
         };
         Some(f(input, cursor))
     }
@@ -919,7 +1111,7 @@ impl App {
                 .into_iter()
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
-            Prompt::None => return,
+            Prompt::None | Prompt::Confirm { .. } => return,
         };
         if candidates.is_empty() {
             return;
@@ -948,6 +1140,29 @@ impl App {
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+        // A confirmation prompt answers y/n rather than editing text.
+        if let Some(action) = match &self.prompt {
+            Prompt::Confirm { action, .. } => Some(*action),
+            _ => Option::None,
+        } {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let yes = matches!(
+                key.code,
+                KeyCode::Char('y') | KeyCode::Char(' ') | KeyCode::Enter
+            );
+            let no = matches!(
+                key.code,
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Backspace
+            ) || (ctrl && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('c')));
+            if yes {
+                self.prompt = Prompt::None;
+                self.run_pending(action);
+            } else if no {
+                self.prompt = Prompt::None;
+                self.message = Some("Canceled".to_string());
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.prompt = Prompt::None;
@@ -970,7 +1185,7 @@ impl App {
         let count = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
-            Prompt::None => 0,
+            Prompt::None | Prompt::Confirm { .. } => 0,
         };
         use Action::*;
         let action = keymap::translate(key);
@@ -1029,6 +1244,8 @@ impl App {
                 }
                 self.history.push(&input);
             }
+            // Confirmations are committed through `handle_prompt_key`.
+            Prompt::Confirm { .. } => {}
         }
     }
 
@@ -1075,6 +1292,9 @@ impl App {
                     names,
                     *selected,
                 ))
+            }
+            Prompt::Confirm { message, .. } => {
+                Some((message.clone(), message.chars().count(), Vec::new(), 0))
             }
         }
     }
@@ -1531,6 +1751,38 @@ impl App {
     }
 }
 
+/// Delete each path (recursively for directories), returning a summary. A
+/// symlink is removed as a link, never followed.
+fn delete_paths(paths: Vec<PathBuf>) -> String {
+    let mut deleted = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for path in paths {
+        let is_dir = fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        let result = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => deleted += 1,
+            Err(err) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                errors.push(format!("{name}: {err}"));
+            }
+        }
+    }
+    if errors.is_empty() {
+        format!("Deleted {deleted} file(s)")
+    } else {
+        format!("Deleted {deleted}; errors: {}", errors.join("; "))
+    }
+}
+
 /// The user's home directory, falling back to environment variables.
 fn home_dir() -> Option<PathBuf> {
     if let Some(dirs) = directories::UserDirs::new() {
@@ -1628,6 +1880,22 @@ fn help_lines() -> Vec<String> {
         "  C-w / M-w      kill / copy region",
         "  C-y / M-y      yank / yank-pop",
         "  C-q            quoted insert",
+        "",
+        "Dired",
+        "  n / p / C-n / C-p   next / previous file line",
+        "  SPC                 next file line",
+        "  DEL                 unmark backward (and move up)",
+        "  RET / f / e         visit the file or directory at point",
+        "  ^                   go up to the parent directory",
+        "  g                   revert the listing",
+        "  q                   bury the Dired buffer",
+        "  m / u               mark / unmark (and move down)",
+        "  d                   flag for deletion",
+        "  x                   delete flagged files",
+        "  D                   delete marked files",
+        "  t / U               toggle / remove all marks",
+        "  w                   copy marked file name(s) to the kill ring",
+        "  < / >               first / last file line",
         "",
         "Buffers",
         "  C-x b          switch buffer",
@@ -1763,6 +2031,59 @@ mod tests {
             .line(0)
             .text()
             .starts_with("00000000: 0001 02ff"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marks_flags_and_deletes() {
+        let dir = temp_dir("marks");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // Mark the first entry; the row shows `*` and point advances.
+        press(&mut app, 'm');
+        let row0 = app.current().dired.as_ref().unwrap().row_of(0);
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[0].mark,
+            Mark::Marked
+        );
+        assert!(app.current().buffer.line(row0).text().starts_with("* "));
+
+        // Flag the second entry, then delete flagged files (confirm with y).
+        press(&mut app, 'd');
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[1].mark,
+            Mark::Flagged
+        );
+        press(&mut app, 'x');
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(!dir.join("b.txt").exists());
+        let d = app.current().dired.as_ref().unwrap();
+        assert_eq!(d.entries.len(), 1);
+        assert_eq!(d.entries[0].name, "a.txt");
+        // The mark on a.txt survives the revert.
+        assert_eq!(d.entries[0].mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn w_copies_marked_names() {
+        let dir = temp_dir("copy");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, 'm'); // mark a.txt
+        press(&mut app, 'w');
+        assert_eq!(app.kill_ring.current().as_deref(), Some("a.txt"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

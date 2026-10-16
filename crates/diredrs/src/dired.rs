@@ -138,23 +138,34 @@ impl Dired {
         ));
         let total: u64 = self.entries.iter().map(|e| e.blocks).sum();
         lines.push(Line::styled(format!("  total {total}"), theme.header));
-        for entry in &self.entries {
-            let mut chars: Vec<char> = entry.head.chars().collect();
-            if let Some(first) = chars.first_mut() {
-                *first = entry.mark.ch();
-            }
-            let head: String = chars.into_iter().collect();
-            let name_style = self.name_style(entry, theme);
-            let mut spans = vec![
-                Span::new(head, Style::default()),
-                Span::new(entry.name.clone(), name_style),
-            ];
-            if let Some(target) = &entry.target {
-                spans.push(Span::new(format!(" -> {target}"), Style::default()));
-            }
-            lines.push(Line::from_spans(spans));
+        for i in 0..self.entries.len() {
+            lines.push(self.render_line(i, theme));
         }
         lines
+    }
+
+    /// Render a single entry's line, including its mark and name face.
+    pub fn render_line(&self, i: usize, theme: &Theme) -> Line {
+        let entry = &self.entries[i];
+        let mut chars: Vec<char> = entry.head.chars().collect();
+        if let Some(first) = chars.first_mut() {
+            *first = entry.mark.ch();
+        }
+        let head: String = chars.into_iter().collect();
+        let name_style = self.name_style(entry, theme);
+        let mut spans = vec![
+            Span::new(head, Style::default()),
+            Span::new(entry.name.clone(), name_style),
+        ];
+        if let Some(target) = &entry.target {
+            spans.push(Span::new(format!(" -> {target}"), Style::default()));
+        }
+        Line::from_spans(spans)
+    }
+
+    /// The buffer row for entry `i`.
+    pub fn row_of(&self, i: usize) -> usize {
+        HEADER_LINES + i
     }
 
     fn name_style(&self, entry: &Entry, theme: &Theme) -> Style {
