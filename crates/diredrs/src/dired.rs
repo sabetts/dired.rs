@@ -48,22 +48,26 @@ pub enum SortKey {
     Name,
     /// By modification time, newest first (`ls -lt`).
     Date,
+    /// By size, largest first (`ls -lS`).
+    Size,
 }
 
 impl SortKey {
-    /// The other sort order.
-    pub fn toggled(self) -> SortKey {
+    /// The next order in the `s` cycle (name -> date -> size -> name).
+    pub fn next(self) -> SortKey {
         match self {
             SortKey::Name => SortKey::Date,
-            SortKey::Date => SortKey::Name,
+            SortKey::Date => SortKey::Size,
+            SortKey::Size => SortKey::Name,
         }
     }
 
-    /// A short label for the echo area.
+    /// A short label for the mode line and echo area.
     pub fn label(self) -> &'static str {
         match self {
             SortKey::Name => "name",
             SortKey::Date => "date",
+            SortKey::Size => "size",
         }
     }
 }
@@ -212,6 +216,11 @@ impl Dired {
             SortKey::Date => self.entries.sort_by(|a, b| {
                 b.mtime
                     .cmp(&a.mtime)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+            SortKey::Size => self.entries.sort_by(|a, b| {
+                b.size
+                    .cmp(&a.size)
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             }),
         }
@@ -503,11 +512,12 @@ mod tests {
     }
 
     #[test]
-    fn sorts_by_name_and_date() {
+    fn sorts_by_name_date_and_size() {
         let dir = temp_dir("sortmode");
-        fs::write(dir.join("b.txt"), b"x").unwrap();
-        fs::write(dir.join("a.txt"), b"x").unwrap();
-        fs::write(dir.join("c.txt"), b"x").unwrap();
+        // Distinct sizes: b=2, a=3, c=4 bytes.
+        fs::write(dir.join("b.txt"), b"bb").unwrap();
+        fs::write(dir.join("a.txt"), b"aaa").unwrap();
+        fs::write(dir.join("c.txt"), b"cccc").unwrap();
 
         let mut d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.sort, SortKey::Name);
@@ -524,14 +534,22 @@ mod tests {
         let names =
             |d: &Dired| -> Vec<String> { d.entries.iter().map(|e| e.name.clone()).collect() };
 
-        // Date order is newest first.
+        assert_eq!(names(&d), ["a.txt", "b.txt", "c.txt"]); // by name
         d.set_sort(SortKey::Date);
-        assert_eq!(names(&d), ["c.txt", "b.txt", "a.txt"]);
-        // Toggling back restores the alphabetical order.
+        assert_eq!(names(&d), ["c.txt", "b.txt", "a.txt"]); // newest first
+        d.set_sort(SortKey::Size);
+        assert_eq!(names(&d), ["c.txt", "a.txt", "b.txt"]); // largest first
         d.set_sort(SortKey::Name);
         assert_eq!(names(&d), ["a.txt", "b.txt", "c.txt"]);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sort_key_cycles_name_date_size() {
+        assert_eq!(SortKey::Name.next(), SortKey::Date);
+        assert_eq!(SortKey::Date.next(), SortKey::Size);
+        assert_eq!(SortKey::Size.next(), SortKey::Name);
     }
 
     #[test]

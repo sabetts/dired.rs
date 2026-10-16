@@ -184,7 +184,7 @@ pub struct App {
     pasting_until: Option<Instant>,
     /// The buffer index last drawn, so a switch can force a full repaint.
     drawn: Option<usize>,
-    /// Whether Dired shows sizes human-readably (`ls -h`), toggled with `h`.
+    /// Whether Dired shows sizes human-readably (`ls -h`); `ui.human_sizes`.
     human_sizes: bool,
 }
 
@@ -273,7 +273,11 @@ impl App {
         match self.current().kind {
             Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
-            Kind::Dired => "Dired".to_string(),
+            // Emacs shows the listing order in the mode name, e.g. "Dired by name".
+            Kind::Dired => match self.current().dired.as_ref() {
+                Some(d) => format!("Dired by {}", d.sort.label()),
+                None => "Dired".to_string(),
+            },
             Kind::Hexl => "Hexl".to_string(),
         }
     }
@@ -556,8 +560,8 @@ impl App {
         }
     }
 
-    /// Toggle the listing between name and date order (`s`).
-    fn dired_toggle_sort(&mut self) {
+    /// Cycle the listing order name -> date -> size (`s`).
+    fn dired_cycle_sort(&mut self) {
         let idx = self.current;
         if self.buffers[idx].dired.is_none() {
             return;
@@ -572,7 +576,7 @@ impl App {
         let theme = self.theme;
         let (sort, lines, target) = {
             let dired = self.buffers[idx].dired.as_mut().unwrap();
-            dired.set_sort(dired.sort.toggled());
+            dired.set_sort(dired.sort.next());
             let lines = dired.render(&theme);
             let target = anchor.and_then(|name| {
                 dired.entries.iter().position(|e| e.name == name).map(|i| {
@@ -948,7 +952,7 @@ impl App {
                 true
             }
             KeyCode::Char('s') => {
-                self.dired_toggle_sort();
+                self.dired_cycle_sort();
                 true
             }
             KeyCode::Char('R') => {
@@ -2477,7 +2481,7 @@ fn help_lines() -> Vec<String> {
         "  * !                 unmark all files",
         "  * .                 mark files by extension",
         "  w                   copy marked file name(s) to the kill ring",
-        "  s                   toggle sorting by name / date",
+        "  s                   cycle sorting: name / date / size",
         "  < / >               first / last file line",
         "",
         "Files and buffers",
@@ -2835,6 +2839,24 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn mode_line_shows_the_sort_key() {
+        let dir = temp_dir("sortmodeline");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        assert_eq!(app.mode_line_mode(), "Dired by name");
+        press(&mut app, 's');
+        assert_eq!(app.mode_line_mode(), "Dired by date");
+        press(&mut app, 's');
+        assert_eq!(app.mode_line_mode(), "Dired by size");
+        press(&mut app, 's');
+        assert_eq!(app.mode_line_mode(), "Dired by name");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
