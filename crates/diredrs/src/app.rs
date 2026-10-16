@@ -2942,6 +2942,32 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_wrap_onto_the_next_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("wrap");
+        // A 30-char line in a 10-wide buffer area wraps to three rows.
+        std::fs::write(dir.join("long.txt"), b"012345678901234567890123456789\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(10, 10)).unwrap();
+        app.open_file(dir.join("long.txt"));
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..10u16)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert_eq!(row(0), "0123456789");
+        assert_eq!(row(1), "0123456789");
+        assert_eq!(row(2), "0123456789");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn listing_uses_human_readable_sizes() {
         let dir = temp_dir("humantoggle");
         std::fs::write(dir.join("big.bin"), vec![0u8; 2048]).unwrap();

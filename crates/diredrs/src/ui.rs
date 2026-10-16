@@ -25,20 +25,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
-    let buf = &app.current().buffer;
     let height = area.height as usize;
-    if height == 0 {
+    let width = area.width as usize;
+    if height == 0 || width == 0 {
         return;
     }
-
+    let buf = &app.current().buffer;
     let point = buf.point();
-    let mut top = buf.scroll();
-    if point.row < top {
-        top = point.row;
-    }
-    if point.row >= top + height {
-        top = point.row + 1 - height;
-    }
 
     let highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
@@ -49,18 +42,66 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     // with a background colour (Emacs's `highlight` face), not reverse video.
     let hex_highlights = app.hexl_highlights();
 
+    // Long lines wrap, so a buffer line can span several screen rows. Pick the
+    // top screen row such that point stays visible.
+    let last_line = buf.len().saturating_sub(1);
+    let point_sub = point.col / width;
+    let mut top_line = buf.scroll().min(last_line);
+    if point.row < top_line {
+        top_line = point.row;
+    }
+    // Screen rows from the top of `top_line` down to point.
+    let mut off = point_sub;
+    for l in top_line..point.row {
+        off += line_rows(buf.line(l), width);
+    }
+    let mut top = top_line;
+    while off >= height && top < point.row {
+        off -= line_rows(buf.line(top), width);
+        top += 1;
+    }
+    top_line = top;
+    // Point's own line is taller than the window: scroll partway into it.
+    let top_sub = if off >= height { off + 1 - height } else { 0 };
+
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
-    for row in top..buf.len().min(top + height) {
+    let mut row = top_line;
+    let mut sub = top_sub;
+    while row <= last_line && lines.len() < height {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
         apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
         if row == point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, point.col);
         }
-        lines.push(to_rline(&cells));
+
+        let total = cells.len();
+        if total == 0 {
+            lines.push(to_rline(&[]));
+        } else {
+            let mut start = (sub * width).min(total);
+            while start < total && lines.len() < height {
+                let end = (start + width).min(total);
+                lines.push(to_rline(&cells[start..end]));
+                start += width;
+            }
+        }
+        row += 1;
+        sub = 0;
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Screen rows a buffer line occupies when wrapped at `width` cells. An empty
+/// line still takes one row.
+fn line_rows(line: &Line, width: usize) -> usize {
+    let n = line.char_len();
+    if n == 0 {
+        1
+    } else {
+        n.div_ceil(width.max(1))
+    }
 }
 
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -231,5 +272,13 @@ mod tests {
         let cells = line_cells(&Line::plain("a\tb"));
         assert_eq!(cells.len(), 3);
         assert_eq!(cells[1].0, ' ');
+    }
+
+    #[test]
+    fn line_rows_wraps() {
+        assert_eq!(line_rows(&Line::plain(""), 4), 1);
+        assert_eq!(line_rows(&Line::plain("abcd"), 4), 1);
+        assert_eq!(line_rows(&Line::plain("abcde"), 4), 2);
+        assert_eq!(line_rows(&Line::plain("abcdefghij"), 4), 3);
     }
 }
