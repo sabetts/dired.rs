@@ -293,6 +293,31 @@ impl Buffer {
         (col / self.width).min(self.line_rows(line).saturating_sub(1))
     }
 
+    /// Wrapped rows above the point (within its line, then earlier lines),
+    /// capped at `at_most`.
+    fn rows_above_point(&self, at_most: usize) -> usize {
+        let mut rows = self.sub_of(self.point.row, self.point.col);
+        let mut line = self.point.row;
+        while rows < at_most && line > 0 {
+            line -= 1;
+            rows += self.line_rows(line);
+        }
+        rows.min(at_most)
+    }
+
+    /// Wrapped rows below the point (rest of its line, then later lines),
+    /// capped at `at_most`.
+    fn rows_below_point(&self, at_most: usize) -> usize {
+        let mut rows =
+            self.line_rows(self.point.row) - 1 - self.sub_of(self.point.row, self.point.col);
+        let mut line = self.point.row;
+        while rows < at_most && line < self.last_row() {
+            line += 1;
+            rows += self.line_rows(line);
+        }
+        rows.min(at_most)
+    }
+
     /// Wrapped rows from the view top down to the point.
     fn offset_from_top(&self) -> usize {
         if self.point.row < self.scroll {
@@ -517,31 +542,35 @@ impl Buffer {
     pub fn ensure_point_visible(&mut self, height: usize, margin: usize) {
         let height = height.max(1);
         let margin = margin.min(height.saturating_sub(1) / 2);
+        // The margin is capped by the content actually above/below point, so it
+        // never forces blank space past the start or end of the buffer.
+        let top_margin = margin.min(self.rows_above_point(margin));
+        let bottom_margin = margin.min(self.rows_below_point(margin));
+
         let psub = self.sub_of(self.point.row, self.point.col);
         if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
         {
-            // Point is above the view: leave `margin` rows above it.
-            let (vl, vc) = self.advance_backward(self.point.row, self.point.col, margin);
+            // Point is above the view: leave `top_margin` rows above it.
+            let (vl, vc) = self.advance_backward(self.point.row, self.point.col, top_margin);
             self.set_view_top(vl, vc / self.width);
             return;
         }
         let off = self.offset_from_top();
-        if off < margin {
-            // Scroll up so there are `margin` rows above point.
+        if off < top_margin {
+            // Scroll up so there are `top_margin` rows above point.
             let (vl, vc) =
-                self.advance_backward(self.scroll, self.scroll_sub * self.width, margin - off);
+                self.advance_backward(self.scroll, self.scroll_sub * self.width, top_margin - off);
             self.set_view_top(vl, vc / self.width);
-        } else if off + margin >= height {
-            // Scroll down so there are `margin` rows below point.
+        } else if off + bottom_margin >= height {
+            // Scroll down so there are `bottom_margin` rows below point.
             let (l, c) = self.advance_forward(
                 self.scroll,
                 self.scroll_sub * self.width,
-                off + margin + 1 - height,
+                off + bottom_margin + 1 - height,
             );
             self.set_view_top(l, c / self.width);
         }
     }
-
     // ---- case changing -----------------------------------------------------
 
     pub fn upcase_word(&mut self) {
@@ -1076,6 +1105,24 @@ mod tests {
         b.set_point(Pos::new(4, 0));
         b.ensure_point_visible(5, 1);
         assert_eq!(b.scroll(), 1);
+    }
+
+    #[test]
+    fn scroll_margin_does_not_pad_past_the_buffer_ends() {
+        let mut b = text_buffer("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        b.set_width(80);
+
+        // Ten lines in a ten-row window: the last line sits on the bottom row
+        // rather than being pushed up by the margin.
+        b.set_view_top(0, 0);
+        b.set_point(Pos::new(9, 0));
+        b.ensure_point_visible(10, 1);
+        assert_eq!(b.scroll(), 0);
+
+        // At the start, point reaches the top row.
+        b.set_point(Pos::new(0, 0));
+        b.ensure_point_visible(10, 1);
+        assert_eq!((b.scroll(), b.scroll_sub()), (0, 0));
     }
 
     #[test]
