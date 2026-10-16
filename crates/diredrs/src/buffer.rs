@@ -50,6 +50,8 @@ pub struct Style {
     /// Background color; `Color::Default` leaves the terminal default.
     pub bg: Color,
     pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
     pub dim: bool,
     pub reverse: bool,
 }
@@ -60,6 +62,8 @@ impl Style {
             color,
             bg: Color::Default,
             bold: false,
+            italic: false,
+            underline: false,
             dim: false,
             reverse: false,
         }
@@ -67,6 +71,11 @@ impl Style {
 
     pub const fn bold(mut self) -> Self {
         self.bold = true;
+        self
+    }
+
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
         self
     }
 
@@ -80,6 +89,8 @@ impl Style {
             color: Color::Rgb(r, g, b),
             bg: Color::Default,
             bold: false,
+            italic: false,
+            underline: false,
             dim: false,
             reverse: false,
         }

@@ -12,6 +12,7 @@ mod keymap;
 mod killring;
 mod paste;
 mod search;
+mod syntax;
 mod theme;
 mod ui;
 

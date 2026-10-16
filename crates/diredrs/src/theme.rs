@@ -1,11 +1,39 @@
-//! Dired face colors, with light/dark-background variants.
+//! Face colors, with light/dark-background variants.
 //!
-//! The faces mirror Emacs' `dired-directory`, `dired-symlink`,
-//! `dired-executable`, `dired-marked`, `dired-flagged`, and `dired-header`.
+//! `dired-*` faces mirror Emacs' Dired, and [`SyntaxFaces`] mirrors the
+//! `font-lock-*` / markdown-mode faces used for syntax highlighting. The
+//! colours are Emacs' defaults (from `font-lock.el`, `faces.el`, and
+//! markdown-mode.el), resolved to hex via `colors_list.txt`.
 
 use serde::Deserialize;
 
 use crate::buffer::{Color, Style};
+
+/// Faces used for syntax highlighting, matching Emacs' defaults for the
+/// 88-colour (`min-colors 88`) class on dark or light backgrounds.
+#[derive(Debug, Clone, Copy)]
+pub struct SyntaxFaces {
+    /// `font-lock-comment-face`.
+    pub comment: Style,
+    /// `font-lock-string-face`.
+    pub string: Style,
+    /// `font-lock-keyword-face`.
+    pub keyword: Style,
+    /// `font-lock-builtin-face`.
+    pub builtin: Style,
+    /// `font-lock-function-name-face` (also `markdown-header-face`).
+    pub function: Style,
+    /// `font-lock-variable-name-face`.
+    pub variable: Style,
+    /// `font-lock-type-face`.
+    pub r#type: Style,
+    /// `font-lock-constant-face`.
+    pub constant: Style,
+    /// `shadow` (markdown markup/delimiters, list markers).
+    pub markup: Style,
+    /// `link` (markdown link text).
+    pub link: Style,
+}
 
 /// Which background the terminal uses, selecting the face variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -36,6 +64,8 @@ pub struct Theme {
     /// Background of the hex viewer's highlighted byte (ASCII and hex halves),
     /// matching Emacs's `highlight` face.
     pub hex_highlight: Color,
+    /// Faces for syntax highlighting.
+    pub syntax: SyntaxFaces,
 }
 
 impl Theme {
@@ -50,6 +80,7 @@ impl Theme {
                 flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1
                 header: Style::rgb(0xff, 0xff, 0x00).bold(), // Yellow
                 hex_highlight: Color::Rgb(0x55, 0x6b, 0x2f), // DarkOliveGreen
+                syntax: dark_syntax(),
             },
             Background::Light => Theme {
                 file: Style::default(),
@@ -60,8 +91,41 @@ impl Theme {
                 flagged: Style::rgb(0x8b, 0x00, 0x00).bold(), // DarkRed
                 header: Style::rgb(0x8b, 0x8b, 0x00).bold(), // DarkYellow
                 hex_highlight: Color::Rgb(0xb4, 0xee, 0xb4), // DarkSeaGreen2
+                syntax: light_syntax(),
             },
         }
+    }
+}
+
+/// `font-lock-*` face colours on a dark background.
+fn dark_syntax() -> SyntaxFaces {
+    SyntaxFaces {
+        comment: Style::rgb(0xff, 0x7f, 0x24),          // chocolate1
+        string: Style::rgb(0xff, 0xa0, 0x7a),           // LightSalmon
+        keyword: Style::rgb(0x00, 0xff, 0xff),          // Cyan1
+        builtin: Style::rgb(0xb0, 0xc4, 0xde),          // LightSteelBlue
+        function: Style::rgb(0x87, 0xce, 0xfa),         // LightSkyBlue
+        variable: Style::rgb(0xee, 0xdd, 0x82),         // LightGoldenrod
+        r#type: Style::rgb(0x98, 0xfb, 0x98),           // PaleGreen
+        constant: Style::rgb(0x7f, 0xff, 0xd4),         // Aquamarine
+        markup: Style::rgb(0xb3, 0xb3, 0xb3),           // grey70
+        link: Style::rgb(0x00, 0xff, 0xff).underline(), // Cyan1
+    }
+}
+
+/// `font-lock-*` face colours on a light background.
+fn light_syntax() -> SyntaxFaces {
+    SyntaxFaces {
+        comment: Style::rgb(0xb2, 0x22, 0x22),          // Firebrick
+        string: Style::rgb(0x8b, 0x22, 0x52),           // VioletRed4
+        keyword: Style::rgb(0xa0, 0x20, 0xf0),          // Purple
+        builtin: Style::rgb(0x48, 0x3d, 0x8b),          // DarkSlateBlue
+        function: Style::rgb(0x00, 0x00, 0xff),         // Blue1
+        variable: Style::rgb(0xa0, 0x52, 0x2d),         // Sienna
+        r#type: Style::rgb(0x22, 0x8b, 0x22),           // ForestGreen
+        constant: Style::rgb(0x00, 0x8b, 0x8b),         // DarkCyan
+        markup: Style::rgb(0x7f, 0x7f, 0x7f),           // grey50
+        link: Style::rgb(0x3a, 0x5f, 0xcd).underline(), // RoyalBlue3
     }
 }
 
@@ -81,5 +145,9 @@ mod tests {
         // DarkSeaGreen2).
         assert_eq!(dark.hex_highlight, Color::Rgb(0x55, 0x6b, 0x2f));
         assert_eq!(light.hex_highlight, Color::Rgb(0xb4, 0xee, 0xb4));
+        // Syntax faces: font-lock-* defaults (chocolate1 / Firebrick comments).
+        assert_eq!(dark.syntax.comment, Style::rgb(0xff, 0x7f, 0x24));
+        assert_eq!(light.syntax.comment, Style::rgb(0xb2, 0x22, 0x22));
+        assert!(dark.syntax.link.underline);
     }
 }

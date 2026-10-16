@@ -20,6 +20,7 @@ use crate::keymap::{self, Action};
 use crate::killring::KillRing;
 use crate::paste;
 use crate::search::{Search, SearchDirection};
+use crate::syntax;
 use crate::theme::Theme;
 use crate::ui;
 
@@ -343,7 +344,11 @@ impl App {
         match fs::read(&path) {
             Ok(bytes) if file::looks_binary(&bytes) => self.open_hexl(path, bytes),
             Ok(bytes) => {
-                let lines = file::to_lines(&bytes);
+                let raw = file::to_lines(&bytes);
+                let lines = match syntax::detect(&path) {
+                    Some(lang) => syntax::highlight(lang, &raw, &self.theme.syntax),
+                    None => raw.into_iter().map(Line::plain).collect(),
+                };
                 let buffer = Buffer::read_only_from(lines);
                 let idx = self.new_buffer(name, Kind::File, buffer);
                 self.switch_to(idx);

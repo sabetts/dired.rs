@@ -179,6 +179,12 @@ fn rstyle(style: Style) -> RStyle {
     if style.bold {
         out = out.add_modifier(Modifier::BOLD);
     }
+    if style.italic {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
     if style.dim {
         out = out.add_modifier(Modifier::DIM);
     }
