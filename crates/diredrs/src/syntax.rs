@@ -20,6 +20,7 @@ use crate::theme::SyntaxFaces;
 pub enum Lang {
     Markdown,
     Toml,
+    Ini,
 }
 
 /// The language to highlight a file as, chosen by extension.
@@ -28,6 +29,7 @@ pub fn detect(path: &Path) -> Option<Lang> {
     match ext.as_str() {
         "md" | "markdown" | "mdown" | "mkd" | "mkdn" => Some(Lang::Markdown),
         "toml" => Some(Lang::Toml),
+        "ini" => Some(Lang::Ini),
         _ => None,
     }
 }
@@ -37,6 +39,7 @@ pub fn highlight(lang: Lang, lines: &[String], faces: &SyntaxFaces) -> Vec<Line>
     match lang {
         Lang::Markdown => markdown::highlight(lines, faces),
         Lang::Toml => toml::highlight(lines, faces),
+        Lang::Ini => ini::highlight(lines, faces),
     }
 }
 
@@ -190,6 +193,101 @@ mod toml {
         while i < n {
             let c = p.char_at(i);
             if c == '#' {
+                p.fill(i, n, faces.comment);
+                break;
+            } else if c == '"' || c == '\'' {
+                let quote = c;
+                let start = i;
+                i += 1;
+                while i < n {
+                    let d = p.char_at(i);
+                    if quote == '"' && d == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if d == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                p.fill(start, i.min(n), faces.string);
+            } else {
+                i += 1;
+            }
+        }
+        p.into_line()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INI (`conf-mode`, Windows/Unix styles)
+// ---------------------------------------------------------------------------
+
+mod ini {
+    use super::*;
+
+    fn section_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"^[ \t]*\[(.+)\]").unwrap())
+    }
+
+    fn key_re() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"^[ \t]*([^=\n]+?)(?:\[([^\]\n]*?)\])?[ \t]*=").unwrap())
+    }
+
+    /// Emacs' `conf-mode` picks the comment character from the buffer
+    /// contents: `#` (Unix) or `;` (Windows), with ties favouring `;`.
+    fn comment_char(lines: &[String]) -> char {
+        let (mut unix, mut win) = (0, 0);
+        for line in lines {
+            match line.trim_start().chars().next() {
+                Some('#') => unix += 1,
+                Some(';') => win += 1,
+                _ => {}
+            }
+        }
+        if unix > win {
+            '#'
+        } else {
+            ';'
+        }
+    }
+
+    pub fn highlight(lines: &[String], faces: &SyntaxFaces) -> Vec<Line> {
+        let comment = comment_char(lines);
+        lines.iter().map(|line| one(line, comment, faces)).collect()
+    }
+
+    fn one(line: &str, comment: char, faces: &SyntaxFaces) -> Line {
+        let mut p = Painter::new(line, Style::default());
+
+        // key = value, or key[index] = value.
+        if let Some(caps) = key_re().captures(line) {
+            if let Some(m) = caps.get(1) {
+                let (s, e) = char_range(line, m.start(), m.end());
+                p.fill(s, e, faces.variable);
+            }
+            if let Some(m) = caps.get(2) {
+                let (s, e) = char_range(line, m.start(), m.end());
+                p.fill(s, e, faces.constant);
+            }
+        }
+        // [section].
+        if let Some(caps) = section_re().captures(line) {
+            if let Some(m) = caps.get(1) {
+                let (s, e) = char_range(line, m.start(), m.end());
+                p.fill(s, e, faces.r#type);
+            }
+        }
+
+        // Strings and the chosen comment character override the above.
+        let n = p.len();
+        let mut i = 0;
+        while i < n {
+            let c = p.char_at(i);
+            if c == comment {
                 p.fill(i, n, faces.comment);
                 break;
             } else if c == '"' || c == '\'' {
@@ -632,7 +730,42 @@ mod tests {
         assert_eq!(detect(Path::new("a.md")), Some(Lang::Markdown));
         assert_eq!(detect(Path::new("A.MARKDOWN")), Some(Lang::Markdown));
         assert_eq!(detect(Path::new("c.toml")), Some(Lang::Toml));
+        assert_eq!(detect(Path::new("c.INI")), Some(Lang::Ini));
         assert_eq!(detect(Path::new("x.rs")), None);
+    }
+
+    #[test]
+    fn ini_windows_style() {
+        let f = faces();
+        let lines = hl(
+            Lang::Ini,
+            &[
+                "; a comment",
+                "[server]",
+                "host = \"localhost\"; note",
+                "port = 8080",
+            ],
+        );
+        assert_eq!(style_at(&lines[0], 0), f.comment);
+        assert_eq!(style_at(&lines[1], 1), f.r#type); // "server"
+        assert_eq!(style_at(&lines[2], 0), f.variable); // "host"
+        assert_eq!(style_at(&lines[2], 7), f.string); // quoted value
+        let semi = lines[2].text().find(';').unwrap();
+        assert_eq!(style_at(&lines[2], semi), f.comment); // trailing "; note"
+        assert_eq!(style_at(&lines[3], 0), f.variable); // "port"
+    }
+
+    #[test]
+    fn ini_unix_style_uses_hash() {
+        let f = faces();
+        let lines = hl(
+            Lang::Ini,
+            &["# one", "# two", "a = 1", "; not a comment here"],
+        );
+        assert_eq!(style_at(&lines[0], 0), f.comment);
+        assert_eq!(style_at(&lines[2], 0), f.variable);
+        // In Unix style, ';' is not a comment character.
+        assert_ne!(style_at(&lines[3], 0), f.comment);
     }
 
     #[test]
