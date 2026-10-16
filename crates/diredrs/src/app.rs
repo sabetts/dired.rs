@@ -77,6 +77,18 @@ pub enum Prompt {
         /// the typed `input` is used as-is (the default).
         selected: Option<usize>,
     },
+    /// Read a new name for the marked files, or the file at point (`R`).
+    Rename {
+        input: String,
+        cursor: usize,
+        /// Highlighted completion candidate (a path), moved with Up/Down.
+        selected: Option<usize>,
+    },
+    /// Read a file extension; every file ending in it is marked (`* .`).
+    MarkExtension {
+        input: String,
+        cursor: usize,
+    },
     /// A yes/no confirmation in the echo area.
     Confirm {
         message: String,
@@ -91,7 +103,7 @@ pub enum PendingAction {
     DeleteMarked,
 }
 
-/// A pending multi-key prefix (`C-x`, `C-c`, or `C-h`).
+/// A pending multi-key prefix (`C-x`, `C-c`, `C-h`, or Dired's `*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Prefix {
     #[default]
@@ -99,6 +111,8 @@ enum Prefix {
     CtrlX,
     CtrlC,
     Help,
+    /// Dired's `*` marking prefix (`* !`, `* .`).
+    Star,
 }
 
 /// A numeric argument being built with `C-u`, `M-<digit>`, or `M--`
@@ -627,6 +641,47 @@ impl App {
         self.dired_rebuild(idx);
     }
 
+    /// Prompt for an extension whose files are then marked (`* .`). The
+    /// current file's extension is offered as the default.
+    fn start_mark_extension(&mut self) {
+        let input = self
+            .dired_entry_at_point()
+            .and_then(|i| {
+                self.current()
+                    .dired
+                    .as_ref()
+                    .and_then(|d| d.entries[i].path.extension())
+                    .map(|e| e.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        self.prompt = Prompt::MarkExtension {
+            cursor: input.chars().count(),
+            input,
+        };
+    }
+
+    /// Mark every file whose name ends in `.<ext>` (`* .`).
+    fn mark_by_extension(&mut self, ext: &str) {
+        let ext = ext.trim().trim_start_matches('.');
+        if ext.is_empty() {
+            self.message = Some("No extension given".to_string());
+            return;
+        }
+        let idx = self.current;
+        let suffix = format!(".{}", ext.to_lowercase());
+        let mut count = 0usize;
+        if let Some(d) = self.buffers[idx].dired.as_mut() {
+            for entry in &mut d.entries {
+                if entry.name.to_lowercase().ends_with(&suffix) {
+                    entry.mark = Mark::Marked;
+                    count += 1;
+                }
+            }
+        }
+        self.dired_rebuild(idx);
+        self.message = Some(format!("Marked {count} file(s)"));
+    }
+
     /// Re-render a listing in place, keeping point.
     fn dired_rebuild(&mut self, idx: usize) {
         let theme = self.theme;
@@ -685,6 +740,100 @@ impl App {
         let text = names.join(" ");
         self.kill_new(&text, false);
         self.message = Some(format!("Copied: {text}"));
+    }
+
+    /// Prompt for a new name for the marked files, or the file at point (`R`).
+    fn start_rename(&mut self) {
+        // Offer the file's own name for a single-file rename; require a
+        // directory when several files are marked.
+        let marked = self.dired_paths(Mark::Marked);
+        let input = if marked.is_empty() {
+            self.dired_entry_at_point()
+                .and_then(|i| {
+                    self.current().dired.as_ref().and_then(|d| {
+                        d.entries[i]
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.prompt = Prompt::Rename {
+            cursor: input.chars().count(),
+            input,
+            selected: None,
+        };
+    }
+
+    /// Rename/move the marked files (or the file at point) to `target` (`R`).
+    fn commit_rename(&mut self, target: &str) {
+        let target = target.trim();
+        let marked = self.dired_paths(Mark::Marked);
+        let sources: Vec<PathBuf> = if !marked.is_empty() {
+            marked
+        } else if let Some(i) = self.dired_entry_at_point() {
+            vec![self.current().dired.as_ref().unwrap().entries[i]
+                .path
+                .clone()]
+        } else {
+            self.message = Some("No file on this line".to_string());
+            return;
+        };
+        if target.is_empty() {
+            self.message = Some("No target name given".to_string());
+            return;
+        }
+        let dest = self.expand_path(target);
+        // A single file is renamed to `dest`; several files (or an existing
+        // directory) are moved into `dest` as a directory.
+        let into_dir = sources.len() > 1 || dest.is_dir();
+        if sources.len() > 1 && !dest.is_dir() {
+            self.message = Some(format!("Not a directory: {}", dest.display()));
+            return;
+        }
+
+        let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let mut errors = 0usize;
+        for src in &sources {
+            let to = if into_dir {
+                match src.file_name() {
+                    Some(name) => dest.join(name),
+                    None => {
+                        errors += 1;
+                        continue;
+                    }
+                }
+            } else {
+                dest.clone()
+            };
+            match fs::rename(src, &to) {
+                Ok(()) => renamed.push((src.clone(), to)),
+                Err(_) => errors += 1,
+            }
+        }
+        for (old, new) in &renamed {
+            self.rename_open_buffer(old, new);
+        }
+        self.dired_revert();
+        self.message = Some(if errors == 0 {
+            match renamed.as_slice() {
+                [(_, new)] => format!("Renamed to {}", new.display()),
+                _ => format!("Renamed {} file(s)", renamed.len()),
+            }
+        } else {
+            format!("Renamed {} file(s); {errors} failed", renamed.len())
+        });
+    }
+
+    /// Point an open file/hexl buffer at `new` after its file was renamed.
+    fn rename_open_buffer(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        let old_name = old.display().to_string();
+        if let Some(idx) = self.buffers.iter().position(|b| b.name == old_name) {
+            self.buffers[idx].name = new.display().to_string();
+        }
     }
 
     /// Ask before deleting the files carrying `mark`.
@@ -796,6 +945,16 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.dired_toggle_sort();
+                true
+            }
+            KeyCode::Char('R') => {
+                self.start_rename();
+                true
+            }
+            KeyCode::Char('*') => {
+                self.numeric_arg = None;
+                self.prefix = Prefix::Star;
+                self.message = Some("*".to_string());
                 true
             }
             _ => false,
@@ -1075,6 +1234,11 @@ impl App {
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-h", key),
             },
+            Prefix::Star => match key.code {
+                KeyCode::Char('!') => self.dired_unmark_all(),
+                KeyCode::Char('.') => self.start_mark_extension(),
+                _ => self.undefined("*", key),
+            },
         }
     }
 
@@ -1228,13 +1392,19 @@ impl App {
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
-        if let Prompt::FindFile { selected, .. } = &mut self.prompt {
+        if let Prompt::FindFile { selected, .. } | Prompt::Rename { selected, .. } =
+            &mut self.prompt
+        {
             *selected = select_move(*selected, count, delta);
             return;
         }
         let selected = match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => selected,
-            Prompt::None | Prompt::Confirm { .. } | Prompt::FindFile { .. } => return,
+            Prompt::None
+            | Prompt::Confirm { .. }
+            | Prompt::FindFile { .. }
+            | Prompt::Rename { .. }
+            | Prompt::MarkExtension { .. } => return,
         };
         if count == 0 {
             *selected = 0;
@@ -1248,7 +1418,9 @@ impl App {
         let (input, cursor) = match &mut self.prompt {
             Prompt::SwitchBuffer { input, cursor, .. }
             | Prompt::KillBuffer { input, cursor, .. }
-            | Prompt::FindFile { input, cursor, .. } => (input, cursor),
+            | Prompt::FindFile { input, cursor, .. }
+            | Prompt::Rename { input, cursor, .. }
+            | Prompt::MarkExtension { input, cursor } => (input, cursor),
             Prompt::None | Prompt::Confirm { .. } => return None,
         };
         Some(f(input, cursor))
@@ -1259,7 +1431,7 @@ impl App {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => {
                 *selected = 0
             }
-            Prompt::FindFile { selected, .. } => *selected = None,
+            Prompt::FindFile { selected, .. } | Prompt::Rename { selected, .. } => *selected = None,
             _ => {}
         }
     }
@@ -1378,7 +1550,8 @@ impl App {
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired),
-            Prompt::None | Prompt::Confirm { .. } => return,
+            Prompt::Rename { input, .. } => self.file_candidates(input, false),
+            Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => return,
         };
         if candidates.is_empty() {
             return;
@@ -1408,6 +1581,11 @@ impl App {
                 cursor,
                 selected,
                 ..
+            }
+            | Prompt::Rename {
+                input,
+                cursor,
+                selected,
             } => {
                 *cursor = completion.chars().count();
                 *input = completion;
@@ -1465,7 +1643,8 @@ impl App {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired).len(),
-            Prompt::None | Prompt::Confirm { .. } => 0,
+            Prompt::Rename { input, .. } => self.file_candidates(input, false).len(),
+            Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
         };
         use Action::*;
         let action = keymap::translate(key);
@@ -1554,6 +1733,17 @@ impl App {
                 }
                 self.history.push(&chosen);
             }
+            Prompt::Rename {
+                input, selected, ..
+            } => {
+                let candidates = self.file_candidates(&input, false);
+                let chosen = match selected {
+                    Some(i) => candidates.get(i).cloned().unwrap_or(input),
+                    None => input,
+                };
+                self.commit_rename(&chosen);
+            }
+            Prompt::MarkExtension { input, .. } => self.mark_by_extension(&input),
             // Confirmations are committed through `handle_prompt_key`.
             Prompt::Confirm { .. } => {}
         }
@@ -1619,6 +1809,28 @@ impl App {
                     prefix.chars().count() + *cursor,
                     self.file_candidates(input, *dired),
                     selected.unwrap_or(usize::MAX),
+                ))
+            }
+            Prompt::Rename {
+                input,
+                cursor,
+                selected,
+            } => {
+                let prefix = "Rename to: ";
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    self.file_candidates(input, false),
+                    selected.unwrap_or(usize::MAX),
+                ))
+            }
+            Prompt::MarkExtension { input, cursor } => {
+                let prefix = "Mark extension: ";
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    Vec::new(),
+                    0,
                 ))
             }
             Prompt::Confirm { message, .. } => {
@@ -2256,7 +2468,10 @@ fn help_lines() -> Vec<String> {
         "  d                   flag for deletion",
         "  x                   delete flagged files",
         "  D                   delete marked files",
+        "  R                   rename / move file(s)",
         "  t / U               toggle / remove all marks",
+        "  * !                 unmark all files",
+        "  * .                 mark files by extension",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   toggle sorting by name / date",
         "  < / >               first / last file line",
@@ -2616,6 +2831,113 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn star_bang_unmarks_all() {
+        let dir = temp_dir("unmarkall");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, 'm');
+        press(&mut app, 'm');
+        assert!(app
+            .current()
+            .dired
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.mark == Mark::Marked));
+
+        press(&mut app, '*');
+        press(&mut app, '!');
+        assert!(app
+            .current()
+            .dired
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .all(|e| e.mark == Mark::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn star_dot_marks_by_extension() {
+        let dir = temp_dir("markext");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        std::fs::write(dir.join("c.rs"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // `* .` opens the extension prompt, defaulted to the current file's.
+        press(&mut app, '*');
+        press(&mut app, '.');
+        if let Prompt::MarkExtension { input, cursor } = &mut app.prompt {
+            *input = "txt".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the extension prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let d = app.current().dired.as_ref().unwrap();
+        let marked: Vec<&str> = d
+            .entries
+            .iter()
+            .filter(|e| e.mark == Mark::Marked)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(marked, ["a.txt", "b.txt"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn t_inverts_the_selection() {
+        let dir = temp_dir("invert");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, 'm'); // mark a.txt
+
+        press(&mut app, 't');
+        let d = app.current().dired.as_ref().unwrap();
+        let a = d.entries.iter().find(|e| e.name == "a.txt").unwrap();
+        let b = d.entries.iter().find(|e| e.name == "b.txt").unwrap();
+        assert_eq!(a.mark, Mark::None);
+        assert_eq!(b.mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r_renames_the_file_at_point() {
+        let dir = temp_dir("rename");
+        std::fs::write(dir.join("old.txt"), b"hello").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'R');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            *input = "new.txt".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the rename prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!dir.join("old.txt").exists());
+        assert!(dir.join("new.txt").exists());
+        let d = app.current().dired.as_ref().unwrap();
+        assert!(d.entries.iter().any(|e| e.name == "new.txt"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
