@@ -39,6 +39,35 @@ impl Mark {
     }
 }
 
+/// How a listing is ordered. `s` toggles between the two, like
+/// `dired-sort-toggle` flipping `ls`'s `-t` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortKey {
+    /// Alphabetically, case-insensitively (the `ls -l` default).
+    #[default]
+    Name,
+    /// By modification time, newest first (`ls -lt`).
+    Date,
+}
+
+impl SortKey {
+    /// The other sort order.
+    pub fn toggled(self) -> SortKey {
+        match self {
+            SortKey::Name => SortKey::Date,
+            SortKey::Date => SortKey::Name,
+        }
+    }
+
+    /// A short label for the echo area.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Date => "date",
+        }
+    }
+}
+
 /// One entry in a directory listing.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -54,6 +83,8 @@ pub struct Entry {
     pub target: Option<String>,
     /// 1K blocks, for the `total` line.
     pub blocks: u64,
+    /// Modification time, used to sort by date.
+    pub mtime: Option<SystemTime>,
     pub mark: Mark,
 }
 
@@ -62,6 +93,8 @@ pub struct Entry {
 pub struct Dired {
     pub dir: PathBuf,
     pub entries: Vec<Entry>,
+    /// Current ordering.
+    pub sort: SortKey,
 }
 
 impl Dired {
@@ -78,9 +111,6 @@ impl Dired {
             let meta = entry.metadata()?;
             read.push((name, entry.path(), meta));
         }
-
-        // `ls -l` sorts by name; Dired keeps that order.
-        read.sort_by_key(|entry| entry.0.to_lowercase());
 
         let links_width = 2;
         let size_width = read
@@ -119,14 +149,37 @@ impl Dired {
                 is_exec,
                 target,
                 blocks: meta.len().div_ceil(1024),
+                mtime: meta.modified().ok(),
                 mark: Mark::None,
             });
         }
 
-        Ok(Dired {
+        let mut dired = Dired {
             dir: dir.to_path_buf(),
             entries,
-        })
+            sort: SortKey::default(),
+        };
+        dired.resort();
+        Ok(dired)
+    }
+
+    /// Change the ordering and re-sort in place (keeping marks and metadata).
+    pub fn set_sort(&mut self, sort: SortKey) {
+        self.sort = sort;
+        self.resort();
+    }
+
+    /// Order `entries` according to `sort`. Name is case-insensitive
+    /// ascending; date is newest first, ties broken by name.
+    fn resort(&mut self) {
+        match self.sort {
+            SortKey::Name => self.entries.sort_by_key(|e| e.name.to_lowercase()),
+            SortKey::Date => self.entries.sort_by(|a, b| {
+                b.mtime
+                    .cmp(&a.mtime)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }),
+        }
     }
 
     /// Render the listing as styled lines (header, total, then one per entry).
@@ -376,6 +429,38 @@ mod tests {
         let shown = Dired::read(&dir, false).unwrap();
         assert_eq!(shown.entries.len(), 1);
         assert_eq!(shown.entries[0].name, "visible");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sorts_by_name_and_date() {
+        let dir = temp_dir("sortmode");
+        fs::write(dir.join("b.txt"), b"x").unwrap();
+        fs::write(dir.join("a.txt"), b"x").unwrap();
+        fs::write(dir.join("c.txt"), b"x").unwrap();
+
+        let mut d = Dired::read(&dir, true).unwrap();
+        assert_eq!(d.sort, SortKey::Name);
+
+        let t = |secs: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        for e in &mut d.entries {
+            e.mtime = Some(match e.name.as_str() {
+                "a.txt" => t(1000),
+                "b.txt" => t(2000),
+                _ => t(3000),
+            });
+        }
+
+        let names =
+            |d: &Dired| -> Vec<String> { d.entries.iter().map(|e| e.name.clone()).collect() };
+
+        // Date order is newest first.
+        d.set_sort(SortKey::Date);
+        assert_eq!(names(&d), ["c.txt", "b.txt", "a.txt"]);
+        // Toggling back restores the alphabetical order.
+        d.set_sort(SortKey::Name);
+        assert_eq!(names(&d), ["a.txt", "b.txt", "c.txt"]);
 
         fs::remove_dir_all(&dir).ok();
     }

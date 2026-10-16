@@ -500,7 +500,11 @@ impl App {
     /// Re-read the current directory listing (`g`), preserving marks by name.
     fn dired_revert(&mut self) {
         let idx = self.current;
-        let Some(dir) = self.buffers[idx].dired.as_ref().map(|d| d.dir.clone()) else {
+        let Some((dir, sort)) = self.buffers[idx]
+            .dired
+            .as_ref()
+            .map(|d| (d.dir.clone(), d.sort))
+        else {
             return;
         };
         let marks: Vec<(String, Mark)> = self.buffers[idx]
@@ -519,6 +523,7 @@ impl App {
                         entry.mark = *mark;
                     }
                 }
+                dired.set_sort(sort);
                 let lines = dired.render(&self.theme);
                 self.buffers[idx].buffer.set_content(lines);
                 self.buffers[idx].dired = Some(dired);
@@ -531,6 +536,40 @@ impl App {
                 self.message = Some(format!("Cannot read {}: {err}", dir.display()));
             }
         }
+    }
+
+    /// Toggle the listing between name and date order (`s`).
+    fn dired_toggle_sort(&mut self) {
+        let idx = self.current;
+        if self.buffers[idx].dired.is_none() {
+            return;
+        }
+        // Remember the file under point so it stays under point.
+        let anchor = self.dired_entry_at_point().and_then(|i| {
+            self.buffers[idx]
+                .dired
+                .as_ref()
+                .map(|d| d.entries[i].name.clone())
+        });
+        let theme = self.theme;
+        let (sort, lines, target) = {
+            let dired = self.buffers[idx].dired.as_mut().unwrap();
+            dired.set_sort(dired.sort.toggled());
+            let lines = dired.render(&theme);
+            let target = anchor.and_then(|name| {
+                dired.entries.iter().position(|e| e.name == name).map(|i| {
+                    let row = dired.row_of(i);
+                    (row, dired.filename_col(row).unwrap_or(0))
+                })
+            });
+            (dired.sort, lines, target)
+        };
+        self.buffers[idx].buffer.set_content(lines);
+        match target {
+            Some((row, col)) => self.buffers[idx].buffer.set_point(Pos::new(row, col)),
+            None => self.goto_first_file(idx),
+        }
+        self.message = Some(format!("Sorting by {}", sort.label()));
     }
 
     /// Kill the current Dired buffer (`q`).
@@ -753,6 +792,10 @@ impl App {
             }
             KeyCode::Char('w') => {
                 self.dired_copy_names();
+                true
+            }
+            KeyCode::Char('s') => {
+                self.dired_toggle_sort();
                 true
             }
             _ => false,
@@ -2215,6 +2258,7 @@ fn help_lines() -> Vec<String> {
         "  D                   delete marked files",
         "  t / U               toggle / remove all marks",
         "  w                   copy marked file name(s) to the kill ring",
+        "  s                   toggle sorting by name / date",
         "  < / >               first / last file line",
         "",
         "Files and buffers",
@@ -2247,6 +2291,7 @@ fn help_lines() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dired::SortKey;
     use crossterm::event::{KeyCode, KeyModifiers};
 
     fn press(app: &mut App, c: char) {
@@ -2571,6 +2616,29 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn s_toggles_dired_sort_keeping_point() {
+        let dir = temp_dir("sorttoggle");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        // Move to the second file (b.txt) so point is not the first entry.
+        press(&mut app, 'n');
+
+        press(&mut app, 's');
+        assert_eq!(app.current().dired.as_ref().unwrap().sort, SortKey::Date);
+        // Point stays on the same file across the re-sort.
+        let i = app.dired_entry_at_point().unwrap();
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[i].name,
+            "b.txt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
