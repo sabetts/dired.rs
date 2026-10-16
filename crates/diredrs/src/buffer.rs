@@ -53,15 +53,6 @@ pub struct Style {
 }
 
 impl Style {
-    pub const fn fg(color: Color) -> Self {
-        Style {
-            color,
-            bold: false,
-            dim: false,
-            reverse: false,
-        }
-    }
-
     pub const fn bold(mut self) -> Self {
         self.bold = true;
         self
@@ -174,10 +165,6 @@ impl Buffer {
         buffer
     }
 
-    pub fn read_only(&self) -> bool {
-        self.read_only
-    }
-
     pub fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
     }
@@ -203,23 +190,13 @@ impl Buffer {
         self.lines.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].char_len() == 0
-    }
-
     pub fn line(&self, row: usize) -> &Line {
         &self.lines[row]
     }
 
+    #[cfg(test)]
     pub fn line_text(&self, row: usize) -> String {
         self.lines[row].text()
-    }
-
-    /// Replace the line at `row` (used to redraw a single listing entry).
-    pub fn set_line(&mut self, row: usize, line: Line) {
-        if row < self.lines.len() {
-            self.lines[row] = line;
-        }
     }
 
     pub fn last_row(&self) -> usize {
@@ -232,10 +209,6 @@ impl Buffer {
 
     pub fn scroll(&self) -> usize {
         self.scroll
-    }
-
-    pub fn set_scroll(&mut self, scroll: usize) {
-        self.scroll = scroll.min(self.last_row());
     }
 
     pub fn set_point(&mut self, pos: Pos) {
@@ -258,10 +231,6 @@ impl Buffer {
 
     pub fn clear_mark(&mut self) {
         self.mark = None;
-    }
-
-    pub fn mark(&self) -> Option<Pos> {
-        self.mark
     }
 
     pub fn region(&self) -> Option<(Pos, Pos)> {
@@ -356,11 +325,6 @@ impl Buffer {
         let row = self.last_row();
         self.point = Pos::new(row, self.lines[row].char_len());
         self.scroll_into_view();
-    }
-
-    pub fn at_end(&self) -> bool {
-        let row = self.last_row();
-        self.point.row == row && self.point.col == self.lines[row].char_len()
     }
 
     pub fn forward_word(&mut self) {

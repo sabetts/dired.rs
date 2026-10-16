@@ -1,5 +1,7 @@
 //! Application state and the event loop.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
@@ -8,6 +10,7 @@ use ratatui::Terminal;
 
 use crate::buffer::{Buffer, Line, Pos};
 use crate::config::Config;
+use crate::dired::{Dired, Mark};
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
@@ -24,8 +27,6 @@ pub enum Kind {
     Help,
     /// A Dired directory listing.
     Dired,
-    /// A read-only file view.
-    File,
 }
 
 /// One buffer.
@@ -33,6 +34,8 @@ pub struct Buf {
     pub name: String,
     pub kind: Kind,
     pub buffer: Buffer,
+    /// Directory listing state, for `Dired` buffers.
+    pub dired: Option<Dired>,
 }
 
 /// The minibuffer prompt, if one is active.
@@ -153,11 +156,20 @@ impl App {
             .set_content(scratch_lines().into_iter().map(Line::plain).collect());
         app.current = scratch;
         app.previous = scratch;
+        // Open a Dired buffer for the home directory and show it on boot.
+        if let Some(home) = home_dir() {
+            app.open_dired(home);
+        }
         app
     }
 
     fn new_buffer(&mut self, name: String, kind: Kind, buffer: Buffer) -> usize {
-        self.buffers.push(Buf { name, kind, buffer });
+        self.buffers.push(Buf {
+            name,
+            kind,
+            buffer,
+            dired: None,
+        });
         self.buffers.len() - 1
     }
 
@@ -176,17 +188,13 @@ impl App {
         self.buffers.iter().position(|b| b.name == name)
     }
 
-    fn scratch_index(&self) -> Option<usize> {
-        self.buffers.iter().position(|b| b.kind == Kind::Scratch)
-    }
-
     pub fn mode_line_name(&self) -> String {
         self.current().name.clone()
     }
 
     pub fn mode_line_mode(&self) -> String {
         match self.current().kind {
-            Kind::Scratch | Kind::File => "Fundamental".to_string(),
+            Kind::Scratch => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
             Kind::Dired => "Dired".to_string(),
         }
@@ -225,6 +233,209 @@ impl App {
             let scratch = self.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
             self.current = scratch;
             self.previous = scratch;
+        }
+    }
+
+    // ---- dired -------------------------------------------------------------
+
+    /// Open (or switch to) a Dired buffer for `dir`.
+    fn open_dired(&mut self, dir: PathBuf) {
+        let name = dir.display().to_string();
+        if let Some(idx) = self.find_buffer(&name) {
+            self.switch_to(idx);
+            return;
+        }
+        match Dired::read(&dir, self.config.ui.show_hidden) {
+            Ok(dired) => {
+                let lines = dired.render(&self.theme);
+                let buffer = Buffer::read_only_from(lines);
+                let idx = self.new_buffer(name, Kind::Dired, buffer);
+                self.buffers[idx].dired = Some(dired);
+                self.goto_first_file(idx);
+                self.switch_to(idx);
+            }
+            Err(err) => {
+                self.message = Some(format!("Cannot read {}: {err}", dir.display()));
+            }
+        }
+    }
+
+    /// Put point on the first file line's name.
+    fn goto_first_file(&mut self, idx: usize) {
+        let pos = self.buffers[idx].dired.as_ref().and_then(|d| {
+            d.first_file_row()
+                .map(|row| Pos::new(row, d.filename_col(row).unwrap_or(0)))
+        });
+        if let Some(pos) = pos {
+            self.buffers[idx].buffer.set_point(pos);
+        }
+    }
+
+    /// The entry index under point, if point is on a file line.
+    fn dired_entry_at_point(&self) -> Option<usize> {
+        let buf = self.current();
+        let dired = buf.dired.as_ref()?;
+        dired.entry_index_at(buf.buffer.point().row)
+    }
+
+    /// The next file row in direction `delta` (+1 down, -1 up) from `row`.
+    fn next_file_row(&self, row: usize, delta: isize) -> Option<usize> {
+        let dired = self.current().dired.as_ref()?;
+        let len = dired.len();
+        let mut r = row as isize + delta;
+        while r >= 0 && (r as usize) < len {
+            if dired.entry_index_at(r as usize).is_some() {
+                return Some(r as usize);
+            }
+            r += delta;
+        }
+        None
+    }
+
+    /// Move point to the next/previous file line, landing on its name.
+    fn dired_move(&mut self, delta: isize, times: i32) {
+        for _ in 0..times {
+            let row = self.current().buffer.point().row;
+            let Some(target) = self.next_file_row(row, delta) else {
+                break;
+            };
+            let col = self
+                .current()
+                .dired
+                .as_ref()
+                .and_then(|d| d.filename_col(target))
+                .unwrap_or(0);
+            self.current_mut().buffer.set_point(Pos::new(target, col));
+        }
+    }
+
+    /// Move point to the first or last file line.
+    fn dired_goto_edge(&mut self, first: bool) {
+        let row = self.current().dired.as_ref().and_then(|d| {
+            if first {
+                d.first_file_row()
+            } else {
+                d.first_file_row().map(|_| d.len() - 1)
+            }
+        });
+        if let Some(row) = row {
+            let col = self
+                .current()
+                .dired
+                .as_ref()
+                .and_then(|d| d.filename_col(row))
+                .unwrap_or(0);
+            self.current_mut().buffer.set_point(Pos::new(row, col));
+        }
+    }
+
+    /// Visit the file or directory at point.
+    fn dired_visit(&mut self) {
+        let Some(i) = self.dired_entry_at_point() else {
+            self.message = Some("No file on this line".to_string());
+            return;
+        };
+        let (is_dir, path) = {
+            let entry = &self.current().dired.as_ref().unwrap().entries[i];
+            (entry.is_dir, entry.path.clone())
+        };
+        if is_dir {
+            self.open_dired(path);
+        } else {
+            self.message = Some(format!("Viewing {} is not yet implemented", path.display()));
+        }
+    }
+
+    /// Open the parent directory (`^`).
+    fn dired_up(&mut self) {
+        let Some(dir) = self.current().dired.as_ref().map(|d| d.dir.clone()) else {
+            return;
+        };
+        match dir.parent() {
+            Some(parent) => self.open_dired(parent.to_path_buf()),
+            None => self.message = Some("Already at the root directory".to_string()),
+        }
+    }
+
+    /// Re-read the current directory listing (`g`), preserving marks by name.
+    fn dired_revert(&mut self) {
+        let idx = self.current;
+        let Some(dir) = self.buffers[idx].dired.as_ref().map(|d| d.dir.clone()) else {
+            return;
+        };
+        let marks: Vec<(String, Mark)> = self.buffers[idx]
+            .dired
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.mark != Mark::None)
+            .map(|e| (e.name.clone(), e.mark))
+            .collect();
+        match Dired::read(&dir, self.config.ui.show_hidden) {
+            Ok(mut dired) => {
+                for entry in &mut dired.entries {
+                    if let Some((_, mark)) = marks.iter().find(|(n, _)| *n == entry.name) {
+                        entry.mark = *mark;
+                    }
+                }
+                let lines = dired.render(&self.theme);
+                self.buffers[idx].buffer.set_content(lines);
+                self.buffers[idx].dired = Some(dired);
+                // Land on the first file line near where point was.
+                self.buffers[idx].buffer.beginning_of_buffer();
+                self.goto_first_file(idx);
+                self.message = Some(format!("Reverted {}", dir.display()));
+            }
+            Err(err) => {
+                self.message = Some(format!("Cannot read {}: {err}", dir.display()));
+            }
+        }
+    }
+
+    /// Kill the current Dired buffer (`q`).
+    fn dired_quit(&mut self) {
+        let idx = self.current;
+        self.kill_buffer(idx);
+    }
+
+    /// Dispatch plain Dired keys. Returns `true` when the key was handled.
+    fn handle_dired_key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode;
+        match code {
+            KeyCode::Char('n') | KeyCode::Char(' ') => {
+                self.dired_move(1, 1);
+                true
+            }
+            KeyCode::Char('p') => {
+                self.dired_move(-1, 1);
+                true
+            }
+            KeyCode::Char('f') | KeyCode::Char('e') | KeyCode::Char('v') | KeyCode::Char('o') => {
+                self.dired_visit();
+                true
+            }
+            KeyCode::Char('^') => {
+                self.dired_up();
+                true
+            }
+            KeyCode::Char('g') => {
+                self.dired_revert();
+                true
+            }
+            KeyCode::Char('q') => {
+                self.dired_quit();
+                true
+            }
+            KeyCode::Char('<') => {
+                self.dired_goto_edge(true);
+                true
+            }
+            KeyCode::Char('>') => {
+                self.dired_goto_edge(false);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -310,6 +521,17 @@ impl App {
             self.numeric_arg = None;
             self.prefix = Prefix::Help;
             self.message = Some("C-h-".to_string());
+            return;
+        }
+
+        // Plain keys in a Dired buffer drive Dired commands (n, p, f, ^, g,
+        // q, ...) rather than inserting text.
+        if self.current().kind == Kind::Dired
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.handle_dired_key(key.code)
+        {
+            self.message = None;
             return;
         }
 
@@ -840,7 +1062,11 @@ impl App {
                 }
             }
             Open => {
-                if self.current().buffer.editable() {
+                if self.current().kind == Kind::Dired {
+                    for _ in 0..n.unsigned_abs().max(1) {
+                        self.dired_visit();
+                    }
+                } else if self.current().buffer.editable() {
                     let buf = self.current_mut();
                     for _ in 0..n.max(0) {
                         buf.buffer.insert_newline();
@@ -849,8 +1075,20 @@ impl App {
             }
             ForwardChar => self.move_chars(n),
             BackwardChar => self.move_chars(-n),
-            NextLine => self.move_lines(n),
-            PrevLine => self.move_lines(-n),
+            NextLine => {
+                if self.current().kind == Kind::Dired {
+                    self.dired_move(1, n.unsigned_abs() as i32);
+                } else {
+                    self.move_lines(n);
+                }
+            }
+            PrevLine => {
+                if self.current().kind == Kind::Dired {
+                    self.dired_move(-1, n.unsigned_abs() as i32);
+                } else {
+                    self.move_lines(-n);
+                }
+            }
             BeginningOfLine => self.current_mut().buffer.beginning_of_line(),
             EndOfLine => self.current_mut().buffer.end_of_line(),
             ForwardWord => self.move_words(n),
@@ -1235,15 +1473,21 @@ impl App {
     }
 }
 
+/// The user's home directory, falling back to environment variables.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(dirs) = directories::UserDirs::new() {
+        return Some(dirs.home_dir().to_path_buf());
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
     match direction {
         SearchDirection::Forward => Pos::new(pos.row, pos.col + 1),
         SearchDirection::Backward => Pos::new(pos.row, pos.col.saturating_sub(1)),
     }
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 /// Byte offset of the `idx`-th char in `s`, clamped to the end.
@@ -1347,4 +1591,91 @@ fn help_lines() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    fn press(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "diredrs-app-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn boot_has_a_scratch_buffer() {
+        let app = App::new(Config::default());
+        assert!(app.buffers.iter().any(|b| b.kind == Kind::Scratch));
+    }
+
+    #[test]
+    fn dired_navigation_and_quit() {
+        let dir = temp_dir("nav");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        assert_eq!(app.current().kind, Kind::Dired);
+        let first = app
+            .current()
+            .dired
+            .as_ref()
+            .unwrap()
+            .first_file_row()
+            .unwrap();
+        assert_eq!(app.current().buffer.point().row, first);
+
+        press(&mut app, 'n');
+        assert_eq!(app.current().buffer.point().row, first + 1);
+        press(&mut app, 'p');
+        assert_eq!(app.current().buffer.point().row, first);
+
+        // `q` kills the Dired buffer.
+        let name = app.current().name.clone();
+        press(&mut app, 'q');
+        assert!(app.find_buffer(&name).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dired_ret_visits_directory() {
+        let dir = temp_dir("visit");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        // Point is on the single entry (the subdirectory); RET opens it.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current().name, dir.join("sub").display().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_cx_cc_quits_in_scratch() {
+        let mut app = App::new(Config::default());
+        // Focus the scratch buffer (home Dired may be current).
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
 }

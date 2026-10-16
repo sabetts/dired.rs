@@ -4,6 +4,7 @@
 mod app;
 mod buffer;
 mod config;
+mod dired;
 mod input;
 mod keymap;
 mod killring;

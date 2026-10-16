@@ -33,8 +33,6 @@ pub struct Theme {
     pub flagged: Style,
     /// The `  /dir:` and `total` header lines.
     pub header: Style,
-    /// Errors and warnings in the echo area.
-    pub warning: Style,
 }
 
 impl Theme {
@@ -48,7 +46,6 @@ impl Theme {
                 marked: Style::rgb(0xff, 0x00, 0xff).bold(), // Magenta
                 flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1
                 header: Style::rgb(0xff, 0xff, 0x00).bold(), // Yellow
-                warning: Style::rgb(0xff, 0x00, 0x00).bold(),
             },
             Background::Light => Theme {
                 file: Style::default(),
@@ -58,7 +55,6 @@ impl Theme {
                 marked: Style::rgb(0x8b, 0x00, 0x8b).bold(), // Magenta4
                 flagged: Style::rgb(0x8b, 0x00, 0x00).bold(), // DarkRed
                 header: Style::rgb(0x8b, 0x8b, 0x00).bold(), // DarkYellow
-                warning: Style::rgb(0x8b, 0x00, 0x00).bold(),
             },
         }
     }
