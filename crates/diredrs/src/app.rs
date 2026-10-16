@@ -464,34 +464,27 @@ impl App {
         dired.entry_index_at(buf.buffer.point().row)
     }
 
-    /// The next file row in direction `delta` (+1 down, -1 up) from `row`.
-    fn next_file_row(&self, row: usize, delta: isize) -> Option<usize> {
-        let dired = self.current().dired.as_ref()?;
-        let len = dired.len();
-        let mut r = row as isize + delta;
-        while r >= 0 && (r as usize) < len {
-            if dired.entry_index_at(r as usize).is_some() {
-                return Some(r as usize);
-            }
-            r += delta;
-        }
-        None
-    }
-
-    /// Move point to the next/previous file line, landing on its name.
+    /// Move point `times` lines down (`delta` +1) or up (-1), like Emacs'
+    /// `dired-next-line`: move by physical line, then land on the file name
+    /// when the target line is a file (so the header line is reachable).
     fn dired_move(&mut self, delta: isize, times: i32) {
+        let idx = self.current;
         for _ in 0..times {
-            let row = self.current().buffer.point().row;
-            let Some(target) = self.next_file_row(row, delta) else {
-                break;
+            let last = self.buffers[idx].buffer.last_row() as isize;
+            let target = (self.buffers[idx].buffer.point().row as isize + delta).clamp(0, last);
+            let target = target as usize;
+            let col = {
+                let cur = self.buffers[idx].buffer.point().col;
+                match self.buffers[idx]
+                    .dired
+                    .as_ref()
+                    .and_then(|d| d.filename_col(target))
+                {
+                    Some(col) => col,
+                    None => cur.min(self.buffers[idx].buffer.line(target).char_len()),
+                }
             };
-            let col = self
-                .current()
-                .dired
-                .as_ref()
-                .and_then(|d| d.filename_col(target))
-                .unwrap_or(0);
-            self.current_mut().buffer.set_point(Pos::new(target, col));
+            self.buffers[idx].buffer.set_point(Pos::new(target, col));
         }
     }
 
@@ -2536,8 +2529,8 @@ fn help_lines() -> Vec<String> {
         "  C-q            quoted insert",
         "",
         "Dired",
-        "  n / p / C-n / C-p   next / previous file line",
-        "  SPC                 next file line",
+        "  n / p / C-n / C-p   next / previous line",
+        "  SPC                 next line",
         "  DEL                 unmark backward (and move up)",
         "  RET / f / e         visit the file or directory at point",
         "  ^                   go up to the parent directory",
@@ -2944,6 +2937,28 @@ mod tests {
             "view should reach the top"
         );
         assert_eq!(app.current().buffer.scroll_sub(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dired_c_p_reaches_the_header_line() {
+        let dir = temp_dir("diredcp");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        // Point starts on the first file line (row 1).
+        assert_eq!(app.current().buffer.point().row, 1);
+
+        // C-p moves up to the header line (row 0) rather than skipping it.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point().row, 0);
+
+        // C-n comes back down onto the first file's name.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point().row, 1);
+        assert_eq!(app.dired_entry_at_point(), Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
     }

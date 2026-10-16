@@ -325,11 +325,6 @@ impl Dired {
     pub fn first_file_row(&self) -> Option<usize> {
         (!self.entries.is_empty()).then_some(HEADER_LINES)
     }
-
-    /// Total number of buffer rows this listing renders to.
-    pub fn len(&self) -> usize {
-        self.entries.len() + HEADER_LINES
-    }
 }
 
 /// Format a byte count for the size column. With `human`, use GNU `ls -h`'s
