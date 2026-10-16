@@ -13,6 +13,7 @@ use crate::buffer::{Buffer, Line, Pos};
 use crate::config::Config;
 use crate::dired::{Dired, Mark};
 use crate::file;
+use crate::hexl;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
@@ -31,6 +32,8 @@ pub enum Kind {
     Dired,
     /// A read-only file view.
     File,
+    /// A read-only hex viewer (Emacs `hexl-mode`).
+    Hexl,
 }
 
 /// One buffer.
@@ -201,6 +204,7 @@ impl App {
             Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
             Kind::Dired => "Dired".to_string(),
+            Kind::Hexl => "Hexl".to_string(),
         }
     }
 
@@ -272,12 +276,7 @@ impl App {
             return;
         }
         match fs::read(&path) {
-            Ok(bytes) if file::looks_binary(&bytes) => {
-                self.message = Some(format!(
-                    "{} is a binary file (hex viewer not yet available)",
-                    path.display()
-                ));
-            }
+            Ok(bytes) if file::looks_binary(&bytes) => self.open_hexl(path, bytes),
             Ok(bytes) => {
                 let lines = file::to_lines(&bytes);
                 let buffer = Buffer::read_only_from(lines);
@@ -287,6 +286,35 @@ impl App {
             Err(err) => {
                 self.message = Some(format!("Cannot read {}: {err}", path.display()));
             }
+        }
+    }
+
+    /// Open (or switch to) a read-only hex view of a binary file.
+    fn open_hexl(&mut self, path: PathBuf, bytes: Vec<u8>) {
+        let name = path.display().to_string();
+        if let Some(idx) = self.find_buffer(&name) {
+            self.switch_to(idx);
+            return;
+        }
+        let truncated = bytes.len() > hexl::MAX_BYTES;
+        let shown = &bytes[..bytes.len().min(hexl::MAX_BYTES)];
+        let mut lines = hexl::render(shown);
+        if truncated {
+            lines.push(Line::plain(""));
+            lines.push(Line::plain(format!(
+                "  ... file truncated: showing the first {} bytes ...",
+                hexl::MAX_BYTES
+            )));
+        }
+        let buffer = Buffer::read_only_from(lines);
+        let idx = self.new_buffer(name, Kind::Hexl, buffer);
+        self.switch_to(idx);
+        if truncated {
+            self.message = Some(format!(
+                "{} is large; showing the first {} bytes",
+                path.display(),
+                hexl::MAX_BYTES
+            ));
         }
     }
 
@@ -1715,6 +1743,26 @@ mod tests {
         press(&mut app, 'x');
         assert_eq!(app.current().buffer.line(0).text(), before);
         assert_eq!(app.message.as_deref(), Some("Text is read-only"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opens_binary_file_in_hexl() {
+        let dir = temp_dir("hex");
+        let path = dir.join("data.bin");
+        std::fs::write(&path, [0x00u8, 0x01, 0x02, 0xff]).unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_file(path.clone());
+        assert_eq!(app.current().kind, Kind::Hexl);
+        assert!(!app.current().buffer.editable());
+        assert!(app
+            .current()
+            .buffer
+            .line(0)
+            .text()
+            .starts_with("00000000: 0001 02ff"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

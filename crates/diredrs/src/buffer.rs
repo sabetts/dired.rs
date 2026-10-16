@@ -53,6 +53,15 @@ pub struct Style {
 }
 
 impl Style {
+    pub const fn fg(color: Color) -> Self {
+        Style {
+            color,
+            bold: false,
+            dim: false,
+            reverse: false,
+        }
+    }
+
     pub const fn bold(mut self) -> Self {
         self.bold = true;
         self

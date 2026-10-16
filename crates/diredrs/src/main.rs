@@ -6,6 +6,7 @@ mod buffer;
 mod config;
 mod dired;
 mod file;
+mod hexl;
 mod input;
 mod keymap;
 mod killring;
