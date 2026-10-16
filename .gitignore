@@ -1,0 +1,4 @@
+/target
+**/*.rs.bk
+# Reference source used only for development; never committed.
+/contrib/
