@@ -433,6 +433,19 @@ impl App {
         }
     }
 
+    /// Put point on the name of the entry called `name`, if it is listed.
+    fn dired_goto_name(&mut self, idx: usize, name: &str) {
+        let pos = self.buffers[idx].dired.as_ref().and_then(|d| {
+            d.entries.iter().position(|e| e.name == name).map(|i| {
+                let row = d.row_of(i);
+                Pos::new(row, d.filename_col(row).unwrap_or(0))
+            })
+        });
+        if let Some(pos) = pos {
+            self.buffers[idx].buffer.set_point(pos);
+        }
+    }
+
     /// The entry index under point, if point is on a file line.
     fn dired_entry_at_point(&self) -> Option<usize> {
         let buf = self.current();
@@ -826,6 +839,18 @@ impl App {
             self.rename_open_buffer(old, new);
         }
         self.dired_revert();
+        // Keep point on the renamed file when it is still in this listing
+        // (i.e. it was renamed in place rather than moved elsewhere).
+        let idx = self.current;
+        if let Some(dir) = self.buffers[idx].dired.as_ref().map(|d| d.dir.clone()) {
+            if let Some(name) = renamed.iter().find_map(|(_, new)| {
+                (new.parent() == Some(dir.as_path()))
+                    .then(|| new.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .flatten()
+            }) {
+                self.dired_goto_name(idx, &name);
+            }
+        }
         self.message = Some(if errors == 0 {
             match renamed.as_slice() {
                 [(_, new)] => format!("Renamed to {}", new.display()),
@@ -2958,10 +2983,13 @@ mod tests {
     #[test]
     fn r_renames_the_file_at_point() {
         let dir = temp_dir("rename");
+        // `aaa.txt` sorts first so the rename target is not the first file.
+        std::fs::write(dir.join("aaa.txt"), b"x").unwrap();
         std::fs::write(dir.join("old.txt"), b"hello").unwrap();
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
 
+        press(&mut app, 'n'); // move to old.txt
         press(&mut app, 'R');
         if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
             *input = "new.txt".to_string();
@@ -2975,6 +3003,12 @@ mod tests {
         assert!(dir.join("new.txt").exists());
         let d = app.current().dired.as_ref().unwrap();
         assert!(d.entries.iter().any(|e| e.name == "new.txt"));
+        // Point stays on the renamed file.
+        let i = app.dired_entry_at_point().unwrap();
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[i].name,
+            "new.txt"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
