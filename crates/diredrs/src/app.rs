@@ -1,5 +1,6 @@
 //! Application state and the event loop.
 
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use ratatui::Terminal;
 use crate::buffer::{Buffer, Line, Pos};
 use crate::config::Config;
 use crate::dired::{Dired, Mark};
+use crate::file;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
@@ -27,6 +29,8 @@ pub enum Kind {
     Help,
     /// A Dired directory listing.
     Dired,
+    /// A read-only file view.
+    File,
 }
 
 /// One buffer.
@@ -194,7 +198,7 @@ impl App {
 
     pub fn mode_line_mode(&self) -> String {
         match self.current().kind {
-            Kind::Scratch => "Fundamental".to_string(),
+            Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
             Kind::Dired => "Dired".to_string(),
         }
@@ -256,6 +260,32 @@ impl App {
             }
             Err(err) => {
                 self.message = Some(format!("Cannot read {}: {err}", dir.display()));
+            }
+        }
+    }
+
+    /// Open (or switch to) a read-only view of `path`.
+    fn open_file(&mut self, path: PathBuf) {
+        let name = path.display().to_string();
+        if let Some(idx) = self.find_buffer(&name) {
+            self.switch_to(idx);
+            return;
+        }
+        match fs::read(&path) {
+            Ok(bytes) if file::looks_binary(&bytes) => {
+                self.message = Some(format!(
+                    "{} is a binary file (hex viewer not yet available)",
+                    path.display()
+                ));
+            }
+            Ok(bytes) => {
+                let lines = file::to_lines(&bytes);
+                let buffer = Buffer::read_only_from(lines);
+                let idx = self.new_buffer(name, Kind::File, buffer);
+                self.switch_to(idx);
+            }
+            Err(err) => {
+                self.message = Some(format!("Cannot read {}: {err}", path.display()));
             }
         }
     }
@@ -342,7 +372,7 @@ impl App {
         if is_dir {
             self.open_dired(path);
         } else {
-            self.message = Some(format!("Viewing {} is not yet implemented", path.display()));
+            self.open_file(path);
         }
     }
 
@@ -1663,6 +1693,28 @@ mod tests {
         // Point is on the single entry (the subdirectory); RET opens it.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.current().name, dir.join("sub").display().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opens_text_file_read_only() {
+        let dir = temp_dir("file");
+        let path = dir.join("note.txt");
+        std::fs::write(&path, b"hello\nworld\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_file(path.clone());
+        assert_eq!(app.current().kind, Kind::File);
+        assert!(!app.current().buffer.editable());
+        assert_eq!(app.current().buffer.line(0).text(), "hello");
+        assert_eq!(app.current().buffer.len(), 2);
+
+        // Editing a file view is refused.
+        let before = app.current().buffer.line(0).text();
+        press(&mut app, 'x');
+        assert_eq!(app.current().buffer.line(0).text(), before);
+        assert_eq!(app.message.as_deref(), Some("Text is read-only"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
