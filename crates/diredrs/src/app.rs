@@ -724,6 +724,29 @@ impl App {
         self.message = Some(format!("Marked {count} file(s)"));
     }
 
+    /// Flag for deletion the files matching `pred` (`#` / `~`); a numeric
+    /// argument unmarks them instead, like `dired-flag-auto-save-files` and
+    /// `dired-flag-backup-files`.
+    fn dired_flag_files(&mut self, what: &str, pred: impl Fn(&str) -> bool) {
+        let unflag = self.numeric_arg.take().is_some();
+        let idx = self.current;
+        let mark = if unflag { Mark::None } else { Mark::Flagged };
+        let mut count = 0usize;
+        if let Some(d) = self.buffers[idx].dired.as_mut() {
+            for entry in &mut d.entries {
+                if !entry.is_dir && pred(&entry.name) {
+                    entry.mark = mark;
+                    count += 1;
+                }
+            }
+        }
+        self.dired_rebuild(idx);
+        self.message = Some(format!(
+            "{} {count} {what}",
+            if unflag { "Unmarked" } else { "Flagged" }
+        ));
+    }
+
     /// Re-render a listing in place, keeping point.
     fn dired_rebuild(&mut self, idx: usize) {
         let theme = self.theme;
@@ -992,6 +1015,14 @@ impl App {
             }
             KeyCode::Char('D') => {
                 self.dired_start_delete(Mark::Marked);
+                true
+            }
+            KeyCode::Char('#') => {
+                self.dired_flag_files("auto-save file(s)", is_auto_save_file);
+                true
+            }
+            KeyCode::Char('~') => {
+                self.dired_flag_files("backup file(s)", is_backup_file);
                 true
             }
             KeyCode::Char('w') => {
@@ -2395,6 +2426,18 @@ fn delete_paths(paths: Vec<PathBuf>) -> String {
 }
 
 /// The user's home directory, falling back to environment variables.
+/// Whether `name` looks like an Emacs auto-save file (`#...#`), matching
+/// `auto-save-file-name-p`.
+fn is_auto_save_file(name: &str) -> bool {
+    name.len() >= 2 && name.starts_with('#') && name.ends_with('#')
+}
+
+/// Whether `name` is an Emacs backup file (ends with `~`), matching
+/// `backup-file-name-p`.
+fn is_backup_file(name: &str) -> bool {
+    name.ends_with('~')
+}
+
 fn home_dir() -> Option<PathBuf> {
     if let Some(dirs) = directories::UserDirs::new() {
         return Some(dirs.home_dir().to_path_buf());
@@ -2544,6 +2587,8 @@ fn help_lines() -> Vec<String> {
         "  t / U               toggle / remove all marks",
         "  * !                 unmark all files",
         "  * .                 mark files by extension",
+        "  #                   flag auto-save files for deletion",
+        "  ~                   flag backup files for deletion",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   cycle sorting: name / date / size",
         "  < / >               previous / next directory line",
@@ -3098,6 +3143,52 @@ mod tests {
             .entries
             .iter()
             .all(|e| e.mark == Mark::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hash_flags_auto_save_files() {
+        let dir = temp_dir("autosave");
+        std::fs::write(dir.join("real.txt"), b"x").unwrap();
+        std::fs::write(dir.join("#other#"), b"x").unwrap();
+        std::fs::write(dir.join("#real.txt#"), b"x").unwrap();
+        std::fs::write(dir.join("#open"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, '#');
+
+        let d = app.current().dired.as_ref().unwrap();
+        let flagged: Vec<&str> = d
+            .entries
+            .iter()
+            .filter(|e| e.mark == Mark::Flagged)
+            .map(|e| e.name.as_str())
+            .collect();
+        // Only names that both begin and end with `#`.
+        assert_eq!(flagged, ["#other#", "#real.txt#"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tilde_flags_backup_files() {
+        let dir = temp_dir("backup");
+        std::fs::write(dir.join("real.txt"), b"x").unwrap();
+        std::fs::write(dir.join("real.txt~"), b"x").unwrap();
+        std::fs::write(dir.join("notes~"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, '~');
+
+        let d = app.current().dired.as_ref().unwrap();
+        let flagged: Vec<&str> = d
+            .entries
+            .iter()
+            .filter(|e| e.mark == Mark::Flagged)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(flagged, ["notes~", "real.txt~"]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
