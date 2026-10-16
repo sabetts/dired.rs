@@ -110,6 +110,10 @@ fn line_cells(line: &Line) -> Vec<(char, Style)> {
     let mut cells = Vec::new();
     for span in &line.spans {
         for ch in span.text.chars() {
+            // Control characters (tabs, etc.) occupy no cell in ratatui but
+            // the terminal may still act on them; show a space instead so every
+            // character is exactly one cell and column math stays aligned.
+            let ch = if ch.is_control() { ' ' } else { ch };
             cells.push((ch, span.style));
         }
     }
@@ -214,5 +218,18 @@ fn rcolor(color: Color) -> RColor {
         Color::LightCyan => RColor::LightCyan,
         Color::White => RColor::White,
         Color::Rgb(r, g, b) => RColor::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::Line;
+
+    #[test]
+    fn control_chars_render_as_spaces() {
+        let cells = line_cells(&Line::plain("a\tb"));
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1].0, ' ');
     }
 }

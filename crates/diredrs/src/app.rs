@@ -168,6 +168,8 @@ pub struct App {
     /// While set, key events are treated as part of an in-progress paste (a
     /// Windows paste delivered as individual keys; see `handle_term_event`).
     pasting_until: Option<Instant>,
+    /// The buffer index last drawn, so a switch can force a full repaint.
+    drawn: Option<usize>,
 }
 
 impl App {
@@ -196,6 +198,7 @@ impl App {
             dabbrev: None,
             clipboard: true,
             pasting_until: None,
+            drawn: None,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -753,6 +756,13 @@ impl App {
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
+            // A buffer switch replaces the whole view; repaint from scratch so
+            // the previous buffer's cells (and any terminal state they left
+            // behind) can't desync the diff-based redraw.
+            if self.drawn != Some(self.current) {
+                terminal.clear()?;
+                self.drawn = Some(self.current);
+            }
             let size = terminal.size()?;
             let minibuffer = self.minibuffer_height();
             self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
@@ -2135,7 +2145,7 @@ fn osc52_sequence(text: &str) -> Option<String> {
 fn scratch_lines() -> Vec<String> {
     let path = crate::config::default_path();
     [
-        "diredrs — a directory editor with Emacs-style editing".to_string(),
+        "diredrs - a directory editor with Emacs-style editing".to_string(),
         String::new(),
         "Welcome to the *scratch* buffer: a free-text buffer for notes and".to_string(),
         "drafts. Nothing typed here touches the filesystem.".to_string(),
@@ -2564,6 +2574,37 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn switching_to_shorter_buffer_clears_leftovers() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("switch");
+        std::fs::write(dir.join("short.txt"), b"one\ntwo\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        // Render a long buffer (scratch has many lines).
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        // Switch to a two-line file.
+        app.open_file(dir.join("short.txt"));
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        // Rows below the two lines (buffer area is 0..8) must be blank.
+        for y in 2..8u16 {
+            for x in 0..40u16 {
+                assert_eq!(buf[(x, y)].symbol(), " ", "leftover at ({x},{y})");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
