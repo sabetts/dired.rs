@@ -73,9 +73,16 @@ impl SortKey {
 pub struct Entry {
     pub name: String,
     pub path: PathBuf,
-    /// The `  perms links owner group size date ` text before the file name.
-    /// The mark replaces its first character at render time.
-    pub head: String,
+    /// Permissions string, e.g. `drwxr-xr-x`.
+    perm: String,
+    /// Hard-link count.
+    links: u64,
+    owner: String,
+    group: String,
+    /// Size in bytes.
+    size: u64,
+    /// Preformatted modification time, e.g. `Oct 16 09:40`.
+    date: String,
     pub is_dir: bool,
     pub is_symlink: bool,
     pub is_exec: bool,
@@ -88,6 +95,24 @@ pub struct Entry {
     pub mark: Mark,
 }
 
+impl Entry {
+    /// The `  perms links owner group size date ` text before the file name.
+    /// The mark replaces its first character at render time.
+    fn head(&self, human: bool, links_width: usize, size_width: usize) -> String {
+        format!(
+            "  {} {:>lw$} {} {} {:>sw$} {} ",
+            self.perm,
+            self.links,
+            self.owner,
+            self.group,
+            format_size(self.size, human),
+            self.date,
+            lw = links_width,
+            sw = size_width,
+        )
+    }
+}
+
 /// A directory listing.
 #[derive(Debug, Clone)]
 pub struct Dired {
@@ -95,31 +120,25 @@ pub struct Dired {
     pub entries: Vec<Entry>,
     /// Current ordering.
     pub sort: SortKey,
+    /// Whether sizes are shown human-readably (`ls -h`).
+    human_sizes: bool,
+    links_width: usize,
+    size_width: usize,
 }
 
 impl Dired {
-    /// Read `dir`, building a listing. `show_hidden` lists dotfiles.
-    pub fn read(dir: &Path, show_hidden: bool) -> io::Result<Dired> {
+    /// Read `dir`, building a listing. `show_hidden` lists dotfiles and
+    /// `human_sizes` formats sizes as K/M/G (`ls -h`).
+    pub fn read(dir: &Path, show_hidden: bool, human_sizes: bool) -> io::Result<Dired> {
         let mut entries: Vec<Entry> = Vec::new();
-        let mut read = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if !show_hidden && name.starts_with('.') {
                 continue;
             }
+            let path = entry.path();
             let meta = entry.metadata()?;
-            read.push((name, entry.path(), meta));
-        }
-
-        let links_width = 2;
-        let size_width = read
-            .iter()
-            .map(|(_, _, m)| format!("{}", m.len()).len())
-            .max()
-            .unwrap_or(1);
-
-        for (name, path, meta) in read {
             let file_type = meta.file_type();
             let is_symlink = file_type.is_symlink();
             let is_dir = file_type.is_dir();
@@ -129,27 +148,22 @@ impl Dired {
             } else {
                 None
             };
-            let head = format!(
-                "  {} {:>lw$} {} {} {:>sw$} {} ",
-                perm_string(&meta),
-                nlink(&meta),
-                owner(&meta),
-                group(&meta),
-                meta.len(),
-                format_mtime(meta.modified().ok()),
-                lw = links_width,
-                sw = size_width,
-            );
+            let modified = meta.modified().ok();
             entries.push(Entry {
                 name,
                 path,
-                head,
+                perm: perm_string(&meta),
+                links: nlink(&meta),
+                owner: owner(&meta),
+                group: group(&meta),
+                size: meta.len(),
+                date: format_mtime(modified),
                 is_dir,
                 is_symlink,
                 is_exec,
                 target,
                 blocks: meta.len().div_ceil(1024),
-                mtime: meta.modified().ok(),
+                mtime: modified,
                 mark: Mark::None,
             });
         }
@@ -158,9 +172,36 @@ impl Dired {
             dir: dir.to_path_buf(),
             entries,
             sort: SortKey::default(),
+            human_sizes,
+            links_width: 2,
+            size_width: 1,
         };
+        dired.recompute_widths();
         dired.resort();
         Ok(dired)
+    }
+
+    /// Toggle human-readable sizes, re-fitting the size column.
+    pub fn set_human_sizes(&mut self, human: bool) {
+        self.human_sizes = human;
+        self.recompute_widths();
+    }
+
+    /// Recompute the column widths from the entries and the current size mode.
+    fn recompute_widths(&mut self) {
+        self.links_width = self
+            .entries
+            .iter()
+            .map(|e| e.links.to_string().len())
+            .max()
+            .unwrap_or(1)
+            .max(2);
+        self.size_width = self
+            .entries
+            .iter()
+            .map(|e| format_size(e.size, self.human_sizes).chars().count())
+            .max()
+            .unwrap_or(1);
     }
 
     /// Change the ordering and re-sort in place (keeping marks and metadata).
@@ -200,7 +241,10 @@ impl Dired {
     /// Render a single entry's line, including its mark and name face.
     pub fn render_line(&self, i: usize, theme: &Theme) -> Line {
         let entry = &self.entries[i];
-        let mut chars: Vec<char> = entry.head.chars().collect();
+        let mut chars: Vec<char> = entry
+            .head(self.human_sizes, self.links_width, self.size_width)
+            .chars()
+            .collect();
         if let Some(first) = chars.first_mut() {
             *first = entry.mark.ch();
         }
@@ -251,7 +295,12 @@ impl Dired {
     /// The character column where a file line's name begins.
     pub fn filename_col(&self, row: usize) -> Option<usize> {
         let i = self.entry_index_at(row)?;
-        Some(self.entries[i].head.chars().count())
+        let e = &self.entries[i];
+        Some(
+            e.head(self.human_sizes, self.links_width, self.size_width)
+                .chars()
+                .count(),
+        )
     }
 
     /// The row of the first file line, if the listing is non-empty.
@@ -262,6 +311,30 @@ impl Dired {
     /// Total number of buffer rows this listing renders to.
     pub fn len(&self) -> usize {
         self.entries.len() + HEADER_LINES
+    }
+}
+
+/// Format a byte count for the size column. With `human`, use GNU `ls -h`'s
+/// style: counts below 1K are exact, larger values use K/M/G/T with at most
+/// three significant digits (`4.0K`, `234K`, `1.5M`).
+fn format_size(bytes: u64, human: bool) -> String {
+    if !human {
+        return bytes.to_string();
+    }
+    const UNITS: [&str; 7] = ["", "K", "M", "G", "T", "P", "E"];
+    if bytes < 1024 {
+        return bytes.to_string();
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
     }
 }
 
@@ -396,7 +469,7 @@ mod tests {
         fs::write(dir.join("alpha.txt"), b"hello").unwrap();
         fs::create_dir(dir.join("sub")).unwrap();
 
-        let d = Dired::read(&dir, true).unwrap();
+        let d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.entries.len(), 2);
         // Sorted by name: alpha.txt, sub.
         assert_eq!(d.entries[0].name, "alpha.txt");
@@ -412,7 +485,9 @@ mod tests {
         // The name begins right after the head (permissions at column 2).
         assert_eq!(
             d.filename_col(HEADER_LINES).unwrap(),
-            d.entries[0].head.len()
+            d.entries[0]
+                .head(d.human_sizes, d.links_width, d.size_width)
+                .len()
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -424,9 +499,9 @@ mod tests {
         fs::write(dir.join(".secret"), b"x").unwrap();
         fs::write(dir.join("visible"), b"x").unwrap();
 
-        let all = Dired::read(&dir, true).unwrap();
+        let all = Dired::read(&dir, true, true).unwrap();
         assert_eq!(all.entries.len(), 2);
-        let shown = Dired::read(&dir, false).unwrap();
+        let shown = Dired::read(&dir, false, true).unwrap();
         assert_eq!(shown.entries.len(), 1);
         assert_eq!(shown.entries[0].name, "visible");
 
@@ -440,7 +515,7 @@ mod tests {
         fs::write(dir.join("a.txt"), b"x").unwrap();
         fs::write(dir.join("c.txt"), b"x").unwrap();
 
-        let mut d = Dired::read(&dir, true).unwrap();
+        let mut d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.sort, SortKey::Name);
 
         let t = |secs: u64| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
@@ -469,10 +544,41 @@ mod tests {
     fn entry_index_and_header_rows() {
         let dir = temp_dir("rows");
         fs::write(dir.join("one"), b"x").unwrap();
-        let d = Dired::read(&dir, true).unwrap();
+        let d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.entry_index_at(0), None);
         assert_eq!(d.entry_index_at(1), None);
         assert_eq!(d.entry_index_at(2), Some(0));
         assert_eq!(d.first_file_row(), Some(2));
+    }
+
+    #[test]
+    fn format_size_human_readable() {
+        assert_eq!(format_size(0, true), "0");
+        assert_eq!(format_size(512, true), "512");
+        assert_eq!(format_size(1024, true), "1.0K");
+        assert_eq!(format_size(1536, true), "1.5K");
+        assert_eq!(format_size(10 * 1024, true), "10K");
+        assert_eq!(format_size(1024 * 1024, true), "1.0M");
+        assert_eq!(format_size(2_500_000, true), "2.4M");
+        // Exact bytes when human-readable is off.
+        assert_eq!(format_size(1536, false), "1536");
+    }
+
+    #[test]
+    fn human_sizes_toggle_in_listing() {
+        let dir = temp_dir("humansize");
+        fs::write(dir.join("big.bin"), vec![0u8; 2048]).unwrap();
+        let theme = Theme::for_background(crate::theme::Background::Dark);
+
+        let mut d = Dired::read(&dir, true, true).unwrap();
+        assert!(d.human_sizes);
+        assert!(d.render_line(0, &theme).text().contains("2.0K"));
+
+        // Toggling in place reformats the size column.
+        d.set_human_sizes(false);
+        assert!(!d.human_sizes);
+        assert!(d.render_line(0, &theme).text().contains("2048"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

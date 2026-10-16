@@ -184,11 +184,14 @@ pub struct App {
     pasting_until: Option<Instant>,
     /// The buffer index last drawn, so a switch can force a full repaint.
     drawn: Option<usize>,
+    /// Whether Dired shows sizes human-readably (`ls -h`), toggled with `h`.
+    human_sizes: bool,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let theme = Theme::for_background(config.ui.background);
+        let human_sizes = config.ui.human_sizes;
         let mut app = App {
             config,
             theme,
@@ -213,6 +216,7 @@ impl App {
             clipboard: true,
             pasting_until: None,
             drawn: None,
+            human_sizes,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -343,7 +347,7 @@ impl App {
             self.switch_to(idx);
             return;
         }
-        match Dired::read(&dir, self.config.ui.show_hidden) {
+        match Dired::read(&dir, self.config.ui.show_hidden, self.human_sizes) {
             Ok(dired) => {
                 let lines = dired.render(&self.theme);
                 let buffer = Buffer::read_only_from(lines);
@@ -530,7 +534,7 @@ impl App {
             .filter(|e| e.mark != Mark::None)
             .map(|e| (e.name.clone(), e.mark))
             .collect();
-        match Dired::read(&dir, self.config.ui.show_hidden) {
+        match Dired::read(&dir, self.config.ui.show_hidden, self.human_sizes) {
             Ok(mut dired) => {
                 for entry in &mut dired.entries {
                     if let Some((_, mark)) = marks.iter().find(|(n, _)| *n == entry.name) {
@@ -584,6 +588,36 @@ impl App {
             None => self.goto_first_file(idx),
         }
         self.message = Some(format!("Sorting by {}", sort.label()));
+    }
+
+    /// Toggle human-readable file sizes across every Dired buffer (`h`).
+    fn dired_toggle_human_sizes(&mut self) {
+        self.human_sizes = !self.human_sizes;
+        let human = self.human_sizes;
+        let theme = self.theme;
+        for i in 0..self.buffers.len() {
+            if self.buffers[i].dired.is_none() {
+                continue;
+            }
+            // Re-render while keeping point on the same file line (the name
+            // column shifts with the size column's new width).
+            let row = self.buffers[i].buffer.point().row;
+            let (lines, col) = {
+                let d = self.buffers[i].dired.as_mut().unwrap();
+                d.set_human_sizes(human);
+                (d.render(&theme), d.filename_col(row).unwrap_or(0))
+            };
+            self.buffers[i].buffer.set_content(lines);
+            self.buffers[i].buffer.set_point(Pos::new(row, col));
+        }
+        self.message = Some(format!(
+            "File sizes: {}",
+            if human {
+                "human-readable"
+            } else {
+                "exact bytes"
+            }
+        ));
     }
 
     /// Kill the current Dired buffer (`q`).
@@ -945,6 +979,10 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.dired_toggle_sort();
+                true
+            }
+            KeyCode::Char('h') => {
+                self.dired_toggle_human_sizes();
                 true
             }
             KeyCode::Char('R') => {
@@ -2474,6 +2512,7 @@ fn help_lines() -> Vec<String> {
         "  * .                 mark files by extension",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   toggle sorting by name / date",
+        "  h                   toggle human-readable file sizes",
         "  < / >               first / last file line",
         "",
         "Files and buffers",
@@ -2831,6 +2870,25 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn h_toggles_human_readable_sizes() {
+        let dir = temp_dir("humantoggle");
+        std::fs::write(dir.join("big.bin"), vec![0u8; 2048]).unwrap();
+        let mut app = App::new(Config::default());
+        assert!(app.human_sizes);
+        app.open_dired(dir.clone());
+        // Row 2 is the first file line.
+        assert!(app.current().buffer.line(2).text().contains("2.0K"));
+
+        press(&mut app, 'h');
+        assert!(!app.human_sizes);
+        assert!(app.current().buffer.line(2).text().contains("2048"));
+        // Point stays on the same file line.
+        assert_eq!(app.dired_entry_at_point(), Some(0));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

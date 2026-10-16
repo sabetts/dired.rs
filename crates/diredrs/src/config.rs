@@ -20,6 +20,8 @@ pub struct UiConfig {
     pub background: Background,
     /// List dotfiles, like `ls -a`.
     pub show_hidden: bool,
+    /// Show file sizes in human-readable units (K, M, G), like `ls -h`.
+    pub human_sizes: bool,
 }
 
 impl Default for UiConfig {
@@ -27,6 +29,7 @@ impl Default for UiConfig {
         UiConfig {
             background: Background::Dark,
             show_hidden: true,
+            human_sizes: true,
         }
     }
 }
@@ -35,8 +38,9 @@ impl Default for UiConfig {
 pub const TEMPLATE: &str = r##"# diredrs configuration
 
 [ui]
-background = "dark"    # or "light"
-show_hidden = true     # list dotfiles, like ls -a
+background = "dark"     # or "light"
+show_hidden = true      # list dotfiles, like ls -a
+human_sizes = true      # sizes as K/M/G (ls -h); toggle in Dired with h
 "##;
 
 impl Config {
@@ -75,6 +79,7 @@ mod tests {
         let cfg: Config = toml::from_str(TEMPLATE).unwrap();
         assert_eq!(cfg.ui.background, Background::Dark);
         assert!(cfg.ui.show_hidden);
+        assert!(cfg.ui.human_sizes);
     }
 
     #[test]
@@ -82,6 +87,7 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.ui.background, Background::Dark);
         assert!(cfg.ui.show_hidden);
+        assert!(cfg.ui.human_sizes);
     }
 
     #[test]
