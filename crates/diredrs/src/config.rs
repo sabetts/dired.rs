@@ -22,6 +22,9 @@ pub struct UiConfig {
     pub show_hidden: bool,
     /// Show file sizes in human-readable units (K, M, G), like `ls -h`.
     pub human_sizes: bool,
+    /// Lines kept above and below point before the view scrolls
+    /// (Emacs' `scroll-margin`).
+    pub scroll_margin: usize,
 }
 
 impl Default for UiConfig {
@@ -30,6 +33,7 @@ impl Default for UiConfig {
             background: Background::Dark,
             show_hidden: true,
             human_sizes: true,
+            scroll_margin: 1,
         }
     }
 }
@@ -41,6 +45,7 @@ pub const TEMPLATE: &str = r##"# diredrs configuration
 background = "dark"     # or "light"
 show_hidden = true      # list dotfiles, like ls -a
 human_sizes = true      # sizes as K/M/G like ls -h; false for exact bytes
+scroll_margin = 1       # lines kept above/below point before the view scrolls
 "##;
 
 impl Config {
@@ -80,6 +85,7 @@ mod tests {
         assert_eq!(cfg.ui.background, Background::Dark);
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
+        assert_eq!(cfg.ui.scroll_margin, 1);
     }
 
     #[test]
@@ -88,6 +94,7 @@ mod tests {
         assert_eq!(cfg.ui.background, Background::Dark);
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
+        assert_eq!(cfg.ui.scroll_margin, 1);
     }
 
     #[test]

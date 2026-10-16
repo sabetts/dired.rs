@@ -510,23 +510,34 @@ impl Buffer {
         let (vl, vc) = self.advance_backward(self.point.row, self.point.col, off);
         self.set_view_top(vl, vc / self.width);
     }
-
-    /// Keep point within a window `height` wrapped rows tall, scrolling only
-    /// when point reaches the top or bottom edge (Emacs-style).
-    pub fn ensure_point_visible(&mut self, height: usize) {
+    /// Keep point within a window `height` wrapped rows tall, with `margin`
+    /// rows of padding: the view scrolls once point comes within `margin` rows
+    /// of the top or bottom (Emacs' `scroll-margin`). `margin` 0 scrolls only
+    /// at the edges; 1 keeps point at least one row away from each edge.
+    pub fn ensure_point_visible(&mut self, height: usize, margin: usize) {
         let height = height.max(1);
+        let margin = margin.min(height.saturating_sub(1) / 2);
         let psub = self.sub_of(self.point.row, self.point.col);
         if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
         {
-            self.scroll = self.point.row;
-            self.scroll_sub = psub;
+            // Point is above the view: leave `margin` rows above it.
+            let (vl, vc) = self.advance_backward(self.point.row, self.point.col, margin);
+            self.set_view_top(vl, vc / self.width);
             return;
         }
         let off = self.offset_from_top();
-        if off >= height {
-            // Advance the top so the point sits on the last visible row.
-            let (l, c) =
-                self.advance_forward(self.scroll, self.scroll_sub * self.width, off + 1 - height);
+        if off < margin {
+            // Scroll up so there are `margin` rows above point.
+            let (vl, vc) =
+                self.advance_backward(self.scroll, self.scroll_sub * self.width, margin - off);
+            self.set_view_top(vl, vc / self.width);
+        } else if off + margin >= height {
+            // Scroll down so there are `margin` rows below point.
+            let (l, c) = self.advance_forward(
+                self.scroll,
+                self.scroll_sub * self.width,
+                off + margin + 1 - height,
+            );
             self.set_view_top(l, c / self.width);
         }
     }
@@ -1033,20 +1044,38 @@ mod tests {
         b.set_width(10);
         b.set_view_top(1, 1); // top is the second row of line 1
         b.set_point(Pos::new(5, 0));
-        b.ensure_point_visible(5);
+        b.ensure_point_visible(5, 0);
         let top = (b.scroll(), b.scroll_sub());
 
         // Moving up within the view must not scroll.
         b.prev_line();
-        b.ensure_point_visible(5);
+        b.ensure_point_visible(5, 0);
         assert_eq!((b.scroll(), b.scroll_sub()), top);
 
         // Moving up past the top scrolls by exactly the overflow.
         b.set_view_top(3, 0);
         b.set_point(Pos::new(3, 0));
         b.prev_line(); // point -> line 2, above the top (line 3)
-        b.ensure_point_visible(5);
+        b.ensure_point_visible(5, 0);
         assert_eq!(b.scroll(), 2);
+    }
+
+    #[test]
+    fn scroll_margin_keeps_point_off_the_edges() {
+        let mut b = text_buffer("0\n1\n2\n3\n4\n5\n6\n7\n8\n9");
+        b.set_width(80);
+
+        // Margin 0: the point may sit on the last visible row.
+        b.set_view_top(0, 0);
+        b.set_point(Pos::new(4, 0));
+        b.ensure_point_visible(5, 0);
+        assert_eq!(b.scroll(), 0);
+
+        // Margin 1: it scrolls to leave a row of padding below the point.
+        b.set_view_top(0, 0);
+        b.set_point(Pos::new(4, 0));
+        b.ensure_point_visible(5, 1);
+        assert_eq!(b.scroll(), 1);
     }
 
     #[test]

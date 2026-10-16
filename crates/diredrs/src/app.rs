@@ -188,12 +188,15 @@ pub struct App {
     drawn: Option<usize>,
     /// Whether Dired shows sizes human-readably (`ls -h`); `ui.human_sizes`.
     human_sizes: bool,
+    /// Rows of padding kept above/below point before scrolling.
+    scroll_margin: usize,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let theme = Theme::for_background(config.ui.background);
         let human_sizes = config.ui.human_sizes;
+        let scroll_margin = config.ui.scroll_margin;
         let mut app = App {
             config,
             theme,
@@ -220,6 +223,7 @@ impl App {
             pasting_until: None,
             drawn: None,
             human_sizes,
+            scroll_margin,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -316,8 +320,12 @@ impl App {
         self.current = idx;
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
+        let cols = self.viewport_cols;
         let height = self.viewport_rows.max(1);
-        self.current_mut().buffer.ensure_point_visible(height);
+        let margin = self.scroll_margin;
+        let buf = &mut self.buffers[idx].buffer;
+        buf.set_width(cols);
+        buf.ensure_point_visible(height, margin);
     }
 
     /// Kill a buffer. `*scratch*` cannot be killed.
@@ -1101,7 +1109,10 @@ impl App {
 
     fn ensure_scroll_visible(&mut self) {
         let height = self.viewport_rows.max(1);
-        self.current_mut().buffer.ensure_point_visible(height);
+        let margin = self.scroll_margin;
+        self.current_mut()
+            .buffer
+            .ensure_point_visible(height, margin);
     }
 
     // ---- key handling ------------------------------------------------------
