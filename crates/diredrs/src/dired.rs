@@ -181,12 +181,6 @@ impl Dired {
         Ok(dired)
     }
 
-    /// Toggle human-readable sizes, re-fitting the size column.
-    pub fn set_human_sizes(&mut self, human: bool) {
-        self.human_sizes = human;
-        self.recompute_widths();
-    }
-
     /// Recompute the column widths from the entries and the current size mode.
     fn recompute_widths(&mut self) {
         self.links_width = self
@@ -565,19 +559,18 @@ mod tests {
     }
 
     #[test]
-    fn human_sizes_toggle_in_listing() {
+    fn human_sizes_in_listing() {
         let dir = temp_dir("humansize");
         fs::write(dir.join("big.bin"), vec![0u8; 2048]).unwrap();
         let theme = Theme::for_background(crate::theme::Background::Dark);
 
-        let mut d = Dired::read(&dir, true, true).unwrap();
-        assert!(d.human_sizes);
-        assert!(d.render_line(0, &theme).text().contains("2.0K"));
+        let human = Dired::read(&dir, true, true).unwrap();
+        assert!(human.human_sizes);
+        assert!(human.render_line(0, &theme).text().contains("2.0K"));
 
-        // Toggling in place reformats the size column.
-        d.set_human_sizes(false);
-        assert!(!d.human_sizes);
-        assert!(d.render_line(0, &theme).text().contains("2048"));
+        let exact = Dired::read(&dir, true, false).unwrap();
+        assert!(!exact.human_sizes);
+        assert!(exact.render_line(0, &theme).text().contains("2048"));
 
         fs::remove_dir_all(&dir).ok();
     }

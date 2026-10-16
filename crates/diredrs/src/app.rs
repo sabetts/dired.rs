@@ -590,36 +590,6 @@ impl App {
         self.message = Some(format!("Sorting by {}", sort.label()));
     }
 
-    /// Toggle human-readable file sizes across every Dired buffer (`h`).
-    fn dired_toggle_human_sizes(&mut self) {
-        self.human_sizes = !self.human_sizes;
-        let human = self.human_sizes;
-        let theme = self.theme;
-        for i in 0..self.buffers.len() {
-            if self.buffers[i].dired.is_none() {
-                continue;
-            }
-            // Re-render while keeping point on the same file line (the name
-            // column shifts with the size column's new width).
-            let row = self.buffers[i].buffer.point().row;
-            let (lines, col) = {
-                let d = self.buffers[i].dired.as_mut().unwrap();
-                d.set_human_sizes(human);
-                (d.render(&theme), d.filename_col(row).unwrap_or(0))
-            };
-            self.buffers[i].buffer.set_content(lines);
-            self.buffers[i].buffer.set_point(Pos::new(row, col));
-        }
-        self.message = Some(format!(
-            "File sizes: {}",
-            if human {
-                "human-readable"
-            } else {
-                "exact bytes"
-            }
-        ));
-    }
-
     /// Kill the current Dired buffer (`q`).
     fn dired_quit(&mut self) {
         let idx = self.current;
@@ -979,10 +949,6 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.dired_toggle_sort();
-                true
-            }
-            KeyCode::Char('h') => {
-                self.dired_toggle_human_sizes();
                 true
             }
             KeyCode::Char('R') => {
@@ -2512,7 +2478,6 @@ fn help_lines() -> Vec<String> {
         "  * .                 mark files by extension",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   toggle sorting by name / date",
-        "  h                   toggle human-readable file sizes",
         "  < / >               first / last file line",
         "",
         "Files and buffers",
@@ -2873,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn h_toggles_human_readable_sizes() {
+    fn listing_uses_human_readable_sizes() {
         let dir = temp_dir("humantoggle");
         std::fs::write(dir.join("big.bin"), vec![0u8; 2048]).unwrap();
         let mut app = App::new(Config::default());
@@ -2881,12 +2846,6 @@ mod tests {
         app.open_dired(dir.clone());
         // Row 2 is the first file line.
         assert!(app.current().buffer.line(2).text().contains("2.0K"));
-
-        press(&mut app, 'h');
-        assert!(!app.human_sizes);
-        assert!(app.current().buffer.line(2).text().contains("2048"));
-        // Point stays on the same file line.
-        assert_eq!(app.dired_entry_at_point(), Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
     }

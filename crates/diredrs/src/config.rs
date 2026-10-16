@@ -40,7 +40,7 @@ pub const TEMPLATE: &str = r##"# diredrs configuration
 [ui]
 background = "dark"     # or "light"
 show_hidden = true      # list dotfiles, like ls -a
-human_sizes = true      # sizes as K/M/G (ls -h); toggle in Dired with h
+human_sizes = true      # sizes as K/M/G like ls -h; false for exact bytes
 "##;
 
 impl Config {
