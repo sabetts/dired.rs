@@ -18,6 +18,21 @@ diverged in a few places where it made sense.
 
 It's a work-in-progress.
 
+# Notes
+
+On Windows Terminal, `Ctrl-V` is bound by the *terminal* to paste, so it
+never reaches diredrs and the `C-v` page-down binding is unavailable
+there. Use the `PageDown` key instead, or free the chord by unbinding
+`Ctrl-V` in Windows Terminal (Settings → Actions → delete the Paste
+binding for `ctrl+v`; `Ctrl-Shift-V` still pastes):
+
+    { "command": "unbound", "keys": "ctrl+v" }
+
+Pasting into a read-only buffer (Dired, file views, the hex viewer) is
+refused with "Text is read-only"; pasting into `*scratch*` or a prompt
+inserts the text. A deliberate single-character paste on Windows is
+indistinguishable from a keystroke.
+
 # Model Used
 
 I'm using Deepseek v4.1 flash.

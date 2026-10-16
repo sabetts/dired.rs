@@ -10,6 +10,7 @@ mod hexl;
 mod input;
 mod keymap;
 mod killring;
+mod paste;
 mod search;
 mod theme;
 mod ui;

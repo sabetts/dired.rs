@@ -333,6 +333,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.29.0",
+ "crossterm_winapi",
  "directories",
  "ratatui",
  "serde",

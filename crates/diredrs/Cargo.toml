@@ -21,3 +21,9 @@ ratatui = "0.29.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 unicode-width = "=0.2.0"
+
+# Same crate/version crossterm already pulls in; used to peek the Windows
+# console input queue so a paste that arrives as individual key events can be
+# detected. See `paste.rs`.
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9.1"

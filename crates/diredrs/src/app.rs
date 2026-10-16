@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -17,6 +18,7 @@ use crate::hexl;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
+use crate::paste;
 use crate::search::{Search, SearchDirection};
 use crate::theme::Theme;
 use crate::ui;
@@ -125,6 +127,10 @@ struct Dabbrev {
     index: usize,
 }
 
+/// How long after a detected paste we keep folding queued keys into it, so a
+/// paste delivered in chunks is not interpreted as commands.
+const PASTE_LATCH: Duration = Duration::from_millis(50);
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -153,6 +159,9 @@ pub struct App {
     dabbrev: Option<Dabbrev>,
     /// Whether kills/copies are written to the system clipboard (OSC 52).
     clipboard: bool,
+    /// While set, key events are treated as part of an in-progress paste (a
+    /// Windows paste delivered as individual keys; see `handle_term_event`).
+    pasting_until: Option<Instant>,
 }
 
 impl App {
@@ -180,6 +189,7 @@ impl App {
             last_yank: None,
             dabbrev: None,
             clipboard: true,
+            pasting_until: None,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -716,13 +726,66 @@ impl App {
             if self.should_quit {
                 break;
             }
-            match event::read()? {
-                TermEvent::Key(key) => self.handle_key(key),
-                TermEvent::Paste(text) => self.handle_paste(text),
-                _ => {}
-            }
+            let event = event::read()?;
+            self.handle_term_event(event);
         }
         Ok(())
+    }
+
+    /// Handle one terminal event. On Windows a paste arrives as a burst of key
+    /// events rather than an `Event::Paste`, so a detected burst is collected
+    /// and routed to `handle_paste` instead of being dispatched as commands.
+    fn handle_term_event(&mut self, event: TermEvent) {
+        use crossterm::event::KeyEventKind;
+        match event {
+            TermEvent::Paste(text) => self.handle_paste(text),
+            TermEvent::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    return;
+                }
+                let latched = self.pasting_until.is_some_and(|t| Instant::now() < t);
+                let ch = paste_char(&key);
+                if paste::is_paste(paste::pending_events(), latched, ch.is_some()) {
+                    let mut text = String::new();
+                    if let Some(c) = ch {
+                        text.push(c);
+                    }
+                    self.drain_paste(&mut text);
+                    self.pasting_until = Some(Instant::now() + PASTE_LATCH);
+                    self.handle_paste(text);
+                } else {
+                    self.pasting_until = None;
+                    self.handle_key(key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Read any further already-queued key events (the rest of a paste) and
+    /// append their text.
+    fn drain_paste(&mut self, text: &mut String) {
+        use crossterm::event::KeyEventKind;
+        loop {
+            if !event::poll(Duration::ZERO).unwrap_or(false) {
+                break;
+            }
+            // On Windows, stop once the console queue is empty so a key that
+            // arrived after the paste is not swallowed.
+            if cfg!(windows) && paste::pending_events() == 0 {
+                break;
+            }
+            match event::read() {
+                Ok(TermEvent::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if let Some(c) = paste_char(&key) {
+                        text.push(c);
+                    }
+                }
+                Ok(TermEvent::Paste(t)) => text.push_str(&t),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
     }
 
     fn ensure_scroll_visible(&mut self) {
@@ -1932,6 +1995,20 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The text a key contributes to a paste, if any (printable characters,
+/// Enter, and Tab). Modifier and navigation keys contribute nothing.
+fn paste_char(key: &KeyEvent) -> Option<char> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char(c) if !ctrl && !alt => Some(c),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
     match direction {
         SearchDirection::Forward => Pos::new(pos.row, pos.col + 1),
@@ -2054,6 +2131,9 @@ fn help_lines() -> Vec<String> {
         "",
         "Notes",
         "  C-w / M-w / C-k mirror kills to the system clipboard (OSC 52).",
+        "  On Windows Terminal Ctrl-V pastes (the terminal owns the chord); use",
+        "  the PageDown key, or unbind Ctrl-V in the terminal to get C-v back.",
+        "  Pasting into a read-only buffer is refused (\"Text is read-only\").",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -2329,5 +2409,56 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn paste_char_maps_text_keys_only() {
+        assert_eq!(
+            paste_char(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some('a')
+        );
+        assert_eq!(
+            paste_char(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some('\n')
+        );
+        assert_eq!(
+            paste_char(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some('\t')
+        );
+        assert_eq!(
+            paste_char(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            paste_char(&KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn paste_into_read_only_buffer_is_refused() {
+        let dir = temp_dir("paste-refuse");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        let before = app.current().dired.as_ref().unwrap().entries.len();
+        // A pasted "d x" must not flag or delete anything.
+        app.handle_paste("d x".to_string());
+        assert_eq!(app.message.as_deref(), Some("Text is read-only"));
+        assert_eq!(app.current().dired.as_ref().unwrap().entries.len(), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paste_into_scratch_inserts_text() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut().buffer.beginning_of_buffer();
+        app.handle_paste("hello".to_string());
+        assert!(app.current().buffer.line(0).text().contains("hello"));
     }
 }
