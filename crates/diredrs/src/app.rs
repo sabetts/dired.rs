@@ -45,6 +45,8 @@ pub struct Buf {
     pub buffer: Buffer,
     /// Directory listing state, for `Dired` buffers.
     pub dired: Option<Dired>,
+    /// Offset column width, for `Hexl` buffers (see `hexl_highlights`).
+    pub hexl_width: Option<usize>,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
     last_visited: u64,
 }
@@ -213,6 +215,7 @@ impl App {
             kind,
             buffer,
             dired: None,
+            hexl_width: None,
             last_visited: 0,
         });
         self.buffers.len() - 1
@@ -243,6 +246,28 @@ impl App {
             Kind::Help => "Help".to_string(),
             Kind::Dired => "Dired".to_string(),
             Kind::Hexl => "Hexl".to_string(),
+        }
+    }
+
+    /// Column ranges to highlight in the hex view, so the byte under point is
+    /// shown in both its hex and ASCII forms (like `hexl-mode`). Empty for
+    /// non-hex buffers or when point is not over a byte.
+    pub fn hexl_highlights(&self) -> Vec<(Pos, usize)> {
+        let buf = self.current();
+        if buf.kind != Kind::Hexl {
+            return Vec::new();
+        }
+        let Some(width) = buf.hexl_width else {
+            return Vec::new();
+        };
+        let point = buf.buffer.point();
+        let line = buf.buffer.line(point.row).text();
+        match hexl::byte_at(&line, point.col, width) {
+            Some((hex_col, ascii_col)) => vec![
+                (Pos::new(point.row, hex_col), 2),
+                (Pos::new(point.row, ascii_col), 1),
+            ],
+            None => Vec::new(),
         }
     }
 
@@ -346,8 +371,10 @@ impl App {
                 hexl::MAX_BYTES
             )));
         }
+        let width = hexl::offset_width(shown.len());
         let buffer = Buffer::read_only_from(lines);
         let idx = self.new_buffer(name, Kind::Hexl, buffer);
+        self.buffers[idx].hexl_width = Some(width);
         self.switch_to(idx);
         if truncated {
             self.message = Some(format!(
@@ -2305,6 +2332,39 @@ mod tests {
             .line(0)
             .text()
             .starts_with("00000000: 0001 02ff"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hex_view_links_hex_and_ascii() {
+        let dir = temp_dir("hexlink");
+        let path = dir.join("data.bin");
+        std::fs::write(&path, [0u8, 1, 2, 3, 0xff]).unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_file(path.clone());
+        assert_eq!(app.current().kind, Kind::Hexl);
+
+        let w = app.current().hexl_width.unwrap();
+        let hex_start = w + 2;
+        let ascii_start = w + 43;
+
+        // Point on byte 1's hex digit -> that hex pair and its ASCII char.
+        app.current_mut()
+            .buffer
+            .set_point(Pos::new(0, hex_start + 2));
+        let hl = app.hexl_highlights();
+        assert!(hl.contains(&(Pos::new(0, hex_start + 2), 2)));
+        assert!(hl.contains(&(Pos::new(0, ascii_start + 1), 1)));
+
+        // Point on ASCII char 3 -> its hex pair and the ASCII char.
+        app.current_mut()
+            .buffer
+            .set_point(Pos::new(0, ascii_start + 3));
+        let hl = app.hexl_highlights();
+        assert!(hl.contains(&(Pos::new(0, hex_start + 7), 2)));
+        assert!(hl.contains(&(Pos::new(0, ascii_start + 3), 1)));
 
         std::fs::remove_dir_all(&dir).ok();
     }

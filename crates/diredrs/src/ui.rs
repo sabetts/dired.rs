@@ -40,11 +40,13 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         top = point.row + 1 - height;
     }
 
-    let highlights = if app.search.active && !app.search.query.is_empty() {
+    let mut highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
     } else {
         Vec::new()
     };
+    // Hex view: link the byte under point to its ASCII/hex form.
+    highlights.extend(app.hexl_highlights());
 
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
     for row in top..buf.len().min(top + height) {
