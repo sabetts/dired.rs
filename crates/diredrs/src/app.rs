@@ -70,6 +70,9 @@ pub enum Prompt {
         cursor: usize,
         /// `true` for `C-x d` (a directory listing), `false` for a file.
         dired: bool,
+        /// Highlighted completion candidate, moved with Up/Down. `None` means
+        /// the typed `input` is used as-is (the default).
+        selected: Option<usize>,
     },
     /// A yes/no confirmation in the echo area.
     Confirm {
@@ -1034,6 +1037,7 @@ impl App {
             cursor: input.chars().count(),
             input,
             dired,
+            selected: None,
         };
     }
 
@@ -1068,8 +1072,9 @@ impl App {
         }
     }
 
-    /// Completion candidates for the last path component of `input`.
-    fn file_candidates(&self, input: &str) -> Vec<String> {
+    /// Completion candidates for the last path component of `input`. With
+    /// `dirs_only` (the `C-x d` prompt) only directories are listed.
+    fn file_candidates(&self, input: &str, dirs_only: bool) -> Vec<String> {
         let (dir_part, prefix) = match input.rfind(['/', '\\']) {
             Some(i) => (&input[..=i], &input[i + 1..]),
             None => ("", input),
@@ -1082,9 +1087,12 @@ impl App {
         let mut out = Vec::new();
         if let Ok(read) = fs::read_dir(&base) {
             for entry in read.flatten() {
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if dirs_only && !is_dir {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with(prefix) {
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     let sep = if is_dir {
                         std::path::MAIN_SEPARATOR.to_string()
                     } else {
@@ -1126,6 +1134,10 @@ impl App {
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
+        if let Prompt::FindFile { selected, .. } = &mut self.prompt {
+            *selected = select_move(*selected, count, delta);
+            return;
+        }
         let selected = match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => selected,
             Prompt::None | Prompt::Confirm { .. } | Prompt::FindFile { .. } => return,
@@ -1153,6 +1165,7 @@ impl App {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => {
                 *selected = 0
             }
+            Prompt::FindFile { selected, .. } => *selected = None,
             _ => {}
         }
     }
@@ -1270,7 +1283,7 @@ impl App {
                 .into_iter()
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
-            Prompt::FindFile { input, .. } => self.file_candidates(input),
+            Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired),
             Prompt::None | Prompt::Confirm { .. } => return,
         };
         if candidates.is_empty() {
@@ -1296,9 +1309,15 @@ impl App {
                 *input = completion;
                 *selected = 0;
             }
-            Prompt::FindFile { input, cursor, .. } => {
+            Prompt::FindFile {
+                input,
+                cursor,
+                selected,
+                ..
+            } => {
                 *cursor = completion.chars().count();
                 *input = completion;
+                *selected = None;
             }
             _ => {}
         }
@@ -1351,7 +1370,7 @@ impl App {
         let count = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
-            Prompt::FindFile { input, .. } => self.file_candidates(input).len(),
+            Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired).len(),
             Prompt::None | Prompt::Confirm { .. } => 0,
         };
         use Action::*;
@@ -1411,8 +1430,20 @@ impl App {
                 }
                 self.history.push(&input);
             }
-            Prompt::FindFile { input, dired, .. } => {
-                let path = self.expand_path(&input);
+            Prompt::FindFile {
+                input,
+                dired,
+                selected,
+                ..
+            } => {
+                // Use the highlighted completion if one was chosen with
+                // Up/Down; otherwise the typed input.
+                let candidates = self.file_candidates(&input, dired);
+                let chosen = match selected {
+                    Some(i) => candidates.get(i).cloned().unwrap_or(input),
+                    None => input,
+                };
+                let path = self.expand_path(&chosen);
                 if path.as_os_str().is_empty() {
                     return;
                 }
@@ -1427,7 +1458,7 @@ impl App {
                 } else {
                     self.message = Some(format!("No such file: {}", path.display()));
                 }
-                self.history.push(&input);
+                self.history.push(&chosen);
             }
             // Confirmations are committed through `handle_prompt_key`.
             Prompt::Confirm { .. } => {}
@@ -1482,6 +1513,7 @@ impl App {
                 input,
                 cursor,
                 dired,
+                selected,
             } => {
                 let prefix = if *dired {
                     "Dired (directory): "
@@ -1491,8 +1523,8 @@ impl App {
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
-                    self.file_candidates(input),
-                    0,
+                    self.file_candidates(input, *dired),
+                    selected.unwrap_or(usize::MAX),
                 ))
             }
             Prompt::Confirm { message, .. } => {
@@ -2009,6 +2041,27 @@ fn paste_char(key: &KeyEvent) -> Option<char> {
     }
 }
 
+/// Move a `FindFile` candidate selection: `None` means "use the typed input".
+/// The first Up from no selection lands on the last candidate, the first Down
+/// on the first.
+fn select_move(selected: Option<usize>, count: usize, delta: isize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let last = count - 1;
+    let next = match selected {
+        None => {
+            if delta < 0 {
+                last
+            } else {
+                0
+            }
+        }
+        Some(s) => (s as isize + delta).clamp(0, last as isize) as usize,
+    };
+    Some(next)
+}
+
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
     match direction {
         SearchDirection::Forward => Pos::new(pos.row, pos.col + 1),
@@ -2356,6 +2409,43 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.current().kind, Kind::Dired);
         assert_eq!(app.current().name, dir.display().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn select_move_clamps_at_edges() {
+        assert_eq!(select_move(None, 3, 1), Some(0));
+        assert_eq!(select_move(None, 3, -1), Some(2));
+        assert_eq!(select_move(Some(0), 3, -1), Some(0));
+        assert_eq!(select_move(Some(0), 3, 1), Some(1));
+        assert_eq!(select_move(Some(2), 3, 1), Some(2));
+        assert_eq!(select_move(Some(1), 0, 1), None);
+    }
+
+    #[test]
+    fn cx_d_arrows_select_a_directory() {
+        let dir = temp_dir("cxd-nav");
+        std::fs::create_dir(dir.join("aaa")).unwrap();
+        std::fs::create_dir(dir.join("bbb")).unwrap();
+        std::fs::write(dir.join("file.txt"), b"x").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        // Point the prompt at our directory.
+        if let Prompt::FindFile { input, cursor, .. } = &mut app.prompt {
+            *input = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+            *cursor = input.chars().count();
+        }
+        // Only directories are listed (aaa, bbb); files are excluded.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.current().kind, Kind::Dired);
+        let opened = app.current().dired.as_ref().unwrap();
+        assert_eq!(opened.dir.file_name().and_then(|n| n.to_str()), Some("bbb"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
