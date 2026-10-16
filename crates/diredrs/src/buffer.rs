@@ -574,6 +574,23 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Insert a newline at point but leave point before it, so the rest of the
+    /// line (and everything after) moves down (`open-line`, `C-o`).
+    pub fn open_line(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        let row = self.point.row;
+        let chars = self.lines[row].chars();
+        let idx = self.point.col.min(chars.len());
+        let left: String = chars[..idx].iter().collect();
+        let right: String = chars[idx..].iter().collect();
+        self.lines[row] = Line::plain(left);
+        self.lines.insert(row + 1, Line::plain(right));
+        self.point = Pos::new(row, idx);
+        self.scroll_into_view();
+    }
+
     pub fn delete_backward(&mut self) {
         if !self.editable() {
             return;
@@ -915,6 +932,21 @@ mod tests {
         assert_eq!(b.point(), Pos::new(0, 10));
         b.page_backward_wrapped(1, 10); // up one row -> start of line 0
         assert_eq!(b.point(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn open_line_leaves_point_before_the_newline() {
+        let mut b = Buffer::new();
+        for c in "hello".chars() {
+            b.insert_char(c);
+        }
+        b.set_point(Pos::new(0, 2));
+        b.open_line();
+
+        assert_eq!(b.line_text(0), "he");
+        assert_eq!(b.line_text(1), "llo");
+        // Point stays before the inserted newline.
+        assert_eq!(b.point(), Pos::new(0, 2));
     }
 
     #[test]

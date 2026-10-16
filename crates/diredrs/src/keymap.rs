@@ -9,6 +9,8 @@ pub enum Action {
     SelfInsert(char),
     /// `RET`: visit the file at point, or insert a newline in a text buffer.
     Open,
+    /// `C-o`: insert a newline at point, leaving point before it.
+    OpenLine,
     ForwardChar,
     BackwardChar,
     NextLine,
@@ -55,6 +57,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'b' => BackwardChar,
             'n' => NextLine,
             'p' => PrevLine,
+            'o' => OpenLine,
             'a' => BeginningOfLine,
             'e' => EndOfLine,
             'v' => PageDown,
@@ -174,6 +177,14 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
             Action::SearchForward
+        );
+    }
+
+    #[test]
+    fn control_o_opens_a_line() {
+        assert_eq!(
+            translate(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Action::OpenLine
         );
     }
 

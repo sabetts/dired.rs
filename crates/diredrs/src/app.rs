@@ -1949,6 +1949,13 @@ impl App {
                     }
                 }
             }
+            OpenLine => {
+                if self.check_editable() {
+                    for _ in 0..n.max(0) {
+                        self.current_mut().buffer.open_line();
+                    }
+                }
+            }
             ForwardChar => self.move_chars(n),
             BackwardChar => self.move_chars(-n),
             NextLine => {
@@ -2505,6 +2512,7 @@ fn help_lines() -> Vec<String> {
         "",
         "Editing (in writable buffers)",
         "  RET            insert a newline",
+        "  C-o            insert a newline, leaving point before it",
         "  M-u / M-l      upcase / downcase word",
         "  M-/            dabbrev-expand",
         "  C-k            kill to end of line",
@@ -2900,6 +2908,29 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn ctrl_o_opens_a_line_in_scratch() {
+        let mut app = App::new(Config::default());
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        app.current_mut().buffer = Buffer::new();
+        for c in "hello".chars() {
+            press(&mut app, c);
+        }
+        // Point is at column 5; move back to column 2, then open a line.
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.current().buffer.line_text(0), "he");
+        assert_eq!(app.current().buffer.line_text(1), "llo");
     }
 
     #[test]
