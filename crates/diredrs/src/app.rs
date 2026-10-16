@@ -760,7 +760,8 @@ impl App {
             .collect();
         let text = names.join(" ");
         self.kill_new(&text, false);
-        self.message = Some(format!("Copied: {text}"));
+        // Emacs echoes the copied names (`(message "%s" string)`).
+        self.message = Some(text);
     }
 
     /// Prompt for a new name for the marked files, or the file at point (`R`).
@@ -1140,14 +1141,17 @@ impl App {
         }
 
         // Plain keys in a Dired buffer drive Dired commands (n, p, f, ^, g,
-        // q, ...) rather than inserting text.
+        // q, ...) rather than inserting text. Clear the echo area first (as
+        // Emacs does before each command) so a command that reports something
+        // leaves its message visible rather than having it wiped afterwards.
         if self.current().kind == Kind::Dired
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
-            && self.handle_dired_key(key.code)
         {
             self.message = None;
-            return;
+            if self.handle_dired_key(key.code) {
+                return;
+            }
         }
 
         self.message = None;
@@ -2736,11 +2740,14 @@ mod tests {
         press(&mut app, 'm'); // mark b.txt
         press(&mut app, 'w');
         assert_eq!(app.kill_ring.current().as_deref(), Some("a.txt b.txt"));
+        // The copied names are echoed, like Emacs.
+        assert_eq!(app.message.as_deref(), Some("a.txt b.txt"));
 
         // With nothing marked, the file at point is copied.
         press(&mut app, 'U'); // unmark all; point is still on b.txt
         press(&mut app, 'w');
         assert_eq!(app.kill_ring.current().as_deref(), Some("b.txt"));
+        assert_eq!(app.message.as_deref(), Some("b.txt"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
