@@ -40,18 +40,20 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         top = point.row + 1 - height;
     }
 
-    let mut highlights = if app.search.active && !app.search.query.is_empty() {
+    let highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
     } else {
         Vec::new()
     };
-    // Hex view: link the byte under point to its ASCII/hex form.
-    highlights.extend(app.hexl_highlights());
+    // Hex view: the byte under point, highlighted in its hex and ASCII forms
+    // with a background colour (Emacs's `highlight` face), not reverse video.
+    let hex_highlights = app.hexl_highlights();
 
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
     for row in top..buf.len().min(top + height) {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
+        apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
         if row == point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, point.col);
         }
@@ -125,6 +127,18 @@ fn apply_highlights(cells: &mut [(char, Style)], row: usize, highlights: &[(Pos,
     }
 }
 
+/// Set the background of the given ranges, leaving each cell's foreground.
+fn apply_background(cells: &mut [(char, Style)], row: usize, ranges: &[(Pos, usize)], bg: Color) {
+    for (pos, len) in ranges {
+        if pos.row != row {
+            continue;
+        }
+        for i in pos.col..(pos.col + len).min(cells.len()) {
+            cells[i].1.bg = bg;
+        }
+    }
+}
+
 fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize) {
     if col < cells.len() {
         cells[col].1 = cells[col].1.reverse();
@@ -159,6 +173,9 @@ fn to_rline(cells: &[(char, Style)]) -> RLine<'static> {
 
 fn rstyle(style: Style) -> RStyle {
     let mut out = RStyle::default().fg(rcolor(style.color));
+    if style.bg != Color::Default {
+        out = out.bg(rcolor(style.bg));
+    }
     if style.bold {
         out = out.add_modifier(Modifier::BOLD);
     }

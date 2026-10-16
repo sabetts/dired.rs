@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use crate::buffer::Style;
+use crate::buffer::{Color, Style};
 
 /// Which background the terminal uses, selecting the face variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -33,6 +33,9 @@ pub struct Theme {
     pub flagged: Style,
     /// The `  /dir:` and `total` header lines.
     pub header: Style,
+    /// Background of the hex viewer's highlighted byte (ASCII and hex halves),
+    /// matching Emacs's `highlight` face.
+    pub hex_highlight: Color,
 }
 
 impl Theme {
@@ -46,6 +49,7 @@ impl Theme {
                 marked: Style::rgb(0xff, 0x00, 0xff).bold(), // Magenta
                 flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1
                 header: Style::rgb(0xff, 0xff, 0x00).bold(), // Yellow
+                hex_highlight: Color::Rgb(0x55, 0x6b, 0x2f), // DarkOliveGreen
             },
             Background::Light => Theme {
                 file: Style::default(),
@@ -55,6 +59,7 @@ impl Theme {
                 marked: Style::rgb(0x8b, 0x00, 0x8b).bold(), // Magenta4
                 flagged: Style::rgb(0x8b, 0x00, 0x00).bold(), // DarkRed
                 header: Style::rgb(0x8b, 0x8b, 0x00).bold(), // DarkYellow
+                hex_highlight: Color::Rgb(0xb4, 0xee, 0xb4), // DarkSeaGreen2
             },
         }
     }
@@ -72,5 +77,9 @@ mod tests {
         assert_eq!(light.dir, Style::rgb(0x00, 0x00, 0xff).bold());
         assert!(dark.marked.bold);
         assert!(light.flagged.bold);
+        // Hex byte highlight: Emacs `highlight` face (DarkOliveGreen /
+        // DarkSeaGreen2).
+        assert_eq!(dark.hex_highlight, Color::Rgb(0x55, 0x6b, 0x2f));
+        assert_eq!(light.hex_highlight, Color::Rgb(0xb4, 0xee, 0xb4));
     }
 }

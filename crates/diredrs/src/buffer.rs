@@ -47,6 +47,8 @@ pub enum Color {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
     pub color: Color,
+    /// Background color; `Color::Default` leaves the terminal default.
+    pub bg: Color,
     pub bold: bool,
     pub dim: bool,
     pub reverse: bool,
@@ -56,6 +58,7 @@ impl Style {
     pub const fn fg(color: Color) -> Self {
         Style {
             color,
+            bg: Color::Default,
             bold: false,
             dim: false,
             reverse: false,
@@ -75,6 +78,7 @@ impl Style {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Style {
             color: Color::Rgb(r, g, b),
+            bg: Color::Default,
             bold: false,
             dim: false,
             reverse: false,
