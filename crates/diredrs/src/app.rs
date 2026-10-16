@@ -237,7 +237,14 @@ impl App {
     }
 
     fn find_buffer(&self, name: &str) -> Option<usize> {
-        self.buffers.iter().position(|b| b.name == name)
+        if let Some(i) = self.buffers.iter().position(|b| b.name == name) {
+            return Some(i);
+        }
+        // Fall back to a case-insensitive match.
+        let lower = name.to_lowercase();
+        self.buffers
+            .iter()
+            .position(|b| b.name.to_lowercase() == lower)
     }
 
     pub fn mode_line_name(&self) -> String {
@@ -1126,6 +1133,7 @@ impl App {
         } else {
             self.expand_path(dir_part)
         };
+        let prefix_lower = prefix.to_lowercase();
         let mut out = Vec::new();
         if let Ok(read) = fs::read_dir(&base) {
             for entry in read.flatten() {
@@ -1134,7 +1142,8 @@ impl App {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(prefix) {
+                // Match the typed component case-insensitively.
+                if name.to_lowercase().starts_with(&prefix_lower) {
                     let sep = if is_dir {
                         std::path::MAIN_SEPARATOR.to_string()
                     } else {
@@ -2562,6 +2571,37 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn buffer_match_is_case_insensitive() {
+        let a = temp_dir("casebufA");
+        let b = temp_dir("casebufB");
+        let mut app = App::new(Config::default());
+        app.open_dired(a.clone());
+        app.open_dired(b.clone()); // make `a` non-current
+
+        // Typing the name in a different case still finds the buffer.
+        let cands = app.switch_candidates(&a.display().to_string().to_uppercase());
+        assert!(cands
+            .iter()
+            .any(|&i| app.buffers[i].name == a.display().to_string()));
+
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn path_completion_is_case_insensitive() {
+        let dir = temp_dir("casefile");
+        std::fs::write(dir.join("Foo.txt"), b"x").unwrap();
+        let app = App::new(Config::default());
+
+        let input = format!("{}{}foo", dir.display(), std::path::MAIN_SEPARATOR);
+        let cands = app.file_candidates(&input, false);
+        assert!(cands.iter().any(|c| c.ends_with("Foo.txt")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
