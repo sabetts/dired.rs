@@ -2733,8 +2733,14 @@ mod tests {
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
         press(&mut app, 'm'); // mark a.txt
+        press(&mut app, 'm'); // mark b.txt
         press(&mut app, 'w');
-        assert_eq!(app.kill_ring.current().as_deref(), Some("a.txt"));
+        assert_eq!(app.kill_ring.current().as_deref(), Some("a.txt b.txt"));
+
+        // With nothing marked, the file at point is copied.
+        press(&mut app, 'U'); // unmark all; point is still on b.txt
+        press(&mut app, 'w');
+        assert_eq!(app.kill_ring.current().as_deref(), Some("b.txt"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
