@@ -43,6 +43,8 @@ pub struct Buf {
     pub buffer: Buffer,
     /// Directory listing state, for `Dired` buffers.
     pub dired: Option<Dired>,
+    /// Monotonic stamp of the most recent visit, for buffer-list ordering.
+    last_visited: u64,
 }
 
 /// The minibuffer prompt, if one is active.
@@ -130,6 +132,8 @@ pub struct App {
     pub buffers: Vec<Buf>,
     pub current: usize,
     pub previous: usize,
+    /// Monotonic counter for the most recent buffer visit, for list ordering.
+    visit_seq: u64,
     pub history: History,
     pub search: Search,
     pub message: Option<String>,
@@ -160,6 +164,7 @@ impl App {
             buffers: Vec::new(),
             current: 0,
             previous: 0,
+            visit_seq: 0,
             history: History::default(),
             search: Search::default(),
             message: None,
@@ -195,6 +200,7 @@ impl App {
             kind,
             buffer,
             dired: None,
+            last_visited: 0,
         });
         self.buffers.len() - 1
     }
@@ -234,6 +240,8 @@ impl App {
         let old = self.current;
         self.previous = old;
         self.current = idx;
+        self.visit_seq += 1;
+        self.buffers[idx].last_visited = self.visit_seq;
         let height = self.viewport_rows.max(1);
         self.current_mut().buffer.ensure_point_visible(height);
     }
@@ -1030,7 +1038,8 @@ impl App {
 
     fn buffer_candidates(&self, input: &str, include_current: bool) -> Vec<usize> {
         let needle = input.to_lowercase();
-        self.buffers
+        let mut candidates: Vec<usize> = self
+            .buffers
             .iter()
             .enumerate()
             .filter(|(i, b)| {
@@ -1038,8 +1047,11 @@ impl App {
                     && (needle.is_empty() || b.name.to_lowercase().contains(&needle))
             })
             .map(|(i, _)| i)
-            .take(5)
-            .collect()
+            .collect();
+        // Most recently visited first, so the current buffer leads the list.
+        candidates.sort_by_key(|&i| std::cmp::Reverse(self.buffers[i].last_visited));
+        candidates.truncate(5);
+        candidates
     }
 
     fn switch_candidates(&self, input: &str) -> Vec<usize> {
@@ -2266,6 +2278,45 @@ mod tests {
         assert_eq!(app.current().name, dir.display().to_string());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kill_list_puts_current_first() {
+        let dir = temp_dir("killorder");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // Open the help buffer; it becomes the current buffer.
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(app.current().name, "*Help*");
+        let cands = app.kill_candidates("");
+        assert_eq!(app.buffers[cands[0]].name, "*Help*");
+
+        // `C-x k RET` with the default selection kills the current buffer.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.find_buffer("*Help*").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switch_list_is_recency_ordered() {
+        let a = temp_dir("orderA");
+        let b = temp_dir("orderB");
+        let mut app = App::new(Config::default());
+        app.open_dired(a.clone());
+        app.open_dired(b.clone());
+        app.open_dired(a.clone()); // current is a
+
+        // Excluding the current buffer, b was visited most recently.
+        let cands = app.switch_candidates("");
+        assert_eq!(app.buffers[cands[0]].name, b.display().to_string());
+
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
     }
 
     #[test]
