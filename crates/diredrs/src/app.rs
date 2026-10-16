@@ -2922,6 +2922,33 @@ mod tests {
     }
 
     #[test]
+    fn dired_can_reach_the_top() {
+        let dir = temp_dir("diredtop");
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        // Scroll well down, then walk back up to the first file line.
+        app.current_mut().buffer.set_view_top(30, 0);
+        app.current_mut().buffer.set_point(Pos::new(35, 0));
+        app.ensure_scroll_visible();
+        for _ in 0..50 {
+            press(&mut app, 'p');
+        }
+        app.ensure_scroll_visible();
+
+        assert_eq!(
+            app.current().buffer.scroll(),
+            0,
+            "view should reach the top"
+        );
+        assert_eq!(app.current().buffer.scroll_sub(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn ctrl_o_opens_a_line_in_scratch() {
         let mut app = App::new(Config::default());
         let scratch = app

@@ -318,6 +318,18 @@ impl Buffer {
         rows.min(at_most)
     }
 
+    /// The top line whose start leaves at least `target` wrapped rows above the
+    /// point (the largest such line, so the scroll is minimal).
+    fn top_line_for_margin(&self, target: usize) -> usize {
+        let mut acc = self.sub_of(self.point.row, self.point.col);
+        let mut line = self.point.row;
+        while acc < target && line > 0 {
+            line -= 1;
+            acc += self.line_rows(line);
+        }
+        line
+    }
+
     /// Wrapped rows from the view top down to the point.
     fn offset_from_top(&self) -> usize {
         if self.point.row < self.scroll {
@@ -546,21 +558,27 @@ impl Buffer {
         // never forces blank space past the start or end of the buffer.
         let top_margin = margin.min(self.rows_above_point(margin));
         let bottom_margin = margin.min(self.rows_below_point(margin));
-
         let psub = self.sub_of(self.point.row, self.point.col);
-        if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
-        {
-            // Point is above the view: leave `top_margin` rows above it.
-            let (vl, vc) = self.advance_backward(self.point.row, self.point.col, top_margin);
-            self.set_view_top(vl, vc / self.width);
-            return;
-        }
+        let above = self.point.row < self.scroll
+            || (self.point.row == self.scroll && psub < self.scroll_sub);
         let off = self.offset_from_top();
-        if off < top_margin {
-            // Scroll up so there are `top_margin` rows above point.
-            let (vl, vc) =
-                self.advance_backward(self.scroll, self.scroll_sub * self.width, top_margin - off);
-            self.set_view_top(vl, vc / self.width);
+        if above || off < top_margin {
+            if top_margin == 0 {
+                // No margin: put point on the top row.
+                self.set_view_top(self.point.row, psub);
+            } else {
+                // Scroll up, aligning the view top to a line start so the start
+                // of the line above point is not cut off (which would hide the
+                // true top of the buffer).
+                let line = self.top_line_for_margin(top_margin);
+                self.set_view_top(line, 0);
+                if self.offset_from_top() >= height {
+                    // Aligning would push point off the bottom; scroll minimally.
+                    let (vl, vc) =
+                        self.advance_backward(self.point.row, self.point.col, top_margin);
+                    self.set_view_top(vl, vc / self.width);
+                }
+            }
         } else if off + bottom_margin >= height {
             // Scroll down so there are `bottom_margin` rows below point.
             let (l, c) = self.advance_forward(
@@ -1122,6 +1140,20 @@ mod tests {
         // At the start, point reaches the top row.
         b.set_point(Pos::new(0, 0));
         b.ensure_point_visible(10, 1);
+        assert_eq!((b.scroll(), b.scroll_sub()), (0, 0));
+    }
+
+    #[test]
+    fn scroll_up_aligns_the_top_to_a_line_start() {
+        // A long first line (two rows at width 10) then short lines.
+        let mut b = text_buffer("01234567890123456789\nsecond\nthird");
+        b.set_width(10);
+        // Point on the second line, view resting as if scrolled to it.
+        b.set_view_top(1, 0);
+        b.set_point(Pos::new(1, 0));
+        b.ensure_point_visible(5, 1);
+
+        // The view top is the start of line 0: its first row is not cut off.
         assert_eq!((b.scroll(), b.scroll_sub()), (0, 0));
     }
 
