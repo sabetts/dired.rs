@@ -166,6 +166,8 @@ pub struct App {
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
+    /// Width (in columns) of the buffer view, from the last draw.
+    pub viewport_cols: usize,
     pub should_quit: bool,
     pub prompt: Prompt,
     /// Height of the minibuffer during the current prompt, never shrinking as
@@ -204,6 +206,7 @@ impl App {
             message: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
+            viewport_cols: 80,
             should_quit: false,
             prompt: Prompt::None,
             minibuffer_rows: 1,
@@ -1026,6 +1029,7 @@ impl App {
             let size = terminal.size()?;
             let minibuffer = self.minibuffer_height();
             self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
+            self.viewport_cols = size.width as usize;
             self.ensure_scroll_visible();
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
@@ -2097,13 +2101,15 @@ impl App {
     }
 
     fn page_up(&mut self) {
-        let n = self.page_lines();
-        self.current_mut().buffer.page_backward(n);
+        let rows = self.page_lines();
+        let width = self.viewport_cols.max(1);
+        self.current_mut().buffer.page_backward_wrapped(rows, width);
     }
 
     fn page_down(&mut self) {
-        let n = self.page_lines();
-        self.current_mut().buffer.page_forward(n);
+        let rows = self.page_lines();
+        let width = self.viewport_cols.max(1);
+        self.current_mut().buffer.page_forward_wrapped(rows, width);
     }
 
     fn dabbrev_expand(&mut self) {

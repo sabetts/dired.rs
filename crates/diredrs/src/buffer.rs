@@ -382,20 +382,69 @@ impl Buffer {
         self.scroll_into_view();
     }
 
-    pub fn page_forward(&mut self, rows: usize) {
-        let target = (self.point.row + rows).min(self.last_row());
-        let delta = target - self.point.row;
-        self.point.row = target;
-        self.point.col = self.clamp_col(self.point.row, self.point.col);
-        self.scroll = (self.scroll + delta).min(self.point.row);
+    /// Move point down by `rows` wrapped screen rows, wrapping at `width`
+    /// cells per row (paging over visual lines, not buffer lines).
+    pub fn page_forward_wrapped(&mut self, rows: usize, width: usize) {
+        let width = width.max(1);
+        let (mut line, mut col) = (self.point.row, self.point.col);
+        let mut remaining = rows;
+        while remaining > 0 {
+            let len = self.lines[line].char_len();
+            let line_rows = if len == 0 { 1 } else { len.div_ceil(width) };
+            let sub = if len == 0 {
+                0
+            } else {
+                (col / width).min(line_rows - 1)
+            };
+            let rows_below = line_rows - 1 - sub;
+            if remaining <= rows_below {
+                col = (col + remaining * width).min(len);
+                remaining = 0;
+            } else {
+                remaining -= rows_below + 1;
+                if line >= self.last_row() {
+                    col = len;
+                    break;
+                }
+                line += 1;
+                col = col.min(self.lines[line].char_len());
+            }
+        }
+        self.point = Pos::new(line, col);
+        self.scroll_into_view();
     }
 
-    pub fn page_backward(&mut self, rows: usize) {
-        let target = self.point.row.saturating_sub(rows);
-        let delta = self.point.row - target;
-        self.point.row = target;
-        self.point.col = self.clamp_col(self.point.row, self.point.col);
-        self.scroll = self.scroll.saturating_sub(delta);
+    /// Move point up by `rows` wrapped screen rows, wrapping at `width` cells.
+    pub fn page_backward_wrapped(&mut self, rows: usize, width: usize) {
+        let width = width.max(1);
+        let (mut line, mut col) = (self.point.row, self.point.col);
+        let mut remaining = rows;
+        while remaining > 0 {
+            let len = self.lines[line].char_len();
+            let line_rows = if len == 0 { 1 } else { len.div_ceil(width) };
+            let sub = if len == 0 {
+                0
+            } else {
+                (col / width).min(line_rows - 1)
+            };
+            if remaining <= sub {
+                col = col.saturating_sub(remaining * width);
+                remaining = 0;
+            } else {
+                remaining -= sub + 1;
+                if line == 0 {
+                    col = 0;
+                    break;
+                }
+                let goal = col % width;
+                line -= 1;
+                let plen = self.lines[line].char_len();
+                let prow = if plen == 0 { 1 } else { plen.div_ceil(width) };
+                col = ((prow - 1) * width + goal).min(plen);
+            }
+        }
+        self.point = Pos::new(line, col);
+        self.scroll_into_view();
     }
 
     /// Keep point within a window `height` rows tall, scrolling only when point
@@ -848,6 +897,23 @@ mod tests {
         let b = Buffer::new();
         assert_eq!(b.len(), 1);
         assert!(b.editable());
+        assert_eq!(b.point(), Pos::new(0, 0));
+    }
+
+    #[test]
+    fn paging_moves_by_wrapped_rows() {
+        // Line 0 is 20 chars: two screen rows at width 10.
+        let mut b = text_buffer("01234567890123456789\nsecond\nthird");
+        b.set_point(Pos::new(0, 0));
+
+        b.page_forward_wrapped(2, 10); // two rows down -> start of line 1
+        assert_eq!(b.point(), Pos::new(1, 0));
+        b.page_forward_wrapped(1, 10); // one more row -> line 2
+        assert_eq!(b.point(), Pos::new(2, 0));
+
+        b.page_backward_wrapped(2, 10); // up two rows -> second row of line 0
+        assert_eq!(b.point(), Pos::new(0, 10));
+        b.page_backward_wrapped(1, 10); // up one row -> start of line 0
         assert_eq!(b.point(), Pos::new(0, 0));
     }
 
