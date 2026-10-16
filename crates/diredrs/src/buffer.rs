@@ -126,12 +126,6 @@ impl Line {
         }
     }
 
-    pub fn styled(text: impl Into<String>, style: Style) -> Self {
-        Line {
-            spans: vec![Span::new(text, style)],
-        }
-    }
-
     pub fn from_spans(spans: Vec<Span>) -> Self {
         Line { spans }
     }

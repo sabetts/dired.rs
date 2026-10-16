@@ -55,11 +55,15 @@ pub struct Theme {
     pub symlink: Style,
     /// `dired-executable`: executable files.
     pub exec: Style,
-    /// `dired-marked`: the `*` marker and marked names.
+    /// `dired-mark`: the first-column mark character (`*`, `D`); inherits
+    /// `font-lock-constant-face`.
+    pub mark: Style,
+    /// `dired-marked`: the name of a marked file; inherits `warning`.
     pub marked: Style,
-    /// `dired-flagged`: the `D` marker and flagged names.
+    /// `dired-flagged`: the name of a file flagged for deletion; inherits
+    /// `error`.
     pub flagged: Style,
-    /// The `  /dir:` and `total` header lines.
+    /// `dired-header`: the `  /dir:` line (inherits `font-lock-type-face`).
     pub header: Style,
     /// Background of the hex viewer's highlighted byte (ASCII and hex halves),
     /// matching Emacs's `highlight` face.
@@ -76,9 +80,10 @@ impl Theme {
                 dir: Style::rgb(0x87, 0xce, 0xfa).bold(), // LightSkyBlue
                 symlink: Style::rgb(0x7f, 0xff, 0xd4).bold(), // Aquamarine
                 exec: Style::rgb(0x90, 0xee, 0x90).bold(), // LightGreen
-                marked: Style::rgb(0xff, 0x00, 0xff).bold(), // Magenta
-                flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1
-                header: Style::rgb(0xff, 0xff, 0x00).bold(), // Yellow
+                mark: Style::rgb(0x7f, 0xff, 0xd4),       // Aquamarine (font-lock-constant-face)
+                marked: Style::rgb(0xff, 0x8c, 0x00).bold(), // DarkOrange (warning)
+                flagged: Style::rgb(0xff, 0xc0, 0xcb).bold(), // Pink (error)
+                header: Style::rgb(0x98, 0xfb, 0x98),     // PaleGreen (font-lock-type-face)
                 hex_highlight: Color::Rgb(0x55, 0x6b, 0x2f), // DarkOliveGreen
                 syntax: dark_syntax(),
             },
@@ -87,9 +92,10 @@ impl Theme {
                 dir: Style::rgb(0x00, 0x00, 0xff).bold(), // Blue1
                 symlink: Style::rgb(0x00, 0x8b, 0x8b).bold(), // DarkCyan
                 exec: Style::rgb(0x00, 0x8b, 0x00).bold(), // DarkGreen
-                marked: Style::rgb(0x8b, 0x00, 0x8b).bold(), // Magenta4
-                flagged: Style::rgb(0x8b, 0x00, 0x00).bold(), // DarkRed
-                header: Style::rgb(0x8b, 0x8b, 0x00).bold(), // DarkYellow
+                mark: Style::rgb(0x00, 0x8b, 0x8b),       // DarkCyan (font-lock-constant-face)
+                marked: Style::rgb(0xff, 0x8c, 0x00).bold(), // DarkOrange (warning)
+                flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1 (error)
+                header: Style::rgb(0x22, 0x8b, 0x22),     // ForestGreen (font-lock-type-face)
                 hex_highlight: Color::Rgb(0xb4, 0xee, 0xb4), // DarkSeaGreen2
                 syntax: light_syntax(),
             },
@@ -141,6 +147,15 @@ mod tests {
         assert_eq!(light.dir, Style::rgb(0x00, 0x00, 0xff).bold());
         assert!(dark.marked.bold);
         assert!(light.flagged.bold);
+        // `dired-header` inherits `font-lock-type-face` (green).
+        assert_eq!(dark.header, dark.syntax.r#type);
+        assert_eq!(light.header, light.syntax.r#type);
+        // `dired-mark` (the marker) inherits `font-lock-constant-face`.
+        assert_eq!(dark.mark, dark.syntax.constant);
+        assert_eq!(light.mark, light.syntax.constant);
+        assert!(!dark.mark.bold);
+        // `dired-marked` (the name) inherits `warning` (DarkOrange, bold).
+        assert_eq!(dark.marked, Style::rgb(0xff, 0x8c, 0x00).bold());
         // Hex byte highlight: Emacs `highlight` face (DarkOliveGreen /
         // DarkSeaGreen2).
         assert_eq!(dark.hex_highlight, Color::Rgb(0x55, 0x6b, 0x2f));

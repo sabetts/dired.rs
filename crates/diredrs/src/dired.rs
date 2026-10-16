@@ -232,11 +232,18 @@ impl Dired {
         let mut lines = Vec::with_capacity(self.entries.len() + HEADER_LINES);
         // Like Emacs' default (`dired-free-space` = `first`), the free space
         // rides on the directory line and there is no separate `total` line.
-        let header = match self.free_space {
-            Some(free) => format!("  {}: ({} available)", self.dir.display(), format_iec(free)),
-            None => format!("  {}:", self.dir.display()),
-        };
-        lines.push(Line::styled(header, theme.header));
+        // `dired-header` greens the directory itself; the `: (N available)` is
+        // inserted with the default face.
+        lines.push(Line::from_spans(vec![
+            Span::new(format!("  {}", self.dir.display()), theme.header),
+            Span::new(
+                match self.free_space {
+                    Some(free) => format!(": ({} available)", format_iec(free)),
+                    None => ":".to_string(),
+                },
+                Style::default(),
+            ),
+        ]));
         for i in 0..self.entries.len() {
             lines.push(self.render_line(i, theme));
         }
@@ -254,9 +261,15 @@ impl Dired {
             *first = entry.mark.ch();
         }
         let head: String = chars.into_iter().collect();
+        // Column 0 is the mark character (`dired-mark`); the metadata after it
+        // is default face.
+        let mut head_chars = head.chars();
+        let mark = head_chars.next().map(String::from).unwrap_or_default();
+        let rest: String = head_chars.collect();
         let name_style = self.name_style(entry, theme);
         let mut spans = vec![
-            Span::new(head, Style::default()),
+            Span::new(mark, theme.mark),
+            Span::new(rest, Style::default()),
             Span::new(entry.name.clone(), name_style),
         ];
         if let Some(target) = &entry.target {
