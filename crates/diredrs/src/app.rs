@@ -1030,6 +1030,8 @@ impl App {
             let minibuffer = self.minibuffer_height();
             self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
             self.viewport_cols = size.width as usize;
+            let cols = self.viewport_cols;
+            self.current_mut().buffer.set_width(cols);
             self.ensure_scroll_visible();
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
@@ -2109,14 +2111,12 @@ impl App {
 
     fn page_up(&mut self) {
         let rows = self.page_lines();
-        let width = self.viewport_cols.max(1);
-        self.current_mut().buffer.page_backward_wrapped(rows, width);
+        self.current_mut().buffer.page_backward(rows);
     }
 
     fn page_down(&mut self) {
         let rows = self.page_lines();
-        let width = self.viewport_cols.max(1);
-        self.current_mut().buffer.page_forward_wrapped(rows, width);
+        self.current_mut().buffer.page_forward(rows);
     }
 
     fn dabbrev_expand(&mut self) {

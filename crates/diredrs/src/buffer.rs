@@ -153,7 +153,13 @@ pub struct Buffer {
     lines: Vec<Line>,
     point: Pos,
     mark: Option<Pos>,
+    /// Top line of the view.
     scroll: usize,
+    /// Wrapped row within the top line, when a wrapped line is taller than the
+    /// window.
+    scroll_sub: usize,
+    /// Wrap width in cells, used for visual-row scrolling.
+    width: usize,
     read_only: bool,
 }
 
@@ -171,6 +177,8 @@ impl Buffer {
             point: Pos::new(0, 0),
             mark: None,
             scroll: 0,
+            scroll_sub: 0,
+            width: 80,
             read_only: false,
         }
     }
@@ -200,6 +208,7 @@ impl Buffer {
         };
         self.point = Pos::new(0, 0);
         self.scroll = 0;
+        self.scroll_sub = 0;
         self.mark = None;
         self.clamp_point();
     }
@@ -236,6 +245,24 @@ impl Buffer {
         self.scroll
     }
 
+    pub fn scroll_sub(&self) -> usize {
+        self.scroll_sub
+    }
+
+    /// Set the wrap width used for visual-row scrolling.
+    pub fn set_width(&mut self, width: usize) {
+        self.width = width.max(1);
+        self.scroll_sub = self
+            .scroll_sub
+            .min(self.line_rows(self.scroll).saturating_sub(1));
+    }
+
+    /// Set the top of the view to wrapped row `sub` of `line`.
+    pub fn set_view_top(&mut self, line: usize, sub: usize) {
+        self.scroll = line.min(self.last_row());
+        self.scroll_sub = sub.min(self.line_rows(self.scroll).saturating_sub(1));
+    }
+
     pub fn set_point(&mut self, pos: Pos) {
         let row = pos.row.min(self.last_row());
         self.point = Pos::new(row, self.clamp_col(row, pos.col));
@@ -246,6 +273,88 @@ impl Buffer {
         let row = self.point.row.min(self.last_row());
         self.point = Pos::new(row, self.clamp_col(row, self.point.col));
         self.scroll = self.scroll.min(self.last_row());
+        self.scroll_sub = self
+            .scroll_sub
+            .min(self.line_rows(self.scroll).saturating_sub(1));
+    }
+
+    /// Wrapped rows a line occupies at the current width (an empty line is 1).
+    fn line_rows(&self, line: usize) -> usize {
+        let n = self.lines[line].char_len();
+        if n == 0 {
+            1
+        } else {
+            n.div_ceil(self.width)
+        }
+    }
+
+    /// The wrapped row of column `col` within its line.
+    fn sub_of(&self, line: usize, col: usize) -> usize {
+        (col / self.width).min(self.line_rows(line).saturating_sub(1))
+    }
+
+    /// Wrapped rows from the view top down to the point.
+    fn offset_from_top(&self) -> usize {
+        if self.point.row < self.scroll {
+            return 0;
+        }
+        let psub = self.sub_of(self.point.row, self.point.col);
+        if self.point.row == self.scroll {
+            return psub.saturating_sub(self.scroll_sub);
+        }
+        let mut off = self.line_rows(self.scroll) - self.scroll_sub;
+        for l in (self.scroll + 1)..self.point.row {
+            off += self.line_rows(l);
+        }
+        off + psub
+    }
+
+    /// The position `rows` wrapped rows below `(line, col)`.
+    fn advance_forward(&self, line: usize, col: usize, rows: usize) -> (usize, usize) {
+        let (mut line, mut col) = (line, col);
+        let mut remaining = rows;
+        while remaining > 0 {
+            let len = self.lines[line].char_len();
+            let sub = self.sub_of(line, col);
+            let rows_below = self.line_rows(line) - 1 - sub;
+            if remaining <= rows_below {
+                col = (col + remaining * self.width).min(len);
+                remaining = 0;
+            } else {
+                remaining -= rows_below + 1;
+                if line >= self.last_row() {
+                    col = len;
+                    break;
+                }
+                line += 1;
+                col = col.min(self.lines[line].char_len());
+            }
+        }
+        (line, col)
+    }
+
+    /// The position `rows` wrapped rows above `(line, col)`.
+    fn advance_backward(&self, line: usize, col: usize, rows: usize) -> (usize, usize) {
+        let (mut line, mut col) = (line, col);
+        let mut remaining = rows;
+        while remaining > 0 {
+            let sub = self.sub_of(line, col);
+            if remaining <= sub {
+                col = col.saturating_sub(remaining * self.width);
+                remaining = 0;
+            } else {
+                remaining -= sub + 1;
+                if line == 0 {
+                    col = 0;
+                    break;
+                }
+                let goal = col % self.width;
+                line -= 1;
+                let plen = self.lines[line].char_len();
+                col = ((self.line_rows(line) - 1) * self.width + goal).min(plen);
+            }
+        }
+        (line, col)
     }
 
     // ---- marks, region -----------------------------------------------------
@@ -344,6 +453,7 @@ impl Buffer {
     pub fn beginning_of_buffer(&mut self) {
         self.point = Pos::new(0, 0);
         self.scroll = 0;
+        self.scroll_sub = 0;
     }
 
     pub fn end_of_buffer(&mut self) {
@@ -382,79 +492,42 @@ impl Buffer {
         self.scroll_into_view();
     }
 
-    /// Move point down by `rows` wrapped screen rows, wrapping at `width`
-    /// cells per row (paging over visual lines, not buffer lines).
-    pub fn page_forward_wrapped(&mut self, rows: usize, width: usize) {
-        let width = width.max(1);
-        let (mut line, mut col) = (self.point.row, self.point.col);
-        let mut remaining = rows;
-        while remaining > 0 {
-            let len = self.lines[line].char_len();
-            let line_rows = if len == 0 { 1 } else { len.div_ceil(width) };
-            let sub = if len == 0 {
-                0
-            } else {
-                (col / width).min(line_rows - 1)
-            };
-            let rows_below = line_rows - 1 - sub;
-            if remaining <= rows_below {
-                col = (col + remaining * width).min(len);
-                remaining = 0;
-            } else {
-                remaining -= rows_below + 1;
-                if line >= self.last_row() {
-                    col = len;
-                    break;
-                }
-                line += 1;
-                col = col.min(self.lines[line].char_len());
-            }
-        }
-        self.point = Pos::new(line, col);
-        self.scroll_into_view();
+    /// Scroll the view forward by `rows` wrapped screen rows (`C-v`), carrying
+    /// the point along so it keeps its screen row.
+    pub fn page_forward(&mut self, rows: usize) {
+        let off = self.offset_from_top();
+        let (l, c) = self.advance_forward(self.point.row, self.point.col, rows);
+        self.point = Pos::new(l, c);
+        let (vl, vc) = self.advance_backward(self.point.row, self.point.col, off);
+        self.set_view_top(vl, vc / self.width);
     }
 
-    /// Move point up by `rows` wrapped screen rows, wrapping at `width` cells.
-    pub fn page_backward_wrapped(&mut self, rows: usize, width: usize) {
-        let width = width.max(1);
-        let (mut line, mut col) = (self.point.row, self.point.col);
-        let mut remaining = rows;
-        while remaining > 0 {
-            let len = self.lines[line].char_len();
-            let line_rows = if len == 0 { 1 } else { len.div_ceil(width) };
-            let sub = if len == 0 {
-                0
-            } else {
-                (col / width).min(line_rows - 1)
-            };
-            if remaining <= sub {
-                col = col.saturating_sub(remaining * width);
-                remaining = 0;
-            } else {
-                remaining -= sub + 1;
-                if line == 0 {
-                    col = 0;
-                    break;
-                }
-                let goal = col % width;
-                line -= 1;
-                let plen = self.lines[line].char_len();
-                let prow = if plen == 0 { 1 } else { plen.div_ceil(width) };
-                col = ((prow - 1) * width + goal).min(plen);
-            }
-        }
-        self.point = Pos::new(line, col);
-        self.scroll_into_view();
+    /// Scroll the view backward by `rows` wrapped screen rows (`M-v`).
+    pub fn page_backward(&mut self, rows: usize) {
+        let off = self.offset_from_top();
+        let (l, c) = self.advance_backward(self.point.row, self.point.col, rows);
+        self.point = Pos::new(l, c);
+        let (vl, vc) = self.advance_backward(self.point.row, self.point.col, off);
+        self.set_view_top(vl, vc / self.width);
     }
 
-    /// Keep point within a window `height` rows tall, scrolling only when point
-    /// reaches the top or bottom edge (Emacs-style).
+    /// Keep point within a window `height` wrapped rows tall, scrolling only
+    /// when point reaches the top or bottom edge (Emacs-style).
     pub fn ensure_point_visible(&mut self, height: usize) {
         let height = height.max(1);
-        if self.point.row < self.scroll {
+        let psub = self.sub_of(self.point.row, self.point.col);
+        if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
+        {
             self.scroll = self.point.row;
-        } else if self.point.row >= self.scroll + height {
-            self.scroll = self.point.row + 1 - height;
+            self.scroll_sub = psub;
+            return;
+        }
+        let off = self.offset_from_top();
+        if off >= height {
+            // Advance the top so the point sits on the last visible row.
+            let (l, c) =
+                self.advance_forward(self.scroll, self.scroll_sub * self.width, off + 1 - height);
+            self.set_view_top(l, c / self.width);
         }
     }
 
@@ -846,8 +919,11 @@ impl Buffer {
     }
 
     fn scroll_into_view(&mut self) {
-        if self.point.row < self.scroll {
+        let psub = self.sub_of(self.point.row, self.point.col);
+        if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
+        {
             self.scroll = self.point.row;
+            self.scroll_sub = psub;
         }
     }
 }
@@ -921,16 +997,17 @@ mod tests {
     fn paging_moves_by_wrapped_rows() {
         // Line 0 is 20 chars: two screen rows at width 10.
         let mut b = text_buffer("01234567890123456789\nsecond\nthird");
+        b.set_width(10);
         b.set_point(Pos::new(0, 0));
 
-        b.page_forward_wrapped(2, 10); // two rows down -> start of line 1
+        b.page_forward(2); // two rows down -> start of line 1
         assert_eq!(b.point(), Pos::new(1, 0));
-        b.page_forward_wrapped(1, 10); // one more row -> line 2
+        b.page_forward(1); // one more row -> line 2
         assert_eq!(b.point(), Pos::new(2, 0));
 
-        b.page_backward_wrapped(2, 10); // up two rows -> second row of line 0
+        b.page_backward(2); // up two rows -> second row of line 0
         assert_eq!(b.point(), Pos::new(0, 10));
-        b.page_backward_wrapped(1, 10); // up one row -> start of line 0
+        b.page_backward(1); // up one row -> start of line 0
         assert_eq!(b.point(), Pos::new(0, 0));
     }
 
@@ -947,6 +1024,29 @@ mod tests {
         assert_eq!(b.line_text(1), "llo");
         // Point stays before the inserted newline.
         assert_eq!(b.point(), Pos::new(0, 2));
+    }
+
+    #[test]
+    fn scrolling_only_happens_at_the_view_edges() {
+        // Two 12-char lines (2 rows each at width 10) then short lines.
+        let mut b = text_buffer("aaaaaaaaaaaa\nbbbbbbbbbbbb\nc\nd\ne\nf\ng\nh");
+        b.set_width(10);
+        b.set_view_top(1, 1); // top is the second row of line 1
+        b.set_point(Pos::new(5, 0));
+        b.ensure_point_visible(5);
+        let top = (b.scroll(), b.scroll_sub());
+
+        // Moving up within the view must not scroll.
+        b.prev_line();
+        b.ensure_point_visible(5);
+        assert_eq!((b.scroll(), b.scroll_sub()), top);
+
+        // Moving up past the top scrolls by exactly the overflow.
+        b.set_view_top(3, 0);
+        b.set_point(Pos::new(3, 0));
+        b.prev_line(); // point -> line 2, above the top (line 3)
+        b.ensure_point_visible(5);
+        assert_eq!(b.scroll(), 2);
     }
 
     #[test]
