@@ -89,9 +89,18 @@ pub enum Prompt {
         input: String,
         cursor: usize,
     },
-    /// A yes/no confirmation in the echo area.
+    /// Read a directory name to create (`+`).
+    CreateDirectory {
+        input: String,
+        cursor: usize,
+        /// Highlighted completion candidate (a path), moved with Up/Down.
+        selected: Option<usize>,
+    },
+    /// A `yes-or-no-p` confirmation: type the answer, then `RET`.
     Confirm {
         message: String,
+        input: String,
+        cursor: usize,
         action: PendingAction,
     },
 }
@@ -906,6 +915,46 @@ impl App {
         });
     }
 
+    /// Prompt for a directory to create (`+`), defaulting to the current
+    /// directory.
+    fn start_create_directory(&mut self) {
+        let mut input = self.default_directory().display().to_string();
+        if !input.ends_with(std::path::MAIN_SEPARATOR) {
+            input.push(std::path::MAIN_SEPARATOR);
+        }
+        self.prompt = Prompt::CreateDirectory {
+            cursor: input.chars().count(),
+            input,
+            selected: None,
+        };
+    }
+
+    /// Create the directory `target` (`+`), like `dired-create-directory`.
+    fn commit_create_directory(&mut self, target: &str) {
+        let target = target.trim();
+        if target.is_empty() {
+            self.message = Some("No directory name given".to_string());
+            return;
+        }
+        let path = self.expand_path(target);
+        if path.exists() {
+            self.message = Some(format!("{} already exists", path.display()));
+            return;
+        }
+        match fs::create_dir_all(&path) {
+            Ok(()) => {
+                self.dired_revert();
+                if let Some(name) = path.file_name() {
+                    let name = name.to_string_lossy().into_owned();
+                    let idx = self.current;
+                    self.dired_goto_name(idx, &name);
+                }
+                self.message = Some(format!("Created {}", path.display()));
+            }
+            Err(err) => self.message = Some(format!("Cannot create {}: {err}", path.display())),
+        }
+    }
+
     /// Point an open file/hexl buffer at `new` after its file was renamed.
     fn rename_open_buffer(&mut self, old: &std::path::Path, new: &std::path::Path) {
         let old_name = old.display().to_string();
@@ -932,7 +981,9 @@ impl App {
             _ => (PendingAction::DeleteMarked, "marked"),
         };
         self.prompt = Prompt::Confirm {
-            message: format!("Delete {count} {what} file(s)? (y or n) "),
+            message: format!("Delete {count} {what} file(s)? (yes or no) "),
+            input: String::new(),
+            cursor: 0,
             action,
         };
     }
@@ -1041,6 +1092,10 @@ impl App {
                 self.numeric_arg = None;
                 self.prefix = Prefix::Star;
                 self.message = Some("*".to_string());
+                true
+            }
+            KeyCode::Char('+') => {
+                self.start_create_directory();
                 true
             }
             _ => false,
@@ -1487,8 +1542,9 @@ impl App {
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
-        if let Prompt::FindFile { selected, .. } | Prompt::Rename { selected, .. } =
-            &mut self.prompt
+        if let Prompt::FindFile { selected, .. }
+        | Prompt::Rename { selected, .. }
+        | Prompt::CreateDirectory { selected, .. } = &mut self.prompt
         {
             *selected = select_move(*selected, count, delta);
             return;
@@ -1499,6 +1555,7 @@ impl App {
             | Prompt::Confirm { .. }
             | Prompt::FindFile { .. }
             | Prompt::Rename { .. }
+            | Prompt::CreateDirectory { .. }
             | Prompt::MarkExtension { .. } => return,
         };
         if count == 0 {
@@ -1515,8 +1572,10 @@ impl App {
             | Prompt::KillBuffer { input, cursor, .. }
             | Prompt::FindFile { input, cursor, .. }
             | Prompt::Rename { input, cursor, .. }
-            | Prompt::MarkExtension { input, cursor } => (input, cursor),
-            Prompt::None | Prompt::Confirm { .. } => return None,
+            | Prompt::MarkExtension { input, cursor }
+            | Prompt::CreateDirectory { input, cursor, .. }
+            | Prompt::Confirm { input, cursor, .. } => (input, cursor),
+            Prompt::None => return None,
         };
         Some(f(input, cursor))
     }
@@ -1526,7 +1585,9 @@ impl App {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => {
                 *selected = 0
             }
-            Prompt::FindFile { selected, .. } | Prompt::Rename { selected, .. } => *selected = None,
+            Prompt::FindFile { selected, .. }
+            | Prompt::Rename { selected, .. }
+            | Prompt::CreateDirectory { selected, .. } => *selected = None,
             _ => {}
         }
     }
@@ -1645,7 +1706,9 @@ impl App {
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired),
-            Prompt::Rename { input, .. } => self.file_candidates(input, false),
+            Prompt::Rename { input, .. } | Prompt::CreateDirectory { input, .. } => {
+                self.file_candidates(input, false)
+            }
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => return,
         };
         if candidates.is_empty() {
@@ -1681,6 +1744,11 @@ impl App {
                 input,
                 cursor,
                 selected,
+            }
+            | Prompt::CreateDirectory {
+                input,
+                cursor,
+                selected,
             } => {
                 *cursor = completion.chars().count();
                 *input = completion;
@@ -1692,29 +1760,6 @@ impl App {
 
     fn handle_prompt_key(&mut self, key: KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
-        // A confirmation prompt answers y/n rather than editing text.
-        if let Some(action) = match &self.prompt {
-            Prompt::Confirm { action, .. } => Some(*action),
-            _ => Option::None,
-        } {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let yes = matches!(
-                key.code,
-                KeyCode::Char('y') | KeyCode::Char(' ') | KeyCode::Enter
-            );
-            let no = matches!(
-                key.code,
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Backspace
-            ) || (ctrl && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('c')));
-            if yes {
-                self.prompt = Prompt::None;
-                self.run_pending(action);
-            } else if no {
-                self.prompt = Prompt::None;
-                self.message = Some("Canceled".to_string());
-            }
-            return;
-        }
         match key.code {
             KeyCode::Esc => {
                 self.prompt = Prompt::None;
@@ -1738,7 +1783,9 @@ impl App {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired).len(),
-            Prompt::Rename { input, .. } => self.file_candidates(input, false).len(),
+            Prompt::Rename { input, .. } | Prompt::CreateDirectory { input, .. } => {
+                self.file_candidates(input, false).len()
+            }
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
         };
         use Action::*;
@@ -1838,9 +1885,37 @@ impl App {
                 };
                 self.commit_rename(&chosen);
             }
+            Prompt::CreateDirectory {
+                input, selected, ..
+            } => {
+                let candidates = self.file_candidates(&input, false);
+                let chosen = match selected {
+                    Some(i) => candidates.get(i).cloned().unwrap_or(input),
+                    None => input,
+                };
+                self.commit_create_directory(&chosen);
+            }
             Prompt::MarkExtension { input, .. } => self.mark_by_extension(&input),
-            // Confirmations are committed through `handle_prompt_key`.
-            Prompt::Confirm { .. } => {}
+            Prompt::Confirm {
+                message,
+                input,
+                action,
+                ..
+            } => {
+                if answer_is_yes(&input) {
+                    self.run_pending(action);
+                } else if answer_is_no(&input) {
+                    self.message = Some("Canceled".to_string());
+                } else {
+                    // Re-ask, like `yes-or-no-p`.
+                    self.prompt = Prompt::Confirm {
+                        message,
+                        input: String::new(),
+                        cursor: 0,
+                        action,
+                    };
+                }
+            }
         }
     }
 
@@ -1919,6 +1994,19 @@ impl App {
                     selected.unwrap_or(usize::MAX),
                 ))
             }
+            Prompt::CreateDirectory {
+                input,
+                cursor,
+                selected,
+            } => {
+                let prefix = "Create directory: ";
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    self.file_candidates(input, false),
+                    selected.unwrap_or(usize::MAX),
+                ))
+            }
             Prompt::MarkExtension { input, cursor } => {
                 let prefix = "Mark extension: ";
                 Some((
@@ -1928,9 +2016,17 @@ impl App {
                     0,
                 ))
             }
-            Prompt::Confirm { message, .. } => {
-                Some((message.clone(), message.chars().count(), Vec::new(), 0))
-            }
+            Prompt::Confirm {
+                message,
+                input,
+                cursor,
+                ..
+            } => Some((
+                format!("{message}{input}"),
+                message.chars().count() + *cursor,
+                Vec::new(),
+                0,
+            )),
         }
     }
 
@@ -2438,6 +2534,16 @@ fn is_backup_file(name: &str) -> bool {
     name.ends_with('~')
 }
 
+/// Whether a `yes-or-no-p` answer means "yes".
+fn answer_is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "yes" | "y")
+}
+
+/// Whether a `yes-or-no-p` answer means "no".
+fn answer_is_no(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "no" | "n")
+}
+
 fn home_dir() -> Option<PathBuf> {
     if let Some(dirs) = directories::UserDirs::new() {
         return Some(dirs.home_dir().to_path_buf());
@@ -2589,6 +2695,7 @@ fn help_lines() -> Vec<String> {
         "  * .                 mark files by extension",
         "  #                   flag auto-save files for deletion",
         "  ~                   flag backup files for deletion",
+        "  +                   create a directory",
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   cycle sorting: name / date / size",
         "  < / >               previous / next directory line",
@@ -2788,7 +2895,8 @@ mod tests {
         );
         assert!(app.current().buffer.line(row0).text().starts_with("* "));
 
-        // Flag the second entry, then delete flagged files (confirm with y).
+        // Flag the second entry, then delete flagged files. The confirmation
+        // is a `yes-or-no-p`: type the answer, then RET.
         press(&mut app, 'd');
         assert_eq!(
             app.current().dired.as_ref().unwrap().entries[1].mark,
@@ -2796,7 +2904,8 @@ mod tests {
         );
         press(&mut app, 'x');
         assert!(matches!(app.prompt, Prompt::Confirm { .. }));
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(!dir.join("b.txt").exists());
         let d = app.current().dired.as_ref().unwrap();
@@ -2804,6 +2913,27 @@ mod tests {
         assert_eq!(d.entries[0].name, "a.txt");
         // The mark on a.txt survives the revert.
         assert_eq!(d.entries[0].mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delete_confirmation_needs_the_answer_then_ret() {
+        let dir = temp_dir("confirm");
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        press(&mut app, 'd'); // flag a.txt
+        press(&mut app, 'x'); // ask
+
+        // A bare `y` is just text in the prompt; nothing is deleted yet.
+        press(&mut app, 'y');
+        assert!(dir.join("a.txt").exists());
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+
+        // RET confirms the answer.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!dir.join("a.txt").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3143,6 +3273,27 @@ mod tests {
             .entries
             .iter()
             .all(|e| e.mark == Mark::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plus_creates_a_directory() {
+        let dir = temp_dir("mkdir");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, '+');
+        assert!(matches!(app.prompt, Prompt::CreateDirectory { .. }));
+        if let Prompt::CreateDirectory { input, cursor, .. } = &mut app.prompt {
+            *input = format!("{}{}newdir", dir.display(), std::path::MAIN_SEPARATOR);
+            *cursor = input.chars().count();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(dir.join("newdir").is_dir());
+        let d = app.current().dired.as_ref().unwrap();
+        assert!(d.entries.iter().any(|e| e.name == "newdir"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
