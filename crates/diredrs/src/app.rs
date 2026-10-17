@@ -482,17 +482,13 @@ impl App {
             let last = self.buffers[idx].buffer.last_row() as isize;
             let target = (self.buffers[idx].buffer.point().row as isize + delta).clamp(0, last);
             let target = target as usize;
-            let col = {
-                let cur = self.buffers[idx].buffer.point().col;
-                match self.buffers[idx]
-                    .dired
-                    .as_ref()
-                    .and_then(|d| d.filename_col(target))
-                {
-                    Some(col) => col,
-                    None => cur.min(self.buffers[idx].buffer.line(target).char_len()),
-                }
-            };
+            // Land on the file name, or at the line start on a non-file line
+            // (the header) like `dired-move-to-filename`.
+            let col = self.buffers[idx]
+                .dired
+                .as_ref()
+                .and_then(|d| d.filename_col(target))
+                .unwrap_or(0);
             self.buffers[idx].buffer.set_point(Pos::new(target, col));
         }
     }
@@ -787,6 +783,20 @@ impl App {
     /// Copy the marked (or current) file names to the kill ring (`w`). With a
     /// numeric argument, copy absolute paths.
     fn dired_copy_names(&mut self) {
+        // On a directory header line, copy the directory itself (absolute),
+        // ignoring marks, like `dired-copy-filename-as-kill`.
+        if self.dired_entry_at_point().is_none() {
+            if let Some(dir) = self.current().dired.as_ref().map(|d| d.dir.clone()) {
+                let mut text = dir.display().to_string();
+                if !text.ends_with(std::path::MAIN_SEPARATOR) {
+                    text.push(std::path::MAIN_SEPARATOR);
+                }
+                self.kill_new(&text, false);
+                self.message = Some(text);
+                return;
+            }
+        }
+
         let absolute = self.numeric_arg.take().is_some();
         let marked = self.dired_paths(Mark::Marked);
         let chosen: Vec<PathBuf> = if !marked.is_empty() {
@@ -3126,9 +3136,9 @@ mod tests {
         // Point starts on the first file line (row 1).
         assert_eq!(app.current().buffer.point().row, 1);
 
-        // C-p moves up to the header line (row 0) rather than skipping it.
+        // C-p moves up to the header line (row 0) and to the start of the line.
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(app.current().buffer.point().row, 0);
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 0));
 
         // C-n comes back down onto the first file's name.
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
@@ -3273,6 +3283,21 @@ mod tests {
             .entries
             .iter()
             .all(|e| e.mark == Mark::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn w_on_the_header_copies_the_directory() {
+        let dir = temp_dir("copydir");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // Move to the header line, then copy: the directory goes on the ring.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        press(&mut app, 'w');
+        let expected = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
+        assert_eq!(app.kill_ring.current().as_deref(), Some(expected.as_str()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
