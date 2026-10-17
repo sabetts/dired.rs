@@ -1,43 +1,26 @@
 # Intro
 
-In the spirit of clones that are fun to write, I present a vibe-coded
-clone of dired in Rust. It mirrors the stack used by `cricr/`: a
-ratatui + crossterm TUI with a shallow set of Emacs keybindings.
+This is a vibe-coded clone of dired in Rust.
 
 # Usage
 
 You run it in a terminal.
 
 On boot it opens a `*scratch*` buffer and a Dired buffer for your home
-directory. Moving around uses Emacs motions; visiting a file opens it in
-a read-only buffer (text files as text, binary files in a hex viewer
-like `hexl-mode`).
+directory. Moving around uses Emacs motions; visiting a file opens it
+in a read-only buffer. I haven't fully decided what is out-of-scope. I
+intend to keep adding until I stop noticing I'm not in emacs.
 
-Markdown, TOML, and INI/conf files are syntax-highlighted with Emacs'
-default faces (for Markdown, `markdown-mode`; for TOML, `conf-toml-mode`;
-for INI/conf, `conf-mode`). Conf files are chosen by extension (`.ini`,
-`.conf`, `.cfg`, `.cf`) and, like Emacs, by name — so `.git/config` and
-`.gitconfig` are highlighted too.
+A few files get syntax highlighting. I'll probably add more.
 
-It clones a shallow subset of Emacs' dired within that scope. I've
-diverged in a few places where it made sense.
+I've diverged from dired in a few places where I thought it made sense.
 
 It's a work-in-progress.
 
 # Notes
 
 On Windows Terminal, `Ctrl-V` is bound by the *terminal* to paste, so it
-never reaches diredrs and the `C-v` page-down binding is unavailable
-there. Use the `PageDown` key instead, or free the chord by unbinding
-`Ctrl-V` in Windows Terminal (Settings → Actions → delete the Paste
-binding for `ctrl+v`; `Ctrl-Shift-V` still pastes):
-
-    { "command": "unbound", "keys": "ctrl+v" }
-
-Pasting into a read-only buffer (Dired, file views, the hex viewer) is
-refused with "Text is read-only"; pasting into `*scratch*` or a prompt
-inserts the text. A deliberate single-character paste on Windows is
-indistinguishable from a keystroke.
+never reaches diredrs and the `C-v` page-down binding is unavailable.
 
 # Model Used
 
