@@ -25,6 +25,8 @@ pub struct UiConfig {
     /// Lines kept above and below point before the view scrolls
     /// (Emacs' `scroll-margin`).
     pub scroll_margin: usize,
+    /// Delay in milliseconds before `M-g` shows the window-number overlay.
+    pub window_number_delay_ms: u64,
     /// Cursor foreground color (a name like `"black"` or `#rrggbb`).
     pub cursor_fg: String,
     /// Cursor background color.
@@ -38,6 +40,7 @@ impl Default for UiConfig {
             show_hidden: true,
             human_sizes: true,
             scroll_margin: 1,
+            window_number_delay_ms: 250,
             cursor_fg: "black".to_string(),
             cursor_bg: "yellow".to_string(),
         }
@@ -52,6 +55,7 @@ background = "dark"     # or "light"
 show_hidden = true      # list dotfiles, like ls -a
 human_sizes = true      # sizes as K/M/G like ls -h; false for exact bytes
 scroll_margin = 1       # lines kept above/below point before the view scrolls
+window_number_delay_ms = 250  # M-g overlay delay in milliseconds
 cursor_fg = "black"     # cursor text color (name or #rrggbb)
 cursor_bg = "yellow"    # cursor background color
 "##;
@@ -94,8 +98,10 @@ mod tests {
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
         assert_eq!(cfg.ui.scroll_margin, 1);
+        assert_eq!(cfg.ui.window_number_delay_ms, 250);
         assert_eq!(cfg.ui.cursor_fg, "black");
         assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert!(TEMPLATE.contains("window_number_delay_ms"));
         assert!(TEMPLATE.contains("cursor_bg"));
     }
 
@@ -106,8 +112,10 @@ mod tests {
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
         assert_eq!(cfg.ui.scroll_margin, 1);
+        assert_eq!(cfg.ui.window_number_delay_ms, 250);
         assert_eq!(cfg.ui.cursor_fg, "black");
         assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert!(TEMPLATE.contains("window_number_delay_ms"));
     }
 
     #[test]
@@ -120,9 +128,12 @@ mod tests {
 
     #[test]
     fn overrides_apply() {
-        let cfg: Config =
-            toml::from_str("[ui]\nbackground = \"light\"\nshow_hidden = false\n").unwrap();
+        let cfg: Config = toml::from_str(
+            "[ui]\nbackground = \"light\"\nshow_hidden = false\nwindow_number_delay_ms = 600\n",
+        )
+        .unwrap();
         assert_eq!(cfg.ui.background, Background::Light);
         assert!(!cfg.ui.show_hidden);
+        assert_eq!(cfg.ui.window_number_delay_ms, 600);
     }
 }

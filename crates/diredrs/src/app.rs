@@ -223,10 +223,6 @@ const PASTE_LATCH: Duration = Duration::from_millis(50);
 /// Emacs's `echo-keystrokes` (default one second).
 const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
 
-/// How long `M-g` waits before showing the window numbers, half the normal
-/// prefix delay.
-const WINDOW_NUMBER_DELAY: Duration = Duration::from_millis(500);
-
 /// How long to show the other end of a copied region, like Emacs's
 /// `indicate-copied-region`.
 const COPY_FLASH: Duration = Duration::from_millis(220);
@@ -1964,7 +1960,7 @@ impl App {
         self.show_window_numbers = false;
         self.message = None;
         let delay = if prefix == Prefix::MetaG {
-            WINDOW_NUMBER_DELAY
+            Duration::from_millis(self.config.ui.window_number_delay_ms)
         } else {
             PREFIX_ECHO_DELAY
         };
@@ -4257,9 +4253,11 @@ mod tests {
         alt(&mut app, 'g');
         assert!(!app.show_window_numbers());
 
-        app.echo_pending_prefix(Instant::now() + Duration::from_millis(250));
+        let delay = Duration::from_millis(app.config.ui.window_number_delay_ms);
+        assert_eq!(delay, Duration::from_millis(250));
+        app.echo_pending_prefix(Instant::now() + Duration::from_millis(100));
         assert!(!app.show_window_numbers());
-        app.echo_pending_prefix(Instant::now() + WINDOW_NUMBER_DELAY);
+        app.echo_pending_prefix(Instant::now() + delay);
         assert!(app.show_window_numbers());
 
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
@@ -4273,6 +4271,18 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert!(!app.show_window_numbers());
+    }
+
+    #[test]
+    fn m_g_overlay_delay_is_configurable() {
+        let mut config = Config::default();
+        config.ui.window_number_delay_ms = 600;
+        let mut app = App::new(config);
+        alt(&mut app, 'g');
+        app.echo_pending_prefix(Instant::now() + Duration::from_millis(500));
+        assert!(!app.show_window_numbers());
+        app.echo_pending_prefix(Instant::now() + Duration::from_millis(600));
+        assert!(app.show_window_numbers());
     }
 
     #[test]
