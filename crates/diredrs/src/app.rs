@@ -895,24 +895,31 @@ impl App {
     }
 
     fn start_transfer(&mut self, copy: bool) {
-        // A copy and a group rename ask for a target directory. Rename offers
-        // the file's own name when only a single file is involved.
+        // A copy and a group rename ask for a target directory. Rename starts
+        // from the current directory plus the file name when one file is
+        // involved.
         let marked = self.dired_paths(Mark::Marked);
         let dir = self.default_directory();
-        let single = self.dired_entry_at_point().and_then(|i| {
+        let at_point = self.dired_entry_at_point().and_then(|i| {
             self.current()
                 .dired
                 .as_ref()
                 .map(|d| d.entries[i].path.clone())
         });
+        let single = if marked.len() == 1 {
+            marked.first().cloned()
+        } else {
+            at_point
+        };
         let input = if copy || marked.len() > 1 {
             directory_input(&dir)
-        } else if marked.is_empty() {
-            single
-                .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_default()
         } else {
-            String::new()
+            single
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|n| format!("{}{}", directory_input(&dir), n.to_string_lossy()))
+                })
+                .unwrap_or_default()
         };
         self.prompt = Prompt::Rename {
             cursor: input.chars().count(),
@@ -4326,6 +4333,8 @@ mod tests {
         press(&mut app, 'n'); // move to old.txt
         press(&mut app, 'R');
         if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            // Start from the current directory plus the current file name.
+            assert_eq!(*input, dir.join("old.txt").display().to_string());
             *input = "new.txt".to_string();
             *cursor = input.chars().count();
         } else {
