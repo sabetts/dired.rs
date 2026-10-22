@@ -18,6 +18,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut panes = Vec::new();
     let mut dividers = Vec::new();
     collect_panes(app.window_tree(), rows[0], &mut panes, &mut dividers);
+    app.set_window_areas(
+        panes
+            .iter()
+            .map(|(id, buffer_area, _)| (*id, *buffer_area))
+            .collect(),
+    );
     let active_id = app.active_window_id();
     let active_area = panes
         .iter()
@@ -26,7 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .unwrap_or(rows[0]);
     app.prepare_active_view(active_area.width as usize, active_area.height as usize);
 
-    for (id, buffer_area, mode_area) in panes {
+    for &(id, buffer_area, mode_area) in &panes {
         let Some(window) = app.window(id) else {
             continue;
         };
@@ -47,6 +53,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame,
             app,
             window.buffer,
+            app.window_number(id),
             view.point.row + 1,
             mode_area,
             active,
@@ -54,6 +61,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     for divider in dividers {
         draw_vertical_border(frame, divider);
+    }
+    if app.show_window_numbers() {
+        draw_window_numbers(frame, app, &panes);
     }
     draw_minibuffer(frame, app, rows[1]);
 }
@@ -107,6 +117,45 @@ fn draw_vertical_border(frame: &mut Frame, area: Rect) {
     }
     let lines = vec![RLine::from("│"); area.height as usize];
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+const DIGIT_PATTERNS: [[&str; 5]; 10] = [
+    ["███", "█ █", "█ █", "█ █", "███"],
+    [" █ ", "██ ", " █ ", " █ ", "███"],
+    ["███", "  █", "███", "█  ", "███"],
+    ["███", "  █", "███", "  █", "███"],
+    ["█ █", "█ █", "███", "  █", "  █"],
+    ["███", "█  ", "███", "  █", "███"],
+    ["███", "█  ", "███", "█ █", "███"],
+    ["███", "  █", "  █", "  █", "  █"],
+    ["███", "█ █", "███", "█ █", "███"],
+    ["███", "█ █", "███", "  █", "███"],
+];
+
+fn draw_window_numbers(frame: &mut Frame, app: &App, panes: &[(WindowId, Rect, Rect)]) {
+    let style = rstyle(app.cursor_style);
+    for &(id, area, _) in panes {
+        let Some(number) = app.window_number(id) else {
+            continue;
+        };
+        let pattern = &DIGIT_PATTERNS[usize::from(number)];
+        if area.width >= 3 && area.height >= 5 {
+            let x = area.x + (area.width - 3) / 2;
+            let y = area.y + (area.height - 5) / 2;
+            let lines: Vec<RLine> = pattern
+                .iter()
+                .map(|row| RLine::from(RSpan::styled((*row).to_string(), style)))
+                .collect();
+            frame.render_widget(Paragraph::new(Text::from(lines)), Rect::new(x, y, 3, 5));
+        } else if area.width > 0 && area.height > 0 {
+            let x = area.x + (area.width - 1) / 2;
+            let y = area.y + (area.height - 1) / 2;
+            frame.render_widget(
+                Paragraph::new(number.to_string()).style(style),
+                Rect::new(x, y, 1, 1),
+            );
+        }
+    }
 }
 
 fn draw_buffer(
@@ -196,14 +245,26 @@ fn display_point(search: &Search, point: Pos) -> Pos {
     }
 }
 
-fn draw_mode_line(frame: &mut Frame, app: &App, idx: usize, line: usize, area: Rect, active: bool) {
+fn draw_mode_line(
+    frame: &mut Frame,
+    app: &App,
+    idx: usize,
+    number: Option<u8>,
+    line: usize,
+    area: Rect,
+    active: bool,
+) {
     let base = if active {
         RStyle::default().add_modifier(Modifier::REVERSED)
     } else {
         RStyle::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
     };
+    let number = number
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "-".to_string());
     let text = format!(
-        " {}  ({})  L{} ",
+        " {}  {}  ({})  L{} ",
+        number,
         app.mode_line_name_for(idx),
         app.mode_line_mode_for(idx),
         line

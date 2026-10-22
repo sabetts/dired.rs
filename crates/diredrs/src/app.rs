@@ -8,6 +8,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Style};
@@ -79,6 +80,15 @@ pub enum SplitAxis {
     Below,
     /// Left and right.
     Right,
+}
+
+/// A direction for `M-g M-f/b/p/n` window movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowDirection {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// The binary tree describing the window layout.
@@ -165,6 +175,8 @@ enum Prefix {
     CtrlX,
     /// `C-x 4` (`C-x 4 b`).
     CtrlX4,
+    /// `M-g` (window movement and numbering).
+    MetaG,
     CtrlC,
     Help,
     /// Dired's `*` marking prefix (`* !`, `* .`).
@@ -227,6 +239,10 @@ pub struct App {
     pub(crate) windows: Vec<Window>,
     pub(crate) active_window: WindowId,
     pub(crate) window_tree: WindowTree,
+    /// Buffer areas from the last draw, used for directional movement.
+    window_areas: Vec<(WindowId, Rect)>,
+    /// Whether the idle `M-g` number overlay is showing.
+    show_window_numbers: bool,
     next_window_id: WindowId,
     /// Monotonic counter for the most recent buffer visit, for list ordering.
     visit_seq: u64,
@@ -288,6 +304,8 @@ impl App {
             windows: Vec::new(),
             active_window: 0,
             window_tree: WindowTree::Leaf(0),
+            window_areas: Vec::new(),
+            show_window_numbers: false,
             next_window_id: 1,
             visit_seq: 0,
             history: History::default(),
@@ -407,6 +425,24 @@ impl App {
 
     pub(crate) fn active_window_id(&self) -> WindowId {
         self.active_window
+    }
+
+    pub(crate) fn set_window_areas(&mut self, areas: Vec<(WindowId, Rect)>) {
+        self.window_areas = areas;
+    }
+
+    pub(crate) fn show_window_numbers(&self) -> bool {
+        self.show_window_numbers
+    }
+
+    /// The displayed number for a window: 1-9, then 0 for the tenth window.
+    pub(crate) fn window_number(&self, id: WindowId) -> Option<u8> {
+        let index = self.window_ids().iter().position(|window| *window == id)?;
+        match index {
+            0..=8 => Some(index as u8 + 1),
+            9 => Some(0),
+            _ => None,
+        }
     }
 
     fn window_ids(&self) -> Vec<WindowId> {
@@ -573,6 +609,89 @@ impl App {
             .position(|id| *id == self.active_window)
             .unwrap_or(0);
         Some(ids[(pos + 1) % ids.len()])
+    }
+
+    fn focus_window_number(&mut self, number: u8) {
+        let index = if number == 0 {
+            9
+        } else {
+            usize::from(number.saturating_sub(1))
+        };
+        if let Some(id) = self.window_ids().get(index).copied() {
+            self.select_window(id);
+        } else {
+            self.message = Some(format!("No window {number}"));
+        }
+    }
+
+    fn focus_direction(&mut self, direction: WindowDirection) {
+        let Some(active) = self
+            .window_areas
+            .iter()
+            .find(|(id, _)| *id == self.active_window)
+            .map(|(_, area)| *area)
+        else {
+            self.message = Some("No window in that direction".to_string());
+            return;
+        };
+        let active_left = u32::from(active.x);
+        let active_top = u32::from(active.y);
+        let active_right = active_left + u32::from(active.width);
+        let active_bottom = active_top + u32::from(active.height);
+
+        let mut best: Option<(u32, WindowId)> = None;
+        for (id, area) in &self.window_areas {
+            if *id == self.active_window {
+                continue;
+            }
+            let left = u32::from(area.x);
+            let top = u32::from(area.y);
+            let right = left + u32::from(area.width);
+            let bottom = top + u32::from(area.height);
+            let (in_direction, primary, perpendicular) = match direction {
+                WindowDirection::Right if left >= active_right => (
+                    true,
+                    left - active_right,
+                    interval_gap(top, bottom, active_top, active_bottom),
+                ),
+                WindowDirection::Left if right <= active_left => (
+                    true,
+                    active_left - right,
+                    interval_gap(top, bottom, active_top, active_bottom),
+                ),
+                WindowDirection::Down if top >= active_bottom => (
+                    true,
+                    top - active_bottom,
+                    interval_gap(left, right, active_left, active_right),
+                ),
+                WindowDirection::Up if bottom <= active_top => (
+                    true,
+                    active_top - bottom,
+                    interval_gap(left, right, active_left, active_right),
+                ),
+                _ => (false, 0, 0),
+            };
+            if !in_direction {
+                continue;
+            }
+            let score = primary + perpendicular * 2;
+            if best.is_none_or(|(best_score, _)| score < best_score) {
+                best = Some((score, *id));
+            }
+        }
+        if let Some((_, id)) = best {
+            self.select_window(id);
+        } else {
+            self.message = Some(format!(
+                "No window {}",
+                match direction {
+                    WindowDirection::Left => "to the left",
+                    WindowDirection::Right => "to the right",
+                    WindowDirection::Up => "above",
+                    WindowDirection::Down => "below",
+                }
+            ));
+        }
     }
 
     fn switch_buffer_in_other_window(&mut self, idx: usize) {
@@ -1656,8 +1775,9 @@ impl App {
         }
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
-        // ...and an overdue-but-unshown prefix hint.
+        // ...and an overdue-but-unshown prefix hint or number overlay.
         self.prefix_echo = None;
+        self.show_window_numbers = false;
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
             return;
@@ -1718,6 +1838,11 @@ impl App {
         if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace) {
             self.numeric_arg = None;
             self.start_prefix(Prefix::Help, "C-h-");
+            return;
+        }
+        if !ctrl && key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('g') {
+            self.numeric_arg = None;
+            self.start_prefix(Prefix::MetaG, "M-g-");
             return;
         }
 
@@ -1832,6 +1957,7 @@ impl App {
     /// echoed only if the user pauses.
     fn start_prefix(&mut self, prefix: Prefix, hint: &str) {
         self.prefix = prefix;
+        self.show_window_numbers = false;
         self.message = None;
         self.start_echo(hint);
     }
@@ -1847,12 +1973,15 @@ impl App {
                 let hint = hint.clone();
                 self.prefix_echo = None;
                 self.message = Some(hint);
+                if self.prefix == Prefix::MetaG {
+                    self.show_window_numbers = true;
+                }
             }
         }
     }
 
     fn handle_prefix(&mut self, key: KeyEvent, ctrl: bool) {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
         let prefix = std::mem::take(&mut self.prefix);
         self.message = None;
         match prefix {
@@ -1878,6 +2007,23 @@ impl App {
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x 4", key),
             },
+            Prefix::MetaG => {
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Char('f') if alt => self.focus_direction(WindowDirection::Right),
+                    KeyCode::Char('b') if alt => self.focus_direction(WindowDirection::Left),
+                    KeyCode::Char('p') if alt => self.focus_direction(WindowDirection::Up),
+                    KeyCode::Char('n') if alt => self.focus_direction(WindowDirection::Down),
+                    KeyCode::Char(d) if !ctrl && !alt && d.is_ascii_digit() => {
+                        if let Some(number) = d.to_digit(10) {
+                            self.focus_window_number(number as u8);
+                        }
+                    }
+                    KeyCode::Esc => {}
+                    KeyCode::Char('g') if ctrl => {}
+                    _ => self.undefined("M-g", key),
+                }
+            }
             Prefix::CtrlC => match key.code {
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-c", key),
@@ -3485,6 +3631,14 @@ fn destination_inside_source(src: &std::path::Path, to: &std::path::Path) -> boo
 
 /// Delete each path (recursively for directories), returning a summary. A
 /// symlink is removed as a link, never followed.
+fn interval_gap(start: u32, end: u32, other_start: u32, other_end: u32) -> u32 {
+    if end <= other_start {
+        other_start - end
+    } else {
+        start.saturating_sub(other_end)
+    }
+}
+
 fn capture_view(buffer: &Buffer) -> WindowView {
     WindowView {
         point: buffer.point(),
@@ -3853,6 +4007,9 @@ fn help_lines() -> Vec<String> {
         "  C-x 1          delete all other windows",
         "  C-x o          move to the next window",
         "  C-x 4 b        switch buffer in the other window",
+        "  M-g M-f/M-b    move focus right / left",
+        "  M-g M-p/M-n    move focus up / down",
+        "  M-g 1-9 / 0    jump to window 1-9 / 10",
         "",
         "Help",
         "  C-h b          describe bindings (this buffer)",
@@ -4016,6 +4173,94 @@ mod tests {
     }
 
     #[test]
+    fn m_g_moves_focus_directionally() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        ctrl_x(&mut app, '2');
+        ctrl_x(&mut app, '3');
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let ids = app.window_ids();
+        let left = ids[0];
+        let right = ids[1];
+        let bottom = ids[2];
+        assert_eq!(app.active_window, left);
+
+        alt(&mut app, 'g');
+        alt(&mut app, 'f');
+        assert_eq!(app.active_window, right);
+
+        alt(&mut app, 'g');
+        alt(&mut app, 'b');
+        assert_eq!(app.active_window, left);
+
+        alt(&mut app, 'g');
+        alt(&mut app, 'n');
+        assert_eq!(app.active_window, bottom);
+
+        alt(&mut app, 'g');
+        alt(&mut app, 'p');
+        assert_eq!(app.active_window, left);
+    }
+
+    #[test]
+    fn m_g_numbers_jump_and_follow_tree_order() {
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '2');
+        ctrl_x(&mut app, '3');
+        let ids = app.window_ids();
+        assert_eq!(app.window_number(ids[0]), Some(1));
+        assert_eq!(app.window_number(ids[1]), Some(2));
+        assert_eq!(app.window_number(ids[2]), Some(3));
+
+        alt(&mut app, 'g');
+        press(&mut app, '2');
+        assert_eq!(app.active_window, ids[1]);
+
+        alt(&mut app, 'g');
+        press(&mut app, '0');
+        assert_eq!(app.active_window, ids[1]);
+        assert_eq!(app.message.as_deref(), Some("No window 0"));
+
+        ctrl_x(&mut app, '0');
+        let after = app.window_ids();
+        assert_eq!(after, vec![ids[0], ids[2]]);
+        assert_eq!(app.window_number(after[0]), Some(1));
+        assert_eq!(app.window_number(after[1]), Some(2));
+
+        alt(&mut app, 'g');
+        press(&mut app, '1');
+        assert_eq!(app.active_window, after[0]);
+    }
+
+    #[test]
+    fn waiting_after_m_g_shows_numbers_until_the_next_key() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '2');
+        alt(&mut app, 'g');
+        assert!(!app.show_window_numbers());
+
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert!(app.show_window_numbers());
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let blocks = (0..12u16)
+            .flat_map(|y| (0..40u16).map(move |x| (x, y)))
+            .filter(|(x, y)| buffer[(*x, *y)].symbol() == "█")
+            .count();
+        assert!(blocks > 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(!app.show_window_numbers());
+    }
+
+    #[test]
     fn c_x_4_b_splits_when_needed_and_switches_the_other_window() {
         let dir = temp_dir("other-buffer");
         let mut app = App::new(Config::default());
@@ -4135,6 +4380,8 @@ mod tests {
 
         let mode_line = row(10);
         assert!(mode_line.contains("*scratch*"), "{mode_line}");
+        assert!(mode_line.contains(" 1 "), "{mode_line}");
+        assert!(mode_line.contains(" 2 "), "{mode_line}");
         let reversed = (0..40u16)
             .filter(|x| {
                 buffer[(*x, 10)]
