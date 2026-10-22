@@ -1,7 +1,7 @@
 //! Application state and the event loop.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -561,8 +561,21 @@ impl App {
         }
     }
 
+    /// The parent path when point is on the synthetic `..` row.
+    fn dired_parent_at_point(&self) -> Option<PathBuf> {
+        let buf = self.current();
+        let dired = buf.dired.as_ref()?;
+        (dired.parent_row() == Some(buf.buffer.point().row))
+            .then(|| dired.parent_path().map(Path::to_path_buf))
+            .flatten()
+    }
+
     /// Visit the file or directory at point.
     fn dired_visit(&mut self) {
+        if let Some(parent) = self.dired_parent_at_point() {
+            self.open_dired(parent);
+            return;
+        }
         let Some(i) = self.dired_entry_at_point() else {
             self.message = Some("No file on this line".to_string());
             return;
@@ -814,6 +827,17 @@ impl App {
     /// Copy the marked (or current) file names to the kill ring (`w`). With a
     /// numeric argument, copy absolute paths.
     fn dired_copy_names(&mut self) {
+        // On the `..` row, copy the parent directory itself (absolute).
+        if let Some(parent) = self.dired_parent_at_point() {
+            self.numeric_arg = None;
+            let mut text = parent.display().to_string();
+            if !text.ends_with(std::path::MAIN_SEPARATOR) {
+                text.push(std::path::MAIN_SEPARATOR);
+            }
+            self.kill_new(&text, false);
+            self.message = Some(text);
+            return;
+        }
         // On a directory header line, copy the directory itself (absolute),
         // ignoring marks, like `dired-copy-filename-as-kill`.
         if self.dired_entry_at_point().is_none() {
@@ -3567,6 +3591,28 @@ mod tests {
     }
 
     #[test]
+    fn dired_ret_on_dotdot_opens_the_parent() {
+        let dir = temp_dir("parent-entry");
+        let child = dir.join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("note.txt"), b"x").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(child.clone());
+        let d = app.current().dired.as_ref().unwrap();
+        assert_eq!(d.parent_path(), Some(dir.as_path()));
+        assert!(app.current().buffer.line(1).text().contains(".."));
+
+        // Point starts on note.txt; `p` moves onto `..`, RET visits the parent.
+        press(&mut app, 'p');
+        assert_eq!(app.current().buffer.point().row, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current().name, dir.display().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn opens_text_file_read_only() {
         let dir = temp_dir("file");
         let path = dir.join("note.txt");
@@ -3887,16 +3933,19 @@ mod tests {
         std::fs::write(dir.join("b.txt"), b"x").unwrap();
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
-        // Point starts on the first file line (row 1).
-        assert_eq!(app.current().buffer.point().row, 1);
+        // Point starts on the first real file line, below `..` (row 2).
+        assert_eq!(app.current().buffer.point().row, 2);
 
-        // C-p moves up to the header line (row 0) and to the start of the line.
+        // C-p moves up through `..` to the header line (row 0), at line start.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point().row, 1);
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.current().buffer.point(), Pos::new(0, 0));
 
-        // C-n comes back down onto the first file's name.
+        // C-n comes back down onto the first file's line.
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(app.current().buffer.point().row, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point().row, 2);
         assert_eq!(app.dired_entry_at_point(), Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -4003,8 +4052,8 @@ mod tests {
         let mut app = App::new(Config::default());
         assert!(app.human_sizes);
         app.open_dired(dir.clone());
-        // Row 1 is the first file line (header is row 0).
-        assert!(app.current().buffer.line(1).text().contains("2.0K"));
+        // Row 2 is the first real file line (header is row 0, `..` is row 1).
+        assert!(app.current().buffer.line(2).text().contains("2.0K"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

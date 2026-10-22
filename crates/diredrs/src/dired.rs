@@ -116,10 +116,39 @@ impl Entry {
     }
 }
 
+fn entry_for(name: String, path: PathBuf, meta: &fs::Metadata) -> Entry {
+    let file_type = meta.file_type();
+    let is_symlink = file_type.is_symlink();
+    let target = if is_symlink {
+        fs::read_link(&path).ok().map(|p| p.display().to_string())
+    } else {
+        None
+    };
+    let is_exec = exec_bit(meta, &name);
+    Entry {
+        name,
+        path,
+        perm: perm_string(meta),
+        links: nlink(meta),
+        owner: owner(meta),
+        group: group(meta),
+        size: meta.len(),
+        date: format_mtime(meta.modified().ok()),
+        is_dir: file_type.is_dir(),
+        is_symlink,
+        is_exec,
+        target,
+        mtime: meta.modified().ok(),
+        mark: Mark::None,
+    }
+}
+
 /// A directory listing.
 #[derive(Debug, Clone)]
 pub struct Dired {
     pub dir: PathBuf,
+    /// The synthetic `..` row that visits `dir`'s parent, when it has one.
+    pub parent: Option<Entry>,
     pub entries: Vec<Entry>,
     /// Current ordering.
     pub sort: SortKey,
@@ -135,6 +164,11 @@ impl Dired {
     /// Read `dir`, building a listing. `show_hidden` lists dotfiles and
     /// `human_sizes` formats sizes as K/M/G (`ls -h`).
     pub fn read(dir: &Path, show_hidden: bool, human_sizes: bool) -> io::Result<Dired> {
+        let parent = dir.parent().and_then(|path| {
+            fs::metadata(path)
+                .ok()
+                .map(|meta| entry_for("..".to_string(), path.to_path_buf(), &meta))
+        });
         let mut entries: Vec<Entry> = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -144,36 +178,12 @@ impl Dired {
             }
             let path = entry.path();
             let meta = entry.metadata()?;
-            let file_type = meta.file_type();
-            let is_symlink = file_type.is_symlink();
-            let is_dir = file_type.is_dir();
-            let is_exec = exec_bit(&meta, &name);
-            let target = if is_symlink {
-                fs::read_link(&path).ok().map(|p| p.display().to_string())
-            } else {
-                None
-            };
-            let modified = meta.modified().ok();
-            entries.push(Entry {
-                name,
-                path,
-                perm: perm_string(&meta),
-                links: nlink(&meta),
-                owner: owner(&meta),
-                group: group(&meta),
-                size: meta.len(),
-                date: format_mtime(modified),
-                is_dir,
-                is_symlink,
-                is_exec,
-                target,
-                mtime: modified,
-                mark: Mark::None,
-            });
+            entries.push(entry_for(name, path, &meta));
         }
 
         let mut dired = Dired {
             dir: dir.to_path_buf(),
+            parent,
             entries,
             sort: SortKey::default(),
             human_sizes,
@@ -189,15 +199,17 @@ impl Dired {
     /// Recompute the column widths from the entries and the current size mode.
     fn recompute_widths(&mut self) {
         self.links_width = self
-            .entries
+            .parent
             .iter()
+            .chain(self.entries.iter())
             .map(|e| e.links.to_string().len())
             .max()
             .unwrap_or(1)
             .max(2);
         self.size_width = self
-            .entries
+            .parent
             .iter()
+            .chain(self.entries.iter())
             .map(|e| format_size(e.size, self.human_sizes).chars().count())
             .max()
             .unwrap_or(1);
@@ -227,9 +239,11 @@ impl Dired {
         }
     }
 
-    /// Render the listing as styled lines (header, total, then one per entry).
+    /// Render the listing as styled lines (header, `..`, then one per entry).
     pub fn render(&self, theme: &Theme) -> Vec<Line> {
-        let mut lines = Vec::with_capacity(self.entries.len() + HEADER_LINES);
+        let mut lines = Vec::with_capacity(
+            self.entries.len() + HEADER_LINES + usize::from(self.parent.is_some()),
+        );
         // Like Emacs' default (`dired-free-space` = `first`), the free space
         // rides on the directory line and there is no separate `total` line.
         // `dired-header` greens the directory itself; the `: (N available)` is
@@ -244,6 +258,9 @@ impl Dired {
                 Style::default(),
             ),
         ]));
+        if let Some(parent) = &self.parent {
+            lines.push(self.render_entry(parent, theme));
+        }
         for i in 0..self.entries.len() {
             lines.push(self.render_line(i, theme));
         }
@@ -252,7 +269,10 @@ impl Dired {
 
     /// Render a single entry's line, including its mark and name face.
     pub fn render_line(&self, i: usize, theme: &Theme) -> Line {
-        let entry = &self.entries[i];
+        self.render_entry(&self.entries[i], theme)
+    }
+
+    fn render_entry(&self, entry: &Entry, theme: &Theme) -> Line {
         let mut chars: Vec<char> = entry
             .head(self.human_sizes, self.links_width, self.size_width)
             .chars()
@@ -278,9 +298,19 @@ impl Dired {
         Line::from_spans(spans)
     }
 
+    /// The buffer row for the synthetic `..` entry, if it is shown.
+    pub fn parent_row(&self) -> Option<usize> {
+        self.parent.as_ref().map(|_| HEADER_LINES)
+    }
+
+    /// The parent directory `..` visits, if it is shown.
+    pub fn parent_path(&self) -> Option<&Path> {
+        self.parent.as_ref().map(|e| e.path.as_path())
+    }
+
     /// The buffer row for entry `i`.
     pub fn row_of(&self, i: usize) -> usize {
-        HEADER_LINES + i
+        HEADER_LINES + usize::from(self.parent.is_some()) + i
     }
 
     fn name_style(&self, entry: &Entry, theme: &Theme) -> Style {
@@ -303,27 +333,29 @@ impl Dired {
 
     /// The entry index for a buffer `row`, if that row is a file line.
     pub fn entry_index_at(&self, row: usize) -> Option<usize> {
-        if row < HEADER_LINES {
-            return None;
-        }
-        let i = row - HEADER_LINES;
+        let first = HEADER_LINES + usize::from(self.parent.is_some());
+        let i = row.checked_sub(first)?;
         (i < self.entries.len()).then_some(i)
     }
 
-    /// The character column where a file line's name begins.
+    /// The character column where a file or `..` line's name begins.
     pub fn filename_col(&self, row: usize) -> Option<usize> {
-        let i = self.entry_index_at(row)?;
-        let e = &self.entries[i];
+        let entry = if self.parent_row() == Some(row) {
+            self.parent.as_ref()?
+        } else {
+            &self.entries[self.entry_index_at(row)?]
+        };
         Some(
-            e.head(self.human_sizes, self.links_width, self.size_width)
+            entry
+                .head(self.human_sizes, self.links_width, self.size_width)
                 .chars()
                 .count(),
         )
     }
 
-    /// The row of the first file line, if the listing is non-empty.
+    /// The row of the first real file line, if the listing is non-empty.
     pub fn first_file_row(&self) -> Option<usize> {
-        (!self.entries.is_empty()).then_some(HEADER_LINES)
+        (!self.entries.is_empty()).then_some(HEADER_LINES + usize::from(self.parent.is_some()))
     }
 }
 
@@ -510,18 +542,22 @@ mod tests {
 
         let theme = Theme::for_background(crate::theme::Background::Dark);
         let lines = d.render(&theme);
-        assert_eq!(lines.len(), HEADER_LINES + 2);
-        // Header carries the directory; the file lines follow directly (no
-        // `total` line).
+        assert_eq!(lines.len(), HEADER_LINES + 3);
+        // Header carries the directory; `..` and the file lines follow
+        // directly (no `total` line).
         assert!(lines[0].text().contains(&dir.display().to_string()));
-        assert!(lines[1].text().contains("alpha.txt"));
-        assert!(lines[2].text().contains("sub"));
+        assert!(lines[1].text().contains(".."));
+        assert!(lines[2].text().contains("alpha.txt"));
+        assert!(lines[3].text().contains("sub"));
+        assert_eq!(d.parent_path(), dir.parent());
+        assert_eq!(d.parent_row(), Some(HEADER_LINES));
         // The name begins right after the head (permissions at column 2).
         assert_eq!(
-            d.filename_col(HEADER_LINES).unwrap(),
+            d.filename_col(d.row_of(0)).unwrap(),
             d.entries[0]
                 .head(d.human_sizes, d.links_width, d.size_width)
-                .len()
+                .chars()
+                .count()
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -572,6 +608,9 @@ mod tests {
         assert_eq!(names(&d), ["c.txt", "a.txt", "b.txt"]); // largest first
         d.set_sort(SortKey::Name);
         assert_eq!(names(&d), ["a.txt", "b.txt", "c.txt"]);
+        // `..` stays above the entries in every ordering.
+        assert_eq!(d.parent_row(), Some(HEADER_LINES));
+        assert_eq!(d.row_of(0), HEADER_LINES + 1);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -589,9 +628,10 @@ mod tests {
         fs::write(dir.join("one"), b"x").unwrap();
         let d = Dired::read(&dir, true, true).unwrap();
         assert_eq!(d.entry_index_at(0), None);
-        assert_eq!(d.entry_index_at(1), Some(0));
-        assert_eq!(d.entry_index_at(2), None);
-        assert_eq!(d.first_file_row(), Some(1));
+        assert_eq!(d.entry_index_at(1), None); // the `..` row
+        assert_eq!(d.entry_index_at(2), Some(0));
+        assert_eq!(d.entry_index_at(3), None);
+        assert_eq!(d.first_file_row(), Some(2));
     }
 
     #[test]
@@ -601,8 +641,8 @@ mod tests {
         let d = Dired::read(&dir, true, true).unwrap();
         let theme = Theme::for_background(crate::theme::Background::Dark);
         let lines = d.render(&theme);
-        // Header plus one file line, no `total` line.
-        assert_eq!(lines.len(), HEADER_LINES + 1);
+        // Header plus `..` and one file line, no `total` line.
+        assert_eq!(lines.len(), HEADER_LINES + 2);
         // Availability is environment-dependent; when known it is shown.
         if d.free_space.is_some() {
             let first = lines[0].text();
