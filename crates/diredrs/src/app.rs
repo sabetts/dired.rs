@@ -2194,7 +2194,10 @@ impl App {
                     self.last_command = LastCommand::Kill;
                 }
             }
-            SetMark => self.current_mut().buffer.set_mark(),
+            SetMark => {
+                self.current_mut().buffer.set_mark();
+                self.message = Some("Mark set".to_string());
+            }
             KillRegion => self.kill_region(prev),
             CopyRegion => self.copy_region(prev),
             Yank => self.yank(),
@@ -3670,6 +3673,26 @@ mod tests {
         app.current_mut().buffer.end_of_line();
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
         assert_eq!(app.current().buffer.line(0).text(), "world hello");
+    }
+
+    #[test]
+    fn ctrl_space_sets_mark_for_copy_region() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("hello world")]);
+        app.current_mut().buffer.end_of_line();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert_eq!(app.message.as_deref(), Some("Mark set"));
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT));
+        assert_eq!(app.kill_ring.current().as_deref(), Some("world"));
+        assert_eq!(app.current().buffer.line(0).text(), "hello world");
     }
 
     #[test]

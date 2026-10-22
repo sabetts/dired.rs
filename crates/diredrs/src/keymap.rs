@@ -53,7 +53,18 @@ pub fn translate(key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Alacritty on Windows reports Ctrl+Space exactly like a plain Space (the
+    // control flag is lost in ConPTY). Recover it from the live key state.
+    #[cfg(windows)]
+    if !ctrl && !alt && key.code == KeyCode::Char(' ') && ctrl_is_down() {
+        return SetMark;
+    }
+
     match key.code {
+        // Terminals report `C-SPC` in several ways: a space with CONTROL,
+        // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
+        KeyCode::Char(' ') | KeyCode::Char('@') | KeyCode::Char('\0') if ctrl => SetMark,
+        KeyCode::Char('\0') | KeyCode::Null => SetMark,
         KeyCode::Char(c) if ctrl => match c.to_ascii_lowercase() {
             'f' => ForwardChar,
             'b' => BackwardChar,
@@ -72,7 +83,10 @@ pub fn translate(key: KeyEvent) -> Action {
             'g' => Abort,
             'q' => QuotedInsert,
             't' => TransposeChars,
-            ' ' => SetMark,
+            // The Alacritty NUL workaround for C-SPC arrives via ConPTY as
+            // Ctrl+Shift+2 on a US layout.
+            #[cfg(windows)]
+            '2' if key.modifiers.contains(KeyModifiers::SHIFT) => SetMark,
             _ => None,
         },
         KeyCode::Char(c) if alt => match c {
@@ -116,7 +130,7 @@ pub fn translate(key: KeyEvent) -> Action {
 pub fn describe(key: KeyEvent) -> Option<String> {
     use KeyCode::*;
     let base = match key.code {
-        Char(' ') | Char('\0') => "SPC".to_string(),
+        Char(' ') | Char('\0') | Null => "SPC".to_string(),
         Char(c) => c.to_string(),
         Enter => "RET".to_string(),
         Tab => "TAB".to_string(),
@@ -141,6 +155,18 @@ pub fn describe(key: KeyEvent) -> Option<String> {
     }
     out.push_str(&base);
     Some(out)
+}
+
+/// Whether a Ctrl key is currently held. Used to recover `C-SPC` from
+/// terminals (notably Alacritty on Windows) that report it as a plain space.
+#[cfg(windows)]
+fn ctrl_is_down() -> bool {
+    const VK_CONTROL: i32 = 0x11;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+    }
+    unsafe { GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000 != 0 }
 }
 
 #[cfg(test)]
@@ -201,6 +227,47 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('<'), KeyModifiers::ALT)),
             Action::BeginningOfBuffer
+        );
+    }
+
+    #[test]
+    fn ctrl_space_variants_set_mark() {
+        assert_eq!(
+            translate(key(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('@'), KeyModifiers::CONTROL)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('\0'), KeyModifiers::NONE)),
+            Action::SetMark
+        );
+        assert_eq!(
+            translate(key(KeyCode::Null, KeyModifiers::NONE)),
+            Action::SetMark
+        );
+        // Plain space and `@` still insert themselves.
+        assert_eq!(
+            translate(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Action::SelfInsert(' ')
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('@'), KeyModifiers::NONE)),
+            Action::SelfInsert('@')
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alacritty_nul_workaround_sets_mark() {
+        assert_eq!(
+            translate(key(
+                KeyCode::Char('2'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::SetMark
         );
     }
 
