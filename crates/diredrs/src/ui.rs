@@ -132,8 +132,16 @@ const DIGIT_PATTERNS: [[&str; 5]; 10] = [
     ["███", "█ █", "███", "  █", "███"],
 ];
 
+fn window_number_style(cursor: Style) -> Style {
+    Style {
+        color: cursor.bg,
+        bg: cursor.color,
+        ..cursor
+    }
+}
+
 fn draw_window_numbers(frame: &mut Frame, app: &App, panes: &[(WindowId, Rect, Rect)]) {
-    let style = rstyle(app.cursor_style);
+    let style = rstyle(window_number_style(app.cursor_style));
     for &(id, area, _) in panes {
         let Some(number) = app.window_number(id) else {
             continue;
@@ -443,6 +451,14 @@ mod tests {
         let cells = line_cells(&Line::plain("a\tb"));
         assert_eq!(cells.len(), 3);
         assert_eq!(cells[1].0, ' ');
+    }
+
+    #[test]
+    fn window_number_style_swaps_foreground_and_background() {
+        let cursor = Style::fg(Color::Black).bg(Color::Yellow);
+        let style = window_number_style(cursor);
+        assert_eq!(style.color, Color::Yellow);
+        assert_eq!(style.bg, Color::Black);
     }
 
     #[test]
