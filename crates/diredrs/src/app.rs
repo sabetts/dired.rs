@@ -1242,8 +1242,22 @@ impl App {
             return;
         }
         if self.search.active {
-            self.handle_search_key(key);
-            return;
+            // Motion commands exit isearch and then perform their normal
+            // action from the current match, like Emacs: forward searches
+            // continue from the end of the match, backward ones from its start.
+            if isearch_motion(key) {
+                let direction = self.search.direction;
+                let match_end = self.search.match_end;
+                self.search.accept();
+                if direction == SearchDirection::Forward {
+                    if let Some(end) = match_end {
+                        self.current_mut().buffer.set_point(end);
+                    }
+                }
+            } else {
+                self.handle_search_key(key);
+                return;
+            }
         }
         if self.quoted {
             self.quoted = false;
@@ -2532,8 +2546,9 @@ impl App {
         };
         let forward = direction == SearchDirection::Forward;
         match self.current().buffer.search(&query, from, forward) {
-            Some((pos, _)) => {
+            Some((pos, len)) => {
                 self.current_mut().buffer.set_point(pos);
+                self.search.match_end = Some(Pos::new(pos.row, pos.col + len));
                 self.search.failed = false;
             }
             None => self.search.failed = true,
@@ -2562,7 +2577,17 @@ impl App {
                 self.search.query.pop();
                 self.search_run(false);
             }
-            KeyCode::Enter => self.search.accept(),
+            KeyCode::Enter => {
+                let end = if self.search.direction == SearchDirection::Forward {
+                    self.search.match_end
+                } else {
+                    None
+                };
+                self.search.accept();
+                if let Some(end) = end {
+                    self.current_mut().buffer.set_point(end);
+                }
+            }
             KeyCode::Esc => self.cancel_search(),
             _ => {}
         }
@@ -2693,6 +2718,26 @@ fn select_move(selected: Option<usize>, count: usize, delta: isize) -> Option<us
         Some(s) => (s as isize + delta).clamp(0, last as isize) as usize,
     };
     Some(next)
+}
+
+/// Whether `key` is a motion command that should leave isearch and run.
+fn isearch_motion(key: KeyEvent) -> bool {
+    use Action::*;
+    matches!(
+        keymap::translate(key),
+        ForwardChar
+            | BackwardChar
+            | NextLine
+            | PrevLine
+            | BeginningOfLine
+            | EndOfLine
+            | ForwardWord
+            | BackwardWord
+            | BeginningOfBuffer
+            | EndOfBuffer
+            | PageUp
+            | PageDown
+    )
 }
 
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
@@ -3792,6 +3837,50 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert_eq!(app.message.as_deref(), Some("No mark set in this buffer"));
+    }
+
+    #[test]
+    fn motion_key_exits_isearch_and_moves() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut().buffer.set_content(vec![
+            Line::plain("alpha"),
+            Line::plain("beta"),
+            Line::plain("gamma"),
+        ]);
+        app.current_mut().buffer.beginning_of_buffer();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        for c in "beta".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.search.active);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 4));
+    }
+
+    #[test]
+    fn enter_accepts_forward_search_at_match_end() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut().buffer.set_content(vec![
+            Line::plain("alpha"),
+            Line::plain("beta"),
+            Line::plain("gamma"),
+        ]);
+        app.current_mut().buffer.beginning_of_buffer();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        for c in "beta".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 4));
     }
 
     #[test]

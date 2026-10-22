@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use crate::app::{App, Prompt};
 use crate::buffer::{Color, Line, Pos, Style};
-use crate::search::SearchDirection;
+use crate::search::{Search, SearchDirection};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let minibuffer = app.minibuffer_height().max(1);
@@ -32,6 +32,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     }
     let buf = &app.current().buffer;
     let point = buf.point();
+    let cursor_point = display_point(&app.search, point);
 
     let highlights = if app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
@@ -52,8 +53,8 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(&mut cells, row, &highlights);
         apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
-        if row == point.row && matches!(app.prompt, Prompt::None) {
-            place_cursor(&mut cells, point.col);
+        if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
+            place_cursor(&mut cells, cursor_point.col);
         }
 
         let total = cells.len();
@@ -72,6 +73,16 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+/// Where to draw the point. During a forward isearch Emacs leaves point at the
+/// end of the match; backward searches leave it at the beginning.
+fn display_point(search: &Search, point: Pos) -> Pos {
+    if search.active && search.direction == SearchDirection::Forward {
+        search.match_end.unwrap_or(point)
+    } else {
+        point
+    }
 }
 
 fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -242,5 +253,18 @@ mod tests {
         let cells = line_cells(&Line::plain("a\tb"));
         assert_eq!(cells.len(), 3);
         assert_eq!(cells[1].0, ' ');
+    }
+
+    #[test]
+    fn isearch_cursor_sits_at_the_match_edge() {
+        let mut search = Search {
+            active: true,
+            direction: SearchDirection::Forward,
+            match_end: Some(Pos::new(0, 4)),
+            ..Search::default()
+        };
+        assert_eq!(display_point(&search, Pos::new(0, 0)), Pos::new(0, 4));
+        search.direction = SearchDirection::Backward;
+        assert_eq!(display_point(&search, Pos::new(0, 0)), Pos::new(0, 0));
     }
 }
