@@ -171,6 +171,7 @@ pub enum PendingAction {
         index: usize,
         deleted: usize,
         errors: Vec<String>,
+        all: bool,
     },
 }
 
@@ -1535,6 +1536,7 @@ impl App {
     fn run_pending(&mut self, action: PendingAction) {
         let mut deleted = 0;
         let mut errors = Vec::new();
+        let mut all = false;
         let (paths, index) = match action {
             PendingAction::Flagged => (self.dired_paths(Mark::Flagged), 0),
             PendingAction::Marked => (self.dired_paths(Mark::Marked), 0),
@@ -1544,14 +1546,16 @@ impl App {
                 index,
                 deleted: already_deleted,
                 errors: previous_errors,
+                all: delete_all,
             } => {
                 deleted = already_deleted;
                 errors = previous_errors;
+                all = delete_all;
                 delete_one(&paths[index], &mut deleted, &mut errors);
                 (paths, index + 1)
             }
         };
-        self.continue_delete(paths, index, deleted, errors);
+        self.continue_delete(paths, index, deleted, errors, all);
     }
 
     /// Delete paths one at a time, asking before entering a non-empty
@@ -1562,13 +1566,14 @@ impl App {
         mut index: usize,
         mut deleted: usize,
         mut errors: Vec<String>,
+        all: bool,
     ) {
         while index < paths.len() {
             let path = &paths[index];
-            if directory_has_entries(path) {
+            if !all && directory_has_entries(path) {
                 let name = self.dired_relative(path);
                 self.prompt = Prompt::Confirm {
-                    message: format!("Recursively delete {name}? "),
+                    message: format!("Recursively delete {name}? (yes, no, all, quit) "),
                     input: String::new(),
                     cursor: 0,
                     action: PendingAction::Delete {
@@ -1576,6 +1581,7 @@ impl App {
                         index,
                         deleted,
                         errors,
+                        all,
                     },
                 };
                 return;
@@ -2987,31 +2993,64 @@ impl App {
                 input,
                 action,
                 ..
-            } => {
-                if answer_is_yes(&input) {
-                    self.run_pending(action);
-                } else if answer_is_no(&input) {
-                    if let PendingAction::Delete {
-                        paths,
-                        index,
-                        deleted,
-                        errors,
-                    } = action
-                    {
-                        self.continue_delete(paths, index + 1, deleted, errors);
-                    } else {
-                        self.message = Some("Canceled".to_string());
+            } => match action {
+                PendingAction::Delete {
+                    paths,
+                    index,
+                    deleted,
+                    errors,
+                    all,
+                } => match recursive_answer(&input) {
+                    RecursiveAnswer::Yes => {
+                        self.run_pending(PendingAction::Delete {
+                            paths,
+                            index,
+                            deleted,
+                            errors,
+                            all,
+                        });
                     }
-                } else {
-                    // Re-ask, like `yes-or-no-p`.
-                    self.prompt = Prompt::Confirm {
-                        message,
-                        input: String::new(),
-                        cursor: 0,
-                        action,
-                    };
+                    RecursiveAnswer::No => {
+                        self.continue_delete(paths, index + 1, deleted, errors, all);
+                    }
+                    RecursiveAnswer::All => {
+                        self.continue_delete(paths, index, deleted, errors, true);
+                    }
+                    RecursiveAnswer::Quit => {
+                        self.dired_revert();
+                        self.message = Some("OK, canceled".to_string());
+                    }
+                    RecursiveAnswer::Invalid => {
+                        self.prompt = Prompt::Confirm {
+                            message,
+                            input: String::new(),
+                            cursor: 0,
+                            action: PendingAction::Delete {
+                                paths,
+                                index,
+                                deleted,
+                                errors,
+                                all,
+                            },
+                        };
+                    }
+                },
+                action => {
+                    if answer_is_yes(&input) {
+                        self.run_pending(action);
+                    } else if answer_is_no(&input) {
+                        self.message = Some("Canceled".to_string());
+                    } else {
+                        // Re-ask, like `yes-or-no-p`.
+                        self.prompt = Prompt::Confirm {
+                            message,
+                            input: String::new(),
+                            cursor: 0,
+                            action,
+                        };
+                    }
                 }
-            }
+            },
         }
     }
 
@@ -3848,6 +3887,27 @@ fn answer_is_yes(answer: &str) -> bool {
 /// Whether a `yes-or-no-p` answer means "no".
 fn answer_is_no(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "no" | "n")
+}
+
+/// An answer to the recursive-delete `read-answer` question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecursiveAnswer {
+    Yes,
+    No,
+    All,
+    Quit,
+    Invalid,
+}
+
+/// Parse `dired-delete-file`'s answers: yes, no, all (or `!`), and quit.
+fn recursive_answer(answer: &str) -> RecursiveAnswer {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" => RecursiveAnswer::Yes,
+        "no" | "n" => RecursiveAnswer::No,
+        "all" | "!" => RecursiveAnswer::All,
+        "quit" | "q" => RecursiveAnswer::Quit,
+        _ => RecursiveAnswer::Invalid,
+    }
 }
 
 /// A directory name as minibuffer input, with a trailing separator.
@@ -4799,7 +4859,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
             &app.prompt,
-            Prompt::Confirm { message, .. } if message == "Recursively delete sub? "
+            Prompt::Confirm { message, .. } if message == "Recursively delete sub? (yes, no, all, quit) "
         ));
         assert!(sub.join("nested.txt").exists());
 
@@ -4815,6 +4875,63 @@ mod tests {
         type_into_prompt(&mut app, "yes");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!sub.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn all_skips_the_remaining_recursive_questions() {
+        let dir = temp_dir("delete-recursive-all");
+        for name in ["aaa", "bbb"] {
+            let sub = dir.join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("nested.txt"), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        press(&mut app, 'x');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete aaa? (yes, no, all, quit) "
+        ));
+
+        type_into_prompt(&mut app, "all");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!dir.join("aaa").exists());
+        assert!(!dir.join("bbb").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quit_stops_the_remaining_recursive_deletions() {
+        let dir = temp_dir("delete-recursive-quit");
+        for name in ["aaa", "bbb"] {
+            let sub = dir.join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("nested.txt"), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        press(&mut app, 'x');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into_prompt(&mut app, "quit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(dir.join("aaa").exists());
+        assert!(dir.join("bbb").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("OK, canceled"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
