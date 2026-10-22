@@ -68,6 +68,10 @@ pub struct Theme {
     /// Background of the hex viewer's highlighted byte (ASCII and hex halves),
     /// matching Emacs's `highlight` face.
     pub hex_highlight: Color,
+    /// `lazy-highlight`: other matches during isearch.
+    pub lazy_highlight: Style,
+    /// `isearch`: the current match.
+    pub isearch: Style,
     /// Faces for syntax highlighting.
     pub syntax: SyntaxFaces,
 }
@@ -85,6 +89,10 @@ impl Theme {
                 flagged: Style::rgb(0xff, 0xc0, 0xcb).bold(), // Pink (error)
                 header: Style::rgb(0x98, 0xfb, 0x98),     // PaleGreen (font-lock-type-face)
                 hex_highlight: Color::Rgb(0x55, 0x6b, 0x2f), // DarkOliveGreen
+                // isearch.el: (:background "paleturquoise4" :distant-foreground "white")
+                lazy_highlight: Style::fg(Color::White).bg(Color::Rgb(0x66, 0x8b, 0x8b)),
+                // isearch.el: (:background "palevioletred2" :foreground "brown4")
+                isearch: Style::fg(Color::Rgb(0x8b, 0x23, 0x23)).bg(Color::Rgb(0xee, 0x79, 0x9f)),
                 syntax: dark_syntax(),
             },
             Background::Light => Theme {
@@ -97,6 +105,10 @@ impl Theme {
                 flagged: Style::rgb(0xff, 0x00, 0x00).bold(), // Red1 (error)
                 header: Style::rgb(0x22, 0x8b, 0x22),     // ForestGreen (font-lock-type-face)
                 hex_highlight: Color::Rgb(0xb4, 0xee, 0xb4), // DarkSeaGreen2
+                // isearch.el: (:background "paleturquoise" :distant-foreground "black")
+                lazy_highlight: Style::fg(Color::Black).bg(Color::Rgb(0xaf, 0xee, 0xee)),
+                // isearch.el: (:background "magenta3" :foreground "lightskyblue1")
+                isearch: Style::fg(Color::Rgb(0xb0, 0xe2, 0xff)).bg(Color::Rgb(0xcd, 0x00, 0xcd)),
                 syntax: light_syntax(),
             },
         }
@@ -160,6 +172,12 @@ mod tests {
         // DarkSeaGreen2).
         assert_eq!(dark.hex_highlight, Color::Rgb(0x55, 0x6b, 0x2f));
         assert_eq!(light.hex_highlight, Color::Rgb(0xb4, 0xee, 0xb4));
+        // isearch faces: `lazy-highlight` and `isearch`.
+        assert_eq!(dark.lazy_highlight.bg, Color::Rgb(0x66, 0x8b, 0x8b));
+        assert_eq!(dark.isearch.bg, Color::Rgb(0xee, 0x79, 0x9f));
+        assert_eq!(dark.isearch.color, Color::Rgb(0x8b, 0x23, 0x23));
+        assert_eq!(light.lazy_highlight.bg, Color::Rgb(0xaf, 0xee, 0xee));
+        assert_eq!(light.isearch.bg, Color::Rgb(0xcd, 0x00, 0xcd));
         // Syntax faces: font-lock-* defaults (chocolate1 / Firebrick comments).
         assert_eq!(dark.syntax.comment, Style::rgb(0xff, 0x7f, 0x24));
         assert_eq!(light.syntax.comment, Style::rgb(0xb2, 0x22, 0x22));

@@ -125,11 +125,6 @@ impl Style {
         self
     }
 
-    pub const fn reverse(mut self) -> Self {
-        self.reverse = true;
-        self
-    }
-
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Style {
             color: Color::Rgb(r, g, b),

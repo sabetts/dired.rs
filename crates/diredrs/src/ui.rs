@@ -39,6 +39,13 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
+    let current_match = if app.search.active {
+        app.search.match_end.and_then(|end| {
+            (end.row == point.row && end.col > point.col).then(|| (point, end.col - point.col))
+        })
+    } else {
+        None
+    };
     // Hex view: the byte under point, highlighted in its hex and ASCII forms
     // with a background colour (Emacs's `highlight` face), not reverse video.
     let hex_highlights = app.hexl_highlights();
@@ -51,7 +58,14 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
     let mut sub = buf.scroll_sub();
     while row <= last_line && lines.len() < height {
         let mut cells = line_cells(buf.line(row));
-        apply_highlights(&mut cells, row, &highlights);
+        apply_highlights(
+            &mut cells,
+            row,
+            &highlights,
+            current_match,
+            app.theme.lazy_highlight,
+            app.theme.isearch,
+        );
         apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
         if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, cursor_point.col, app.cursor_style);
@@ -142,13 +156,28 @@ fn line_cells(line: &Line) -> Vec<(char, Style)> {
     cells
 }
 
-fn apply_highlights(cells: &mut [(char, Style)], row: usize, highlights: &[(Pos, usize)]) {
+fn apply_highlights(
+    cells: &mut [(char, Style)],
+    row: usize,
+    highlights: &[(Pos, usize)],
+    current: Option<(Pos, usize)>,
+    lazy: Style,
+    isearch: Style,
+) {
     for (pos, len) in highlights {
         if pos.row != row {
             continue;
         }
+        let is_current = current
+            .is_some_and(|(cpos, clen)| cpos.row == pos.row && cpos.col == pos.col && clen == *len);
         for i in pos.col..(pos.col + len).min(cells.len()) {
-            cells[i].1 = cells[i].1.reverse();
+            cells[i].1.reverse = false;
+            if is_current {
+                cells[i].1.color = isearch.color;
+                cells[i].1.bg = isearch.bg;
+            } else {
+                cells[i].1.bg = lazy.bg;
+            }
         }
     }
 }
@@ -261,6 +290,26 @@ mod tests {
         let cursor = Style::fg(Color::Black).bg(Color::Yellow);
         place_cursor(&mut cells, 0, cursor);
         assert_eq!(cells[0].1, cursor);
+    }
+
+    #[test]
+    fn isearch_uses_lazy_highlight_for_other_matches() {
+        let mut cells = vec![('a', Style::default()); 8];
+        let lazy = Style::fg(Color::White).bg(Color::Rgb(0x66, 0x8b, 0x8b));
+        let isearch = Style::fg(Color::Rgb(0x8b, 0x23, 0x23)).bg(Color::Rgb(0xee, 0x79, 0x9f));
+        let highlights = vec![(Pos::new(0, 0), 2), (Pos::new(0, 4), 2)];
+        apply_highlights(
+            &mut cells,
+            0,
+            &highlights,
+            Some((Pos::new(0, 0), 2)),
+            lazy,
+            isearch,
+        );
+        assert_eq!(cells[0].1.bg, isearch.bg);
+        assert_eq!(cells[0].1.color, isearch.color);
+        assert_eq!(cells[4].1.bg, lazy.bg);
+        assert_eq!(cells[4].1.color, Style::default().color);
     }
 
     #[test]
