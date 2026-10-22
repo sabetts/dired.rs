@@ -4126,6 +4126,13 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol().to_string())
                 .collect::<String>()
         };
+        let border = (0..40u16)
+            .find(|x| buffer[(*x, 0)].symbol() == "│")
+            .expect("missing vertical border");
+        for y in 0..11u16 {
+            assert_eq!(buffer[(border, y)].symbol(), "│", "divider gap at row {y}");
+        }
+
         let mode_line = row(10);
         assert!(mode_line.contains("*scratch*"), "{mode_line}");
         let reversed = (0..40u16)
@@ -4135,7 +4142,7 @@ mod tests {
                     .contains(ratatui::style::Modifier::REVERSED)
             })
             .count();
-        assert_eq!(reversed, 40, "{mode_line}");
+        assert_eq!(reversed, 39, "{mode_line}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

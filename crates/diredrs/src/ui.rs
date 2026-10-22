@@ -16,7 +16,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(0), Constraint::Length(minibuffer)]).split(frame.area());
 
     let mut panes = Vec::new();
-    collect_panes(app.window_tree(), rows[0], &mut panes);
+    let mut dividers = Vec::new();
+    collect_panes(app.window_tree(), rows[0], &mut panes, &mut dividers);
     let active_id = app.active_window_id();
     let active_area = panes
         .iter()
@@ -51,10 +52,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             active,
         );
     }
+    for divider in dividers {
+        draw_vertical_border(frame, divider);
+    }
     draw_minibuffer(frame, app, rows[1]);
 }
 
-fn collect_panes(tree: &WindowTree, area: Rect, out: &mut Vec<(WindowId, Rect, Rect)>) {
+fn collect_panes(
+    tree: &WindowTree,
+    area: Rect,
+    out: &mut Vec<(WindowId, Rect, Rect)>,
+    dividers: &mut Vec<Rect>,
+) {
     match tree {
         WindowTree::Leaf(id) => {
             let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
@@ -70,15 +79,34 @@ fn collect_panes(tree: &WindowTree, area: Rect, out: &mut Vec<(WindowId, Rect, R
                     Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(area)
                 }
-                SplitAxis::Right => {
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(area)
-                }
+                SplitAxis::Right => Layout::horizontal([
+                    Constraint::Fill(1),
+                    Constraint::Length(1),
+                    Constraint::Fill(1),
+                ])
+                .split(area),
             };
-            collect_panes(first, chunks[0], out);
-            collect_panes(second, chunks[1], out);
+            match axis {
+                SplitAxis::Below => {
+                    collect_panes(first, chunks[0], out, dividers);
+                    collect_panes(second, chunks[1], out, dividers);
+                }
+                SplitAxis::Right => {
+                    collect_panes(first, chunks[0], out, dividers);
+                    dividers.push(chunks[1]);
+                    collect_panes(second, chunks[2], out, dividers);
+                }
+            }
         }
     }
+}
+
+fn draw_vertical_border(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = vec![RLine::from("│"); area.height as usize];
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_buffer(
