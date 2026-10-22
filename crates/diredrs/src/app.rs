@@ -861,8 +861,8 @@ impl App {
     }
 
     fn start_transfer(&mut self, copy: bool) {
-        // Dired offers the current directory (plus the file's own name for a
-        // single file); with several files marked it prompts for a directory.
+        // A copy always asks for a target directory. Rename offers the file's
+        // own name for a single file, and a directory when several are marked.
         let marked = self.dired_paths(Mark::Marked);
         let dir = self.default_directory();
         let single = self.dired_entry_at_point().and_then(|i| {
@@ -872,13 +872,7 @@ impl App {
                 .map(|d| d.entries[i].path.clone())
         });
         let input = if copy {
-            if marked.is_empty() {
-                single
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| directory_input(&dir))
-            } else {
-                directory_input(&dir)
-            }
+            directory_input(&dir)
         } else if marked.is_empty() {
             single
                 .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -986,18 +980,8 @@ impl App {
             return;
         }
         let dest = self.expand_path(target);
-        // A target written as a directory must already exist.
-        if target.ends_with(['/', '\\']) && !dest.is_dir() {
-            self.message = Some(format!(
-                "Target directory does not exist: {}",
-                dest.display()
-            ));
-            return;
-        }
-        // A single file is copied to `dest`; several files (or an existing
-        // directory) are copied into `dest` as a directory.
-        let into_dir = sources.len() > 1 || dest.is_dir();
-        if sources.len() > 1 && !dest.is_dir() {
+        // `C` always copies into a target directory, keeping each file name.
+        if !dest.is_dir() {
             self.message = Some(format!("Not a directory: {}", dest.display()));
             return;
         }
@@ -1005,16 +989,12 @@ impl App {
         let mut copied: Vec<PathBuf> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for src in &sources {
-            let to = if into_dir {
-                match src.file_name() {
-                    Some(name) => dest.join(name),
-                    None => {
-                        errors.push(format!("{} has no file name", src.display()));
-                        continue;
-                    }
+            let to = match src.file_name() {
+                Some(name) => dest.join(name),
+                None => {
+                    errors.push(format!("{} has no file name", src.display()));
+                    continue;
                 }
-            } else {
-                dest.clone()
             };
             if to.exists() {
                 errors.push(format!("{} already exists", to.display()));
@@ -1949,9 +1929,8 @@ impl App {
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired),
-            Prompt::Rename { input, .. } | Prompt::CreateDirectory { input, .. } => {
-                self.file_candidates(input, false)
-            }
+            Prompt::Rename { input, copy, .. } => self.file_candidates(input, *copy),
+            Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false),
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => return,
         };
         if candidates.is_empty() {
@@ -2027,9 +2006,8 @@ impl App {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired).len(),
-            Prompt::Rename { input, .. } | Prompt::CreateDirectory { input, .. } => {
-                self.file_candidates(input, false).len()
-            }
+            Prompt::Rename { input, copy, .. } => self.file_candidates(input, *copy).len(),
+            Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false).len(),
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
         };
         use Action::*;
@@ -2244,7 +2222,7 @@ impl App {
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
-                    self.file_candidates(input, false),
+                    self.file_candidates(input, *copy),
                     selected.unwrap_or(usize::MAX),
                 ))
             }
@@ -3857,6 +3835,8 @@ mod tests {
     #[test]
     fn c_copies_the_file_at_point() {
         let dir = temp_dir("copy-file");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
         std::fs::write(dir.join("aaa.txt"), b"x").unwrap();
         std::fs::write(dir.join("old.txt"), b"hello").unwrap();
         let mut app = App::new(Config::default());
@@ -3872,8 +3852,9 @@ mod tests {
         } = &mut app.prompt
         {
             assert!(*copy);
-            assert_eq!(*input, dir.join("old.txt").display().to_string());
-            *input = "copy.txt".to_string();
+            // Copy prompts for a directory, never a file name.
+            assert_eq!(*input, directory_input(&dir));
+            *input = target.display().to_string();
             *cursor = input.chars().count();
         } else {
             panic!("expected the copy prompt");
@@ -3882,14 +3863,7 @@ mod tests {
 
         // The original remains and the copy has the same contents.
         assert_eq!(std::fs::read(dir.join("old.txt")).unwrap(), b"hello");
-        assert_eq!(std::fs::read(dir.join("copy.txt")).unwrap(), b"hello");
-        let d = app.current().dired.as_ref().unwrap();
-        assert!(d.entries.iter().any(|e| e.name == "copy.txt"));
-        let i = app.dired_entry_at_point().unwrap();
-        assert_eq!(
-            app.current().dired.as_ref().unwrap().entries[i].name,
-            "copy.txt"
-        );
+        assert_eq!(std::fs::read(target.join("old.txt")).unwrap(), b"hello");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3926,11 +3900,38 @@ mod tests {
     }
 
     #[test]
-    fn c_copies_a_single_file_into_a_chosen_directory() {
-        let dir = temp_dir("copy-single-dir");
+    fn c_requires_a_target_directory() {
+        let dir = temp_dir("copy-not-dir");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'C');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            *input = "missing".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!dir.join("missing").exists());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Not a directory"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_refuses_to_overwrite_an_existing_file() {
+        let dir = temp_dir("copy-exists");
         let target = dir.join("target");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(target.join("a.txt"), b"keep").unwrap();
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
 
@@ -3943,30 +3944,7 @@ mod tests {
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
-        assert!(dir.join("a.txt").exists());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn c_refuses_to_overwrite_an_existing_file() {
-        let dir = temp_dir("copy-exists");
-        std::fs::write(dir.join("a.txt"), b"a").unwrap();
-        std::fs::write(dir.join("b.txt"), b"b").unwrap();
-        let mut app = App::new(Config::default());
-        app.open_dired(dir.clone());
-
-        press(&mut app, 'C');
-        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
-            *input = "b.txt".to_string();
-            *cursor = input.chars().count();
-        } else {
-            panic!("expected the copy prompt");
-        }
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"b");
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"keep");
         assert!(app
             .message
             .as_deref()
@@ -3980,14 +3958,16 @@ mod tests {
     fn c_copies_a_directory_recursively() {
         let dir = temp_dir("copy-dir");
         let src = dir.join("src");
+        let target = dir.join("target");
         std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&target).unwrap();
         std::fs::write(src.join("inner.txt"), b"inner").unwrap();
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
 
         press(&mut app, 'C');
         if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
-            *input = "src-copy".to_string();
+            *input = target.display().to_string();
             *cursor = input.chars().count();
         } else {
             panic!("expected the copy prompt");
@@ -3995,7 +3975,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(
-            std::fs::read(dir.join("src-copy").join("inner.txt")).unwrap(),
+            std::fs::read(target.join("src").join("inner.txt")).unwrap(),
             b"inner"
         );
 
