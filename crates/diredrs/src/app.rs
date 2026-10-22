@@ -108,10 +108,11 @@ pub enum Prompt {
 }
 
 /// A deferred action awaiting confirmation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum PendingAction {
-    DeleteFlagged,
-    DeleteMarked,
+    Flagged,
+    Marked,
+    Current(PathBuf),
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, `C-h`, or Dired's `*`).
@@ -1110,6 +1111,23 @@ impl App {
     fn dired_start_delete(&mut self, mark: Mark) {
         let count = self.dired_paths(mark).len();
         if count == 0 {
+            // Like `dired-do-delete` with no marks: offer the file at point.
+            if mark == Mark::Marked {
+                if let Some((name, path)) = self.dired_entry_at_point().and_then(|i| {
+                    self.current()
+                        .dired
+                        .as_ref()
+                        .map(|d| (d.entries[i].name.clone(), d.entries[i].path.clone()))
+                }) {
+                    self.prompt = Prompt::Confirm {
+                        message: format!("Delete {name} (yes or no) "),
+                        input: String::new(),
+                        cursor: 0,
+                        action: PendingAction::Current(path),
+                    };
+                    return;
+                }
+            }
             self.message = Some(
                 match mark {
                     Mark::Flagged => "No files flagged for deletion",
@@ -1120,8 +1138,8 @@ impl App {
             return;
         }
         let (action, what) = match mark {
-            Mark::Flagged => (PendingAction::DeleteFlagged, "flagged"),
-            _ => (PendingAction::DeleteMarked, "marked"),
+            Mark::Flagged => (PendingAction::Flagged, "flagged"),
+            _ => (PendingAction::Marked, "marked"),
         };
         self.prompt = Prompt::Confirm {
             message: format!("Delete {count} {what} file(s)? (yes or no) "),
@@ -1133,11 +1151,11 @@ impl App {
 
     /// Run a confirmed action.
     fn run_pending(&mut self, action: PendingAction) {
-        let mark = match action {
-            PendingAction::DeleteFlagged => Mark::Flagged,
-            PendingAction::DeleteMarked => Mark::Marked,
+        let paths = match action {
+            PendingAction::Flagged => self.dired_paths(Mark::Flagged),
+            PendingAction::Marked => self.dired_paths(Mark::Marked),
+            PendingAction::Current(path) => vec![path],
         };
-        let paths = self.dired_paths(mark);
         let summary = delete_paths(paths);
         self.dired_revert();
         self.message = Some(summary);
@@ -3723,6 +3741,29 @@ mod tests {
         assert_eq!(d.entries[0].name, "a.txt");
         // The mark on a.txt survives the revert.
         assert_eq!(d.entries[0].mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn d_without_marks_deletes_the_file_at_point() {
+        let dir = temp_dir("delete-current");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // No marks: `D` asks about the current file by name.
+        press(&mut app, 'D');
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. } if message == "Delete a.txt (yes or no) "
+        ));
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
