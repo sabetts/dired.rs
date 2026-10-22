@@ -204,6 +204,12 @@ pub struct App {
     quoted: bool,
     last_command: LastCommand,
     last_yank: Option<(Pos, Pos)>,
+    /// Mark within the active minibuffer input, as a char index.
+    prompt_mark: Option<usize>,
+    /// Range of the last prompt yank, for `M-y` (`yank-pop`).
+    prompt_last_yank: Option<(usize, usize)>,
+    /// True after `C-x` in a prompt, waiting for `C-x` (`C-x C-x`).
+    prompt_cx: bool,
     dabbrev: Option<Dabbrev>,
     /// Whether kills/copies are written to the system clipboard (OSC 52).
     clipboard: bool,
@@ -249,6 +255,9 @@ impl App {
             quoted: false,
             last_command: LastCommand::Other,
             last_yank: None,
+            prompt_mark: None,
+            prompt_last_yank: None,
+            prompt_cx: false,
             dabbrev: None,
             clipboard: true,
             pasting_until: None,
@@ -1771,6 +1780,120 @@ impl App {
         Some(f(input, cursor))
     }
 
+    fn prompt_cursor_pos(&self) -> Option<usize> {
+        match &self.prompt {
+            Prompt::SwitchBuffer { cursor, .. }
+            | Prompt::KillBuffer { cursor, .. }
+            | Prompt::FindFile { cursor, .. }
+            | Prompt::Rename { cursor, .. }
+            | Prompt::MarkExtension { cursor, .. }
+            | Prompt::CreateDirectory { cursor, .. }
+            | Prompt::Confirm { cursor, .. } => Some(*cursor),
+            Prompt::None => None,
+        }
+    }
+
+    fn prompt_region(&self) -> Option<(usize, usize)> {
+        let mark = self.prompt_mark?;
+        let cursor = self.prompt_cursor_pos()?;
+        Some(if mark <= cursor {
+            (mark, cursor)
+        } else {
+            (cursor, mark)
+        })
+    }
+
+    fn prompt_set_mark(&mut self) {
+        if let Some(cursor) = self.prompt_cursor_pos() {
+            self.prompt_mark = Some(cursor);
+            self.message = Some("Mark set".to_string());
+        }
+    }
+
+    fn prompt_adjust_mark_insert(&mut self, at: usize, len: usize) {
+        if let Some(mark) = &mut self.prompt_mark {
+            if *mark >= at {
+                *mark += len;
+            }
+        }
+    }
+
+    fn prompt_adjust_mark_delete(&mut self, start: usize, end: usize) {
+        if let Some(mark) = self.prompt_mark {
+            self.prompt_mark = Some(if mark <= start {
+                mark
+            } else if mark <= end {
+                start
+            } else {
+                mark - (end - start)
+            });
+        }
+    }
+
+    fn prompt_adjust_mark_replace(&mut self, start: usize, end: usize, new_len: usize) {
+        if let Some(mark) = self.prompt_mark {
+            self.prompt_mark = Some(if mark <= start {
+                mark
+            } else if mark >= end {
+                mark - (end - start) + new_len
+            } else {
+                start + new_len.min(mark - start)
+            });
+        }
+    }
+
+    fn prompt_exchange_point_and_mark(&mut self) {
+        let Some(mark) = self.prompt_mark else {
+            return;
+        };
+        let Some(cursor) = self.prompt_cursor_pos() else {
+            return;
+        };
+        self.prompt_mark = Some(cursor);
+        self.prompt_edit(|_, cursor| *cursor = mark);
+    }
+
+    fn prompt_kill_region(&mut self, prev: LastCommand) {
+        let Some((start, end)) = self.prompt_region() else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        let killed = self.prompt_edit(|input, cursor| {
+            let from = char_to_byte(input, start);
+            let to = char_to_byte(input, end);
+            let text = input[from..to].to_string();
+            input.replace_range(from..to, "");
+            *cursor = start;
+            text
+        });
+        if let Some(killed) = killed {
+            self.prompt_mark = None;
+            self.kill_new(&killed, prev == LastCommand::Kill);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
+    fn prompt_copy_region(&mut self, prev: LastCommand) {
+        let Some((start, end)) = self.prompt_region() else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        let text = self.prompt_edit(|input, _| {
+            let from = char_to_byte(input, start);
+            let to = char_to_byte(input, end);
+            input[from..to].to_string()
+        });
+        if let Some(text) = text {
+            self.kill_new(&text, prev == LastCommand::Kill);
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
     fn prompt_reset_selection(&mut self) {
         match &mut self.prompt {
             Prompt::SwitchBuffer { selected, .. } | Prompt::KillBuffer { selected, .. } => {
@@ -1792,46 +1915,55 @@ impl App {
         if text.is_empty() {
             return;
         }
-        if self
-            .prompt_edit(|input, cursor| {
-                let idx = (*cursor).min(input.chars().count());
-                input.insert_str(char_to_byte(input, idx), text);
-                *cursor = idx + text.chars().count();
-            })
-            .is_some()
-        {
+        let inserted = self.prompt_edit(|input, cursor| {
+            let idx = (*cursor).min(input.chars().count());
+            input.insert_str(char_to_byte(input, idx), text);
+            let len = text.chars().count();
+            *cursor = idx + len;
+            (idx, len)
+        });
+        if let Some((idx, len)) = inserted {
+            self.prompt_adjust_mark_insert(idx, len);
             self.prompt_reset_selection();
             self.last_command = LastCommand::Other;
         }
     }
 
     fn prompt_delete_backward(&mut self) {
-        if self
-            .prompt_edit(|input, cursor| {
-                if *cursor > 0 {
-                    let start = char_to_byte(input, *cursor - 1);
-                    let end = char_to_byte(input, *cursor);
-                    input.replace_range(start..end, "");
-                    *cursor -= 1;
-                }
-            })
-            .is_some()
-        {
+        let removed = self.prompt_edit(|input, cursor| {
+            if *cursor > 0 {
+                let start_char = *cursor - 1;
+                let end_char = *cursor;
+                let start = char_to_byte(input, start_char);
+                let end = char_to_byte(input, end_char);
+                input.replace_range(start..end, "");
+                *cursor = start_char;
+                Some((start_char, end_char))
+            } else {
+                None
+            }
+        });
+        if let Some(Some((start, end))) = removed {
+            self.prompt_adjust_mark_delete(start, end);
             self.prompt_reset_selection();
         }
     }
 
     fn prompt_delete_forward(&mut self) {
-        if self
-            .prompt_edit(|input, cursor| {
-                if *cursor < input.chars().count() {
-                    let start = char_to_byte(input, *cursor);
-                    let end = char_to_byte(input, *cursor + 1);
-                    input.replace_range(start..end, "");
-                }
-            })
-            .is_some()
-        {
+        let removed = self.prompt_edit(|input, cursor| {
+            if *cursor < input.chars().count() {
+                let start_char = *cursor;
+                let end_char = *cursor + 1;
+                let start = char_to_byte(input, start_char);
+                let end = char_to_byte(input, end_char);
+                input.replace_range(start..end, "");
+                Some((start_char, end_char))
+            } else {
+                None
+            }
+        });
+        if let Some(Some((start, end))) = removed {
+            self.prompt_adjust_mark_delete(start, end);
             self.prompt_reset_selection();
         }
     }
@@ -1868,6 +2000,95 @@ impl App {
         }
     }
 
+    fn prompt_forward_word(&mut self) {
+        self.prompt_edit(|input, cursor| *cursor = word_forward(input, *cursor));
+    }
+
+    fn prompt_backward_word(&mut self) {
+        self.prompt_edit(|input, cursor| *cursor = word_backward(input, *cursor));
+    }
+
+    fn prompt_backward_kill_word(&mut self, prev: LastCommand) {
+        let killed = self.prompt_edit(|input, cursor| {
+            let end = (*cursor).min(input.chars().count());
+            let start = word_backward(input, end);
+            if start == end {
+                return None;
+            }
+            let from = char_to_byte(input, start);
+            let to = char_to_byte(input, end);
+            let text = input[from..to].to_string();
+            input.replace_range(from..to, "");
+            *cursor = start;
+            Some((start, end, text))
+        });
+        if let Some(Some((start, end, text))) = killed {
+            self.prompt_adjust_mark_delete(start, end);
+            self.kill_new(&text, prev == LastCommand::Kill);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
+    fn prompt_kill_word(&mut self, prev: LastCommand) {
+        let killed = self.prompt_edit(|input, cursor| {
+            let start = (*cursor).min(input.chars().count());
+            let end = word_forward(input, start);
+            if start == end {
+                return None;
+            }
+            let from = char_to_byte(input, start);
+            let to = char_to_byte(input, end);
+            let text = input[from..to].to_string();
+            input.replace_range(from..to, "");
+            Some((start, end, text))
+        });
+        if let Some(Some((start, end, text))) = killed {
+            self.prompt_adjust_mark_delete(start, end);
+            self.kill_new(&text, prev == LastCommand::Kill);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Kill;
+        }
+    }
+
+    fn prompt_case_word(&mut self, up: bool) {
+        let changed = self.prompt_edit(|input, cursor| {
+            let chars: Vec<char> = input.chars().collect();
+            let mut start = (*cursor).min(chars.len());
+            while start < chars.len() && !is_word_char(chars[start]) {
+                start += 1;
+            }
+            if start == chars.len() {
+                *cursor = start;
+                return None;
+            }
+            let mut end = start;
+            while end < chars.len() && is_word_char(chars[end]) {
+                end += 1;
+            }
+            let transform = |c: char| {
+                if up {
+                    c.to_uppercase().collect::<String>()
+                } else {
+                    c.to_lowercase().collect::<String>()
+                }
+            };
+            let changed: String = chars[start..end].iter().map(|c| transform(*c)).collect();
+            let new_len = changed.chars().count();
+            let mut out: Vec<char> = chars[..start].to_vec();
+            out.extend(changed.chars());
+            out.extend_from_slice(&chars[end..]);
+            *input = out.into_iter().collect();
+            *cursor = start + new_len;
+            Some((start, end, new_len))
+        });
+        if let Some(Some((start, end, new_len))) = changed {
+            self.prompt_adjust_mark_replace(start, end, new_len);
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
     fn prompt_move_cursor(&mut self, delta: isize) {
         self.prompt_edit(|input, cursor| {
             let len = input.chars().count();
@@ -1883,40 +2104,75 @@ impl App {
         self.prompt_edit(|input, cursor| *cursor = input.chars().count());
     }
 
-    fn prompt_kill_line(&mut self) {
+    fn prompt_kill_line(&mut self, prev: LastCommand) {
         let killed = self.prompt_edit(|input, cursor| {
-            let at = char_to_byte(input, (*cursor).min(input.chars().count()));
+            let start = (*cursor).min(input.chars().count());
+            let at = char_to_byte(input, start);
             let killed = input[at..].to_string();
+            if killed.is_empty() {
+                return None;
+            }
             input.truncate(at);
-            killed
+            Some((start, start + killed.chars().count(), killed))
         });
-        if let Some(killed) = killed {
-            let append = self.last_command == LastCommand::Kill;
-            self.kill_ring.push(&killed, append);
+        if let Some(Some((start, end, killed))) = killed {
+            self.prompt_adjust_mark_delete(start, end);
+            self.kill_new(&killed, prev == LastCommand::Kill);
             self.prompt_reset_selection();
             self.last_command = LastCommand::Kill;
         }
     }
 
     fn prompt_yank(&mut self) {
-        let text = match self.kill_ring.current() {
+        let text = match self.kill_ring.yank() {
             Some(text) => text,
             None => return,
         };
-        if self
-            .prompt_edit(|input, cursor| {
-                let idx = (*cursor).min(input.chars().count());
-                input.insert_str(char_to_byte(input, idx), &text);
-                *cursor = idx + text.chars().count();
-            })
-            .is_some()
-        {
+        let inserted = self.prompt_edit(|input, cursor| {
+            let idx = (*cursor).min(input.chars().count());
+            input.insert_str(char_to_byte(input, idx), &text);
+            let len = text.chars().count();
+            *cursor = idx + len;
+            (idx, idx + len)
+        });
+        if let Some((start, end)) = inserted {
+            self.prompt_adjust_mark_insert(start, end - start);
+            self.prompt_last_yank = Some((start, end));
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Yank;
+        }
+    }
+
+    fn prompt_yank_pop(&mut self, prev: LastCommand) {
+        if prev != LastCommand::Yank {
+            return;
+        }
+        let Some((start, end)) = self.prompt_last_yank else {
+            return;
+        };
+        let Some(text) = self.kill_ring.yank_pop() else {
+            return;
+        };
+        let replaced = self.prompt_edit(|input, cursor| {
+            let from = char_to_byte(input, start);
+            let to = char_to_byte(input, end);
+            input.replace_range(from..to, &text);
+            let len = text.chars().count();
+            *cursor = start + len;
+            (start, start + len)
+        });
+        if let Some((start, end)) = replaced {
+            self.prompt_mark = None;
+            self.prompt_last_yank = Some((start, end));
             self.prompt_reset_selection();
             self.last_command = LastCommand::Yank;
         }
     }
 
     fn prompt_complete(&mut self) {
+        self.prompt_mark = None;
+        self.prompt_last_yank = None;
+        self.last_command = LastCommand::Other;
         let candidates = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self
                 .switch_candidates(input)
@@ -1981,15 +2237,48 @@ impl App {
         }
     }
 
+    fn cancel_prompt(&mut self) {
+        self.prompt = Prompt::None;
+        self.prompt_mark = None;
+        self.prompt_last_yank = None;
+        self.prompt_cx = false;
+        self.message = Option::None;
+    }
+
     fn handle_prompt_key(&mut self, key: KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
+        if self.quoted {
+            self.quoted = false;
+            self.message = Option::None;
+            if let KeyCode::Char(c) = key.code {
+                self.prompt_insert(c);
+            } else if key.code == KeyCode::Tab {
+                self.prompt_insert('\t');
+            }
+            return;
+        }
+        if self.prompt_cx {
+            self.prompt_cx = false;
+            if key.code == KeyCode::Esc {
+                self.cancel_prompt();
+            } else if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('x')
+            {
+                self.prompt_exchange_point_and_mark();
+            }
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+            self.prompt_cx = true;
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
-                self.prompt = Prompt::None;
+                self.cancel_prompt();
                 return;
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.prompt = Prompt::None;
+                self.cancel_prompt();
                 return;
             }
             KeyCode::Enter => {
@@ -2015,19 +2304,35 @@ impl App {
         if action != DabbrevExpand {
             self.dabbrev = Option::None;
         }
+        let prev = self.last_command;
+        self.last_command = LastCommand::Other;
         match action {
-            Abort => self.prompt = Prompt::None,
+            Abort => self.cancel_prompt(),
             SelfInsert(c) => self.prompt_insert(c),
             DeleteBackward => self.prompt_delete_backward(),
             DeleteForward => self.prompt_delete_forward(),
             BackwardChar => self.prompt_move_cursor(-1),
             ForwardChar => self.prompt_move_cursor(1),
+            ForwardWord => self.prompt_forward_word(),
+            BackwardWord => self.prompt_backward_word(),
             BeginningOfLine => self.prompt_cursor_start(),
             EndOfLine => self.prompt_cursor_end(),
+            UpcaseWord => self.prompt_case_word(true),
+            DowncaseWord => self.prompt_case_word(false),
             TransposeChars => self.prompt_transpose_chars(),
             TransposeWords => self.prompt_transpose_words(),
-            KillLine => self.prompt_kill_line(),
+            BackwardKillWord => self.prompt_backward_kill_word(prev),
+            KillWord => self.prompt_kill_word(prev),
+            KillLine => self.prompt_kill_line(prev),
+            SetMark => self.prompt_set_mark(),
+            KillRegion => self.prompt_kill_region(prev),
+            CopyRegion => self.prompt_copy_region(prev),
             Yank => self.prompt_yank(),
+            YankPop => self.prompt_yank_pop(prev),
+            QuotedInsert => {
+                self.quoted = true;
+                self.start_echo("C-q-");
+            }
             PrevLine => self.prompt_move(count, -1),
             NextLine => self.prompt_move(count, 1),
             _ => {}
@@ -2035,6 +2340,10 @@ impl App {
     }
 
     fn commit_prompt(&mut self) {
+        self.prompt_mark = None;
+        self.prompt_last_yank = None;
+        self.prompt_cx = false;
+        self.message = Option::None;
         match std::mem::replace(&mut self.prompt, Prompt::None) {
             Prompt::None => {}
             Prompt::SwitchBuffer {
@@ -2105,7 +2414,7 @@ impl App {
                 copy,
                 ..
             } => {
-                let candidates = self.file_candidates(&input, false);
+                let candidates = self.file_candidates(&input, copy);
                 let chosen = match selected {
                     Some(i) => candidates.get(i).cloned().unwrap_or(input),
                     None => input,
@@ -2964,6 +3273,36 @@ fn isearch_motion(key: KeyEvent) -> bool {
     )
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The char index just past the next word from `start`.
+fn word_forward(text: &str, start: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = start.min(chars.len());
+    while idx < chars.len() && !is_word_char(chars[idx]) {
+        idx += 1;
+    }
+    while idx < chars.len() && is_word_char(chars[idx]) {
+        idx += 1;
+    }
+    idx
+}
+
+/// The char index at the start of the word before `start`.
+fn word_backward(text: &str, start: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = start.min(chars.len());
+    while idx > 0 && !is_word_char(chars[idx - 1]) {
+        idx -= 1;
+    }
+    while idx > 0 && is_word_char(chars[idx - 1]) {
+        idx -= 1;
+    }
+    idx
+}
+
 fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
     match direction {
         SearchDirection::Forward => Pos::new(pos.row, pos.col + 1),
@@ -3124,6 +3463,30 @@ mod tests {
 
     fn press(app: &mut App, c: char) {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn alt(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+    }
+
+    fn ctrl(app: &mut App, c: char) {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn start_find_prompt(app: &mut App, input: &str) {
+        app.prompt = Prompt::FindFile {
+            input: input.to_string(),
+            cursor: 0,
+            dired: false,
+            selected: None,
+        };
+    }
+
+    fn prompt_text(app: &App) -> (String, usize) {
+        match &app.prompt {
+            Prompt::FindFile { input, cursor, .. } => (input.clone(), *cursor),
+            _ => panic!("expected the find-file prompt"),
+        }
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -4182,6 +4545,105 @@ mod tests {
         assert!(matches!(app.prompt, Prompt::FindFile { .. }));
         assert!(app.prefix_echo.is_none());
         assert_ne!(app.message.as_deref(), Some("C-x-"));
+    }
+
+    #[test]
+    fn prompt_word_motion_and_kills() {
+        let mut app = App::new(Config::default());
+        start_find_prompt(&mut app, "hello world foo");
+        alt(&mut app, 'f');
+        assert_eq!(prompt_text(&app).1, 5);
+        alt(&mut app, 'f');
+        assert_eq!(prompt_text(&app).1, 11);
+        alt(&mut app, 'b');
+        assert_eq!(prompt_text(&app).1, 6);
+        alt(&mut app, 'b');
+        assert_eq!(prompt_text(&app).1, 0);
+
+        start_find_prompt(&mut app, "hello world");
+        app.prompt = Prompt::FindFile {
+            input: "hello world".to_string(),
+            cursor: 11,
+            dired: false,
+            selected: None,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(prompt_text(&app), ("hello ".to_string(), 6));
+        assert_eq!(app.kill_ring.current().as_deref(), Some("world"));
+
+        start_find_prompt(&mut app, "hello world");
+        alt(&mut app, 'd');
+        assert_eq!(prompt_text(&app), (" world".to_string(), 0));
+    }
+
+    #[test]
+    fn prompt_case_words() {
+        let mut app = App::new(Config::default());
+        start_find_prompt(&mut app, "hello world");
+        alt(&mut app, 'u');
+        assert_eq!(prompt_text(&app), ("HELLO world".to_string(), 5));
+
+        start_find_prompt(&mut app, "HELLO world");
+        alt(&mut app, 'l');
+        assert_eq!(prompt_text(&app), ("hello world".to_string(), 5));
+    }
+
+    #[test]
+    fn prompt_mark_regions_and_exchange() {
+        let mut app = App::new(Config::default());
+        app.prompt = Prompt::FindFile {
+            input: "hello world".to_string(),
+            cursor: 11,
+            dired: false,
+            selected: None,
+        };
+        ctrl(&mut app, ' ');
+        assert_eq!(app.prompt_mark, Some(11));
+        for _ in 0..5 {
+            ctrl(&mut app, 'b');
+        }
+        alt(&mut app, 'w');
+        assert_eq!(app.kill_ring.current().as_deref(), Some("world"));
+        assert_eq!(prompt_text(&app), ("hello world".to_string(), 6));
+
+        ctrl(&mut app, 'w');
+        assert_eq!(prompt_text(&app), ("hello ".to_string(), 6));
+        assert_eq!(app.prompt_mark, None);
+
+        start_find_prompt(&mut app, "hello");
+        app.prompt = Prompt::FindFile {
+            input: "hello".to_string(),
+            cursor: 5,
+            dired: false,
+            selected: None,
+        };
+        ctrl(&mut app, ' ');
+        for _ in 0..2 {
+            ctrl(&mut app, 'b');
+        }
+        ctrl(&mut app, 'x');
+        ctrl(&mut app, 'x');
+        assert_eq!(prompt_text(&app), ("hello".to_string(), 5));
+        assert_eq!(app.prompt_mark, Some(3));
+    }
+
+    #[test]
+    fn prompt_yank_pop_and_quoted_insert() {
+        let mut app = App::new(Config::default());
+        app.kill_ring.push("one", false);
+        app.kill_ring.push("two", false);
+        start_find_prompt(&mut app, "x");
+        ctrl(&mut app, 'y');
+        assert_eq!(prompt_text(&app).0, "twox");
+        alt(&mut app, 'y');
+        assert_eq!(prompt_text(&app).0, "onex");
+        alt(&mut app, 'y');
+        assert_eq!(prompt_text(&app).0, "twox");
+
+        start_find_prompt(&mut app, "");
+        ctrl(&mut app, 'q');
+        press(&mut app, 'a');
+        assert_eq!(prompt_text(&app).0, "a");
     }
 
     #[test]
