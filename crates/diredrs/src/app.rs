@@ -3899,13 +3899,13 @@ enum RecursiveAnswer {
     Invalid,
 }
 
-/// Parse `dired-delete-file`'s answers: yes, no, all (or `!`), and quit.
+/// Parse `dired-delete-file`'s answers: yes, no, all, and quit.
 fn recursive_answer(answer: &str) -> RecursiveAnswer {
     match answer.trim().to_ascii_lowercase().as_str() {
-        "yes" | "y" => RecursiveAnswer::Yes,
-        "no" | "n" => RecursiveAnswer::No,
-        "all" | "!" => RecursiveAnswer::All,
-        "quit" | "q" => RecursiveAnswer::Quit,
+        "yes" => RecursiveAnswer::Yes,
+        "no" => RecursiveAnswer::No,
+        "all" => RecursiveAnswer::All,
+        "quit" => RecursiveAnswer::Quit,
         _ => RecursiveAnswer::Invalid,
     }
 }
@@ -4860,6 +4860,16 @@ mod tests {
         assert!(matches!(
             &app.prompt,
             Prompt::Confirm { message, .. } if message == "Recursively delete sub? (yes, no, all, quit) "
+        ));
+        assert!(sub.join("nested.txt").exists());
+
+        // Short answers are not accepted; the prompt asks again.
+        type_into_prompt(&mut app, "y");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete sub? (yes, no, all, quit) "
         ));
         assert!(sub.join("nested.txt").exists());
 
