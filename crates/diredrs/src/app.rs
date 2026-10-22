@@ -2315,8 +2315,8 @@ impl App {
             ForwardChar => self.prompt_move_cursor(1),
             ForwardWord => self.prompt_forward_word(),
             BackwardWord => self.prompt_backward_word(),
-            BeginningOfLine => self.prompt_cursor_start(),
-            EndOfLine => self.prompt_cursor_end(),
+            BeginningOfLine | BeginningOfBuffer => self.prompt_cursor_start(),
+            EndOfLine | EndOfBuffer => self.prompt_cursor_end(),
             UpcaseWord => self.prompt_case_word(true),
             DowncaseWord => self.prompt_case_word(false),
             TransposeChars => self.prompt_transpose_chars(),
@@ -4574,6 +4574,12 @@ mod tests {
         start_find_prompt(&mut app, "hello world");
         alt(&mut app, 'd');
         assert_eq!(prompt_text(&app), (" world".to_string(), 0));
+
+        start_find_prompt(&mut app, "hello");
+        alt(&mut app, '>');
+        assert_eq!(prompt_text(&app).1, 5);
+        alt(&mut app, '<');
+        assert_eq!(prompt_text(&app).1, 0);
     }
 
     #[test]
