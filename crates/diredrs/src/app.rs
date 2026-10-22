@@ -160,6 +160,10 @@ struct Dabbrev {
 /// paste delivered in chunks is not interpreted as commands.
 const PASTE_LATCH: Duration = Duration::from_millis(50);
 
+/// How long to wait before echoing an incomplete prefix key (`C-c-`), like
+/// Emacs's `echo-keystrokes` (default one second).
+const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -183,6 +187,9 @@ pub struct App {
     /// the candidate list narrows.
     minibuffer_rows: u16,
     prefix: Prefix,
+    /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
+    /// Emacs's `echo-keystrokes` does.
+    prefix_echo: Option<(String, Instant)>,
     numeric_arg: Option<ArgState>,
     quoted: bool,
     last_command: LastCommand,
@@ -223,6 +230,7 @@ impl App {
             prompt: Prompt::None,
             minibuffer_rows: 1,
             prefix: Prefix::None,
+            prefix_echo: None,
             numeric_arg: None,
             quoted: false,
             last_command: LastCommand::Other,
@@ -1100,8 +1108,7 @@ impl App {
             }
             KeyCode::Char('*') => {
                 self.numeric_arg = None;
-                self.prefix = Prefix::Star;
-                self.message = Some("*".to_string());
+                self.start_prefix(Prefix::Star, "*");
                 true
             }
             KeyCode::Char('+') => {
@@ -1134,10 +1141,27 @@ impl App {
             if self.should_quit {
                 break;
             }
-            let event = event::read()?;
-            self.handle_term_event(event);
+            if let Some(event) = self.next_event()? {
+                self.handle_term_event(event);
+            }
         }
         Ok(())
+    }
+
+    /// Wait for the next terminal event, or echo a pending prefix hint once its
+    /// delay has elapsed. Returns `None` when a hint was echoed instead.
+    fn next_event(&mut self) -> Result<Option<TermEvent>> {
+        if let Some((_, deadline)) = &self.prefix_echo {
+            let now = Instant::now();
+            if *deadline > now {
+                if event::poll(*deadline - now)? {
+                    return Ok(Some(event::read()?));
+                }
+            }
+            self.echo_pending_prefix(Instant::now());
+            return Ok(None);
+        }
+        Ok(Some(event::read()?))
     }
 
     /// Handle one terminal event. On Windows a paste arrives as a burst of key
@@ -1211,6 +1235,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        // Any keystroke cancels an overdue-but-unshown prefix hint.
+        self.prefix_echo = None;
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
             return;
@@ -1245,21 +1271,18 @@ impl App {
 
         if ctrl && key.code == KeyCode::Char('x') {
             self.numeric_arg = None;
-            self.prefix = Prefix::CtrlX;
-            self.message = Some("C-x-".to_string());
+            self.start_prefix(Prefix::CtrlX, "C-x-");
             return;
         }
         if ctrl && key.code == KeyCode::Char('c') {
             self.numeric_arg = None;
-            self.prefix = Prefix::CtrlC;
-            self.message = Some("C-c-".to_string());
+            self.start_prefix(Prefix::CtrlC, "C-c-");
             return;
         }
         // C-h (help) prefix. Some terminals report Ctrl+H as Backspace.
         if ctrl && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace) {
             self.numeric_arg = None;
-            self.prefix = Prefix::Help;
-            self.message = Some("C-h-".to_string());
+            self.start_prefix(Prefix::Help, "C-h-");
             return;
         }
 
@@ -1368,6 +1391,29 @@ impl App {
 
     fn take_arg(&mut self) -> i32 {
         self.numeric_arg.take().map(ArgState::value).unwrap_or(1)
+    }
+
+    /// Begin an incomplete key sequence and arrange for its hint to be
+    /// echoed only if the user pauses.
+    fn start_prefix(&mut self, prefix: Prefix, hint: &str) {
+        self.prefix = prefix;
+        self.message = None;
+        self.start_echo(hint);
+    }
+
+    fn start_echo(&mut self, hint: &str) {
+        self.prefix_echo = Some((hint.to_string(), Instant::now() + PREFIX_ECHO_DELAY));
+    }
+
+    /// Show the pending prefix hint once its delay has elapsed.
+    fn echo_pending_prefix(&mut self, now: Instant) {
+        if let Some((hint, deadline)) = &self.prefix_echo {
+            if *deadline <= now {
+                let hint = hint.clone();
+                self.prefix_echo = None;
+                self.message = Some(hint);
+            }
+        }
     }
 
     fn handle_prefix(&mut self, key: KeyEvent, ctrl: bool) {
@@ -2213,7 +2259,7 @@ impl App {
             SearchBackward => self.start_search(SearchDirection::Backward),
             QuotedInsert => {
                 self.quoted = true;
-                self.message = Some("C-q-".to_string());
+                self.start_echo("C-q-");
             }
             Abort => {
                 self.current_mut().buffer.clear_mark();
@@ -3673,6 +3719,30 @@ mod tests {
         app.current_mut().buffer.end_of_line();
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
         assert_eq!(app.current().buffer.line(0).text(), "world hello");
+    }
+
+    #[test]
+    fn prefix_echo_waits_for_idle_delay() {
+        let mut app = App::new(Config::default());
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(app.prefix, Prefix::CtrlC));
+        // Nothing is echoed immediately.
+        assert_eq!(app.message, None);
+        assert!(app.prefix_echo.is_some());
+
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-c-"));
+        assert!(app.prefix_echo.is_none());
+    }
+
+    #[test]
+    fn completing_a_prefix_cancels_its_echo() {
+        let mut app = App::new(Config::default());
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert!(matches!(app.prompt, Prompt::FindFile { .. }));
+        assert!(app.prefix_echo.is_none());
+        assert_ne!(app.message.as_deref(), Some("C-x-"));
     }
 
     #[test]
