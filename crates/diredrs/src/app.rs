@@ -223,6 +223,10 @@ const PASTE_LATCH: Duration = Duration::from_millis(50);
 /// Emacs's `echo-keystrokes` (default one second).
 const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
 
+/// How long `M-g` waits before showing the window numbers, half the normal
+/// prefix delay.
+const WINDOW_NUMBER_DELAY: Duration = Duration::from_millis(500);
+
 /// How long to show the other end of a copied region, like Emacs's
 /// `indicate-copied-region`.
 const COPY_FLASH: Duration = Duration::from_millis(220);
@@ -1959,11 +1963,20 @@ impl App {
         self.prefix = prefix;
         self.show_window_numbers = false;
         self.message = None;
-        self.start_echo(hint);
+        let delay = if prefix == Prefix::MetaG {
+            WINDOW_NUMBER_DELAY
+        } else {
+            PREFIX_ECHO_DELAY
+        };
+        self.start_echo_after(hint, delay);
     }
 
     fn start_echo(&mut self, hint: &str) {
-        self.prefix_echo = Some((hint.to_string(), Instant::now() + PREFIX_ECHO_DELAY));
+        self.start_echo_after(hint, PREFIX_ECHO_DELAY);
+    }
+
+    fn start_echo_after(&mut self, hint: &str, delay: Duration) {
+        self.prefix_echo = Some((hint.to_string(), Instant::now() + delay));
     }
 
     /// Show the pending prefix hint once its delay has elapsed.
@@ -4244,7 +4257,9 @@ mod tests {
         alt(&mut app, 'g');
         assert!(!app.show_window_numbers());
 
-        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        app.echo_pending_prefix(Instant::now() + Duration::from_millis(250));
+        assert!(!app.show_window_numbers());
+        app.echo_pending_prefix(Instant::now() + WINDOW_NUMBER_DELAY);
         assert!(app.show_window_numbers());
 
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
