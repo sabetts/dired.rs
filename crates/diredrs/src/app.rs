@@ -165,6 +165,13 @@ pub enum PendingAction {
     Flagged,
     Marked,
     Current(PathBuf),
+    /// Continue deleting after the user confirmed a non-empty directory.
+    Delete {
+        paths: Vec<PathBuf>,
+        index: usize,
+        deleted: usize,
+        errors: Vec<String>,
+    },
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, `C-h`, or Dired's `*`).
@@ -1526,14 +1533,68 @@ impl App {
 
     /// Run a confirmed action.
     fn run_pending(&mut self, action: PendingAction) {
-        let paths = match action {
-            PendingAction::Flagged => self.dired_paths(Mark::Flagged),
-            PendingAction::Marked => self.dired_paths(Mark::Marked),
-            PendingAction::Current(path) => vec![path],
+        let mut deleted = 0;
+        let mut errors = Vec::new();
+        let (paths, index) = match action {
+            PendingAction::Flagged => (self.dired_paths(Mark::Flagged), 0),
+            PendingAction::Marked => (self.dired_paths(Mark::Marked), 0),
+            PendingAction::Current(path) => (vec![path], 0),
+            PendingAction::Delete {
+                paths,
+                index,
+                deleted: already_deleted,
+                errors: previous_errors,
+            } => {
+                deleted = already_deleted;
+                errors = previous_errors;
+                delete_one(&paths[index], &mut deleted, &mut errors);
+                (paths, index + 1)
+            }
         };
-        let summary = delete_paths(paths);
+        self.continue_delete(paths, index, deleted, errors);
+    }
+
+    /// Delete paths one at a time, asking before entering a non-empty
+    /// directory, like `dired-delete-file`.
+    fn continue_delete(
+        &mut self,
+        paths: Vec<PathBuf>,
+        mut index: usize,
+        mut deleted: usize,
+        mut errors: Vec<String>,
+    ) {
+        while index < paths.len() {
+            let path = &paths[index];
+            if directory_has_entries(path) {
+                let name = self.dired_relative(path);
+                self.prompt = Prompt::Confirm {
+                    message: format!("Recursively delete {name}? "),
+                    input: String::new(),
+                    cursor: 0,
+                    action: PendingAction::Delete {
+                        paths,
+                        index,
+                        deleted,
+                        errors,
+                    },
+                };
+                return;
+            }
+            delete_one(path, &mut deleted, &mut errors);
+            index += 1;
+        }
         self.dired_revert();
-        self.message = Some(summary);
+        self.message = Some(delete_summary(deleted, &errors));
+    }
+
+    /// The path shown in prompts, relative to the current Dired directory.
+    fn dired_relative(&self, path: &Path) -> String {
+        self.current()
+            .dired
+            .as_ref()
+            .and_then(|d| path.strip_prefix(&d.dir).ok())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| path.display().to_string())
     }
 
     /// Dispatch plain Dired keys. Returns `true` when the key was handled.
@@ -2930,7 +2991,17 @@ impl App {
                 if answer_is_yes(&input) {
                     self.run_pending(action);
                 } else if answer_is_no(&input) {
-                    self.message = Some("Canceled".to_string());
+                    if let PendingAction::Delete {
+                        paths,
+                        index,
+                        deleted,
+                        errors,
+                    } = action
+                    {
+                        self.continue_delete(paths, index + 1, deleted, errors);
+                    } else {
+                        self.message = Some("Canceled".to_string());
+                    }
                 } else {
                     // Re-ask, like `yes-or-no-p`.
                     self.prompt = Prompt::Confirm {
@@ -3717,29 +3788,38 @@ fn remove_leaf(tree: WindowTree, target: WindowId) -> Option<WindowTree> {
     }
 }
 
-fn delete_paths(paths: Vec<PathBuf>) -> String {
-    let mut deleted = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-    for path in paths {
-        let is_dir = fs::symlink_metadata(&path)
-            .map(|m| m.file_type().is_dir())
-            .unwrap_or(false);
-        let result = if is_dir {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
-        match result {
-            Ok(()) => deleted += 1,
-            Err(err) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                errors.push(format!("{name}: {err}"));
-            }
+fn directory_has_entries(path: &Path) -> bool {
+    let is_dir = fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    is_dir
+        && fs::read_dir(path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(true)
+}
+
+fn delete_one(path: &Path, deleted: &mut usize, errors: &mut Vec<String>) {
+    let is_dir = fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    let result = if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => *deleted += 1,
+        Err(err) => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            errors.push(format!("{name}: {err}"));
         }
     }
+}
+
+fn delete_summary(deleted: usize, errors: &[String]) -> String {
     if errors.is_empty() {
         format!("Deleted {deleted} file(s)")
     } else {
@@ -4701,6 +4781,57 @@ mod tests {
 
         assert!(!dir.join("a.txt").exists());
         assert!(dir.join("b.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_nonempty_directory_asks_to_recurse() {
+        let dir = temp_dir("delete-recursive");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. } if message == "Recursively delete sub? "
+        ));
+        assert!(sub.join("nested.txt").exists());
+
+        // `no` skips this directory.
+        type_into_prompt(&mut app, "no");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(sub.join("nested.txt").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!sub.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_an_empty_directory_does_not_ask_to_recurse() {
+        let dir = temp_dir("delete-empty-recursive");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!sub.exists());
+        assert!(matches!(app.prompt, Prompt::None));
 
         std::fs::remove_dir_all(&dir).ok();
     }
