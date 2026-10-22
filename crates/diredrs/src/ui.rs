@@ -54,7 +54,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         apply_highlights(&mut cells, row, &highlights);
         apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
         if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
-            place_cursor(&mut cells, cursor_point.col);
+            place_cursor(&mut cells, cursor_point.col, app.cursor_style);
         }
 
         let total = cells.len();
@@ -101,7 +101,7 @@ fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
     if let Some((prompt, cursor, candidates, selected)) = app.prompt_view() {
         let mut lines: Vec<RLine> = Vec::with_capacity(candidates.len() + 1);
         let mut cells: Vec<(char, Style)> = prompt.chars().map(|c| (c, Style::default())).collect();
-        place_cursor(&mut cells, cursor);
+        place_cursor(&mut cells, cursor, app.cursor_style);
         lines.push(to_rline(&cells));
         for (i, candidate) in candidates.iter().enumerate() {
             let style = if i == selected {
@@ -165,11 +165,11 @@ fn apply_background(cells: &mut [(char, Style)], row: usize, ranges: &[(Pos, usi
     }
 }
 
-fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize) {
+fn place_cursor(cells: &mut Vec<(char, Style)>, col: usize, style: Style) {
     if col < cells.len() {
-        cells[col].1 = cells[col].1.reverse();
+        cells[col].1 = style;
     } else {
-        cells.push((' ', Style::default().reverse()));
+        cells.push((' ', style));
     }
 }
 
@@ -253,6 +253,14 @@ mod tests {
         let cells = line_cells(&Line::plain("a\tb"));
         assert_eq!(cells.len(), 3);
         assert_eq!(cells[1].0, ' ');
+    }
+
+    #[test]
+    fn cursor_style_is_independent_of_the_text_under_it() {
+        let mut cells = vec![('a', Style::fg(Color::Green).bold())];
+        let cursor = Style::fg(Color::Black).bg(Color::Yellow);
+        place_cursor(&mut cells, 0, cursor);
+        assert_eq!(cells[0].1, cursor);
     }
 
     #[test]

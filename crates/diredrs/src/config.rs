@@ -25,6 +25,10 @@ pub struct UiConfig {
     /// Lines kept above and below point before the view scrolls
     /// (Emacs' `scroll-margin`).
     pub scroll_margin: usize,
+    /// Cursor foreground color (a name like `"black"` or `#rrggbb`).
+    pub cursor_fg: String,
+    /// Cursor background color.
+    pub cursor_bg: String,
 }
 
 impl Default for UiConfig {
@@ -34,6 +38,8 @@ impl Default for UiConfig {
             show_hidden: true,
             human_sizes: true,
             scroll_margin: 1,
+            cursor_fg: "black".to_string(),
+            cursor_bg: "yellow".to_string(),
         }
     }
 }
@@ -46,6 +52,8 @@ background = "dark"     # or "light"
 show_hidden = true      # list dotfiles, like ls -a
 human_sizes = true      # sizes as K/M/G like ls -h; false for exact bytes
 scroll_margin = 1       # lines kept above/below point before the view scrolls
+cursor_fg = "black"     # cursor text color (name or #rrggbb)
+cursor_bg = "yellow"    # cursor background color
 "##;
 
 impl Config {
@@ -86,6 +94,9 @@ mod tests {
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
         assert_eq!(cfg.ui.scroll_margin, 1);
+        assert_eq!(cfg.ui.cursor_fg, "black");
+        assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert!(TEMPLATE.contains("cursor_bg"));
     }
 
     #[test]
@@ -95,6 +106,16 @@ mod tests {
         assert!(cfg.ui.show_hidden);
         assert!(cfg.ui.human_sizes);
         assert_eq!(cfg.ui.scroll_margin, 1);
+        assert_eq!(cfg.ui.cursor_fg, "black");
+        assert_eq!(cfg.ui.cursor_bg, "yellow");
+    }
+
+    #[test]
+    fn cursor_colors_are_configurable() {
+        let cfg: Config =
+            toml::from_str("[ui]\ncursor_fg = \"#ffffff\"\ncursor_bg = \"blue\"\n").unwrap();
+        assert_eq!(cfg.ui.cursor_fg, "#ffffff");
+        assert_eq!(cfg.ui.cursor_bg, "blue");
     }
 
     #[test]

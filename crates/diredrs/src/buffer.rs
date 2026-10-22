@@ -43,6 +43,47 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+impl Color {
+    /// Parse a color name (e.g. `"yellow"`, `"light-blue"`) or `#rrggbb`.
+    pub fn parse(name: &str) -> Option<Color> {
+        let key: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let named = match key.as_str() {
+            "default" => Color::Default,
+            "black" => Color::Black,
+            "red" => Color::Red,
+            "green" => Color::Green,
+            "yellow" => Color::Yellow,
+            "blue" => Color::Blue,
+            "magenta" => Color::Magenta,
+            "cyan" => Color::Cyan,
+            "gray" | "grey" => Color::Gray,
+            "darkgray" | "darkgrey" => Color::DarkGray,
+            "lightred" => Color::LightRed,
+            "lightgreen" => Color::LightGreen,
+            "lightyellow" => Color::LightYellow,
+            "lightblue" => Color::LightBlue,
+            "lightmagenta" => Color::LightMagenta,
+            "lightcyan" => Color::LightCyan,
+            "white" => Color::White,
+            _ => {
+                let hex = name.trim().strip_prefix('#')?;
+                if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+                return Some(Color::Rgb(r, g, b));
+            }
+        };
+        Some(named)
+    }
+}
+
 /// A minimal, UI-independent text style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Style {
@@ -67,6 +108,11 @@ impl Style {
             dim: false,
             reverse: false,
         }
+    }
+
+    pub const fn bg(mut self, color: Color) -> Self {
+        self.bg = color;
+        self
     }
 
     pub const fn bold(mut self) -> Self {
@@ -1444,6 +1490,14 @@ mod tests {
         assert!(b.delete_region(start, end));
         assert_eq!(b.line_text(0), "af");
         assert_eq!(b.len(), 1);
+    }
+
+    #[test]
+    fn parses_color_names_and_hex() {
+        assert_eq!(Color::parse("yellow"), Some(Color::Yellow));
+        assert_eq!(Color::parse("Light-Blue"), Some(Color::LightBlue));
+        assert_eq!(Color::parse("#1e90ff"), Some(Color::Rgb(0x1e, 0x90, 0xff)));
+        assert_eq!(Color::parse("not-a-color"), None);
     }
 
     #[test]

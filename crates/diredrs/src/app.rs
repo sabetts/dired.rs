@@ -10,7 +10,7 @@ use crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Line, Pos};
+use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Style};
 use crate::config::Config;
 use crate::dired::{Dired, Mark};
 use crate::file;
@@ -168,6 +168,8 @@ const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
 pub struct App {
     pub config: Config,
     pub theme: Theme,
+    /// Colors used to draw the point, independent of the text under it.
+    pub cursor_style: Style,
     pub buffers: Vec<Buf>,
     pub current: usize,
     pub previous: usize,
@@ -213,9 +215,12 @@ impl App {
         let theme = Theme::for_background(config.ui.background);
         let human_sizes = config.ui.human_sizes;
         let scroll_margin = config.ui.scroll_margin;
+        let cursor_style = Style::fg(Color::parse(&config.ui.cursor_fg).unwrap_or(Color::Black))
+            .bg(Color::parse(&config.ui.cursor_bg).unwrap_or(Color::Yellow));
         let mut app = App {
             config,
             theme,
+            cursor_style,
             buffers: Vec::new(),
             current: 0,
             previous: 0,
