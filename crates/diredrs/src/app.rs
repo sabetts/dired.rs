@@ -235,6 +235,10 @@ const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
 /// `indicate-copied-region`.
 const COPY_FLASH: Duration = Duration::from_millis(220);
 
+/// How long `read-answer` shows its "Please answer ..." message after an
+/// unrecognized reply before asking again.
+const CONFIRM_FLASH: Duration = Duration::from_secs(2);
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -271,6 +275,9 @@ pub struct App {
     /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
     /// Emacs's `echo-keystrokes` does.
     prefix_echo: Option<(String, Instant)>,
+    /// A confirmation waiting behind an invalid-answer message: the prompt to
+    /// restore, and when to restore it if no key arrives first.
+    confirm_flash: Option<(Prompt, Instant)>,
     /// Pending `M-w` indication: (position to restore, deadline).
     copy_flash: Option<(Pos, Instant)>,
     numeric_arg: Option<ArgState>,
@@ -327,6 +334,7 @@ impl App {
             minibuffer_rows: 1,
             prefix: Prefix::None,
             prefix_echo: None,
+            confirm_flash: None,
             copy_flash: None,
             numeric_arg: None,
             quoted: false,
@@ -1723,18 +1731,17 @@ impl App {
         Ok(())
     }
 
-    /// Wait for the next terminal event, or handle a due prefix hint / `M-w`
-    /// indication once its delay has elapsed. Returns `None` when a timer fired
-    /// instead of an event arriving.
+    /// Wait for the next terminal event, or handle a due prefix hint, invalid
+    /// confirmation message, or `M-w` indication once its delay has elapsed.
+    /// Returns `None` when a timer fired instead of an event arriving.
     fn next_event(&mut self) -> Result<Option<TermEvent>> {
         let prefix_deadline = self.prefix_echo.as_ref().map(|(_, deadline)| *deadline);
+        let confirm_deadline = self.confirm_flash.as_ref().map(|(_, deadline)| *deadline);
         let flash_deadline = self.copy_flash.as_ref().map(|(_, deadline)| *deadline);
-        let deadline = match (prefix_deadline, flash_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
+        let deadline = [prefix_deadline, confirm_deadline, flash_deadline]
+            .into_iter()
+            .flatten()
+            .min();
         if let Some(deadline) = deadline {
             let now = Instant::now();
             if deadline > now && event::poll(deadline - now)? {
@@ -1750,6 +1757,7 @@ impl App {
                     self.current_mut().buffer.set_point(restore);
                 }
             }
+            self.expire_confirm_flash(now);
             self.echo_pending_prefix(now);
             return Ok(None);
         }
@@ -1839,6 +1847,11 @@ impl App {
         use crossterm::event::{KeyCode, KeyModifiers};
         if key.kind == KeyEventKind::Release {
             return;
+        }
+        // Typing during an invalid-answer message resumes the question and
+        // feeds this key to it, so the first keystroke is not lost.
+        if self.confirm_flash.is_some() {
+            self.resume_confirm();
         }
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
@@ -2786,6 +2799,38 @@ impl App {
         self.message = Option::None;
     }
 
+    /// Show `read-answer`'s invalid-answer message, keeping the prompt hidden
+    /// until a key arrives or the timeout elapses.
+    fn flash_invalid_answer(&mut self, prompt: Prompt, options: &[&str]) {
+        let choices = options
+            .iter()
+            .map(|option| format!("'{option}'"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        self.prompt = Prompt::None;
+        self.confirm_flash = Some((prompt, Instant::now() + CONFIRM_FLASH));
+        self.message = Some(format!("Please answer {choices}."));
+    }
+
+    /// Bring back a confirmation that was waiting behind an invalid answer.
+    fn resume_confirm(&mut self) {
+        if let Some((prompt, _)) = self.confirm_flash.take() {
+            self.prompt = prompt;
+            self.message = None;
+        }
+    }
+
+    /// Restore a confirmation once its invalid-answer message has timed out.
+    fn expire_confirm_flash(&mut self, now: Instant) {
+        if self
+            .confirm_flash
+            .as_ref()
+            .is_some_and(|(_, deadline)| *deadline <= now)
+        {
+            self.resume_confirm();
+        }
+    }
+
     fn handle_prompt_key(&mut self, key: KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
         if self.quoted {
@@ -3021,18 +3066,21 @@ impl App {
                         self.message = Some("OK, canceled".to_string());
                     }
                     RecursiveAnswer::Invalid => {
-                        self.prompt = Prompt::Confirm {
-                            message,
-                            input: String::new(),
-                            cursor: 0,
-                            action: PendingAction::Delete {
-                                paths,
-                                index,
-                                deleted,
-                                errors,
-                                all,
+                        self.flash_invalid_answer(
+                            Prompt::Confirm {
+                                message,
+                                input: String::new(),
+                                cursor: 0,
+                                action: PendingAction::Delete {
+                                    paths,
+                                    index,
+                                    deleted,
+                                    errors,
+                                    all,
+                                },
                             },
-                        };
+                            &["yes", "no", "all", "quit"],
+                        );
                     }
                 },
                 action => {
@@ -3042,12 +3090,15 @@ impl App {
                         self.message = Some("Canceled".to_string());
                     } else {
                         // Re-ask, like `yes-or-no-p`.
-                        self.prompt = Prompt::Confirm {
-                            message,
-                            input: String::new(),
-                            cursor: 0,
-                            action,
-                        };
+                        self.flash_invalid_answer(
+                            Prompt::Confirm {
+                                message,
+                                input: String::new(),
+                                cursor: 0,
+                                action,
+                            },
+                            &["yes", "no"],
+                        );
                     }
                 }
             },
@@ -3671,6 +3722,9 @@ impl App {
     fn handle_paste(&mut self, text: String) {
         if text.is_empty() {
             return;
+        }
+        if self.confirm_flash.is_some() {
+            self.resume_confirm();
         }
         if !matches!(self.prompt, Prompt::None) {
             let filtered: String = text.chars().filter(|c| *c != '\r').collect();
@@ -4863,15 +4917,24 @@ mod tests {
         ));
         assert!(sub.join("nested.txt").exists());
 
-        // Short answers are not accepted; the prompt asks again.
+        // Short answers are rejected with a timed message.
         type_into_prompt(&mut app, "y");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Please answer 'yes' or 'no' or 'all' or 'quit'.")
+        );
+        assert!(sub.join("nested.txt").exists());
+
+        // Once the message times out, the question returns.
+        app.expire_confirm_flash(Instant::now() + CONFIRM_FLASH);
         assert!(matches!(
             &app.prompt,
             Prompt::Confirm { message, .. }
                 if message == "Recursively delete sub? (yes, no, all, quit) "
         ));
-        assert!(sub.join("nested.txt").exists());
+        assert!(app.message.is_none());
 
         // `no` skips this directory.
         type_into_prompt(&mut app, "no");
@@ -4972,16 +5035,24 @@ mod tests {
         press(&mut app, 'd'); // flag a.txt
         press(&mut app, 'x'); // ask
 
-        // A bare `y` is not an accepted answer, so RET re-asks.
+        // A bare `y` is not an accepted answer: show the choices instead.
         press(&mut app, 'y');
         assert!(dir.join("a.txt").exists());
         assert!(matches!(app.prompt, Prompt::Confirm { .. }));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(dir.join("a.txt").exists());
-        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("Please answer 'yes' or 'no'."));
 
-        // The full word confirms the answer.
-        type_into_prompt(&mut app, "yes");
+        // Typing while the message is visible returns to the prompt with the
+        // first keystroke retained.
+        press(&mut app, 'y');
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { input, .. } if input == "y"
+        ));
+        assert!(app.message.is_none());
+        type_into_prompt(&mut app, "es");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!dir.join("a.txt").exists());
 
