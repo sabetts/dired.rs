@@ -6,56 +6,124 @@ use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Prompt};
+use crate::app::{App, Prompt, SplitAxis, WindowId, WindowTree, WindowView};
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::{Search, SearchDirection};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let minibuffer = app.minibuffer_height().max(1);
-    let rows = Layout::vertical([
-        Constraint::Min(0),
-        Constraint::Length(1),
-        Constraint::Length(minibuffer),
-    ])
-    .split(frame.area());
+    let rows =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(minibuffer)]).split(frame.area());
 
-    draw_buffer(frame, app, rows[0]);
-    draw_mode_line(frame, app, rows[1]);
-    draw_minibuffer(frame, app, rows[2]);
+    let mut panes = Vec::new();
+    collect_panes(app.window_tree(), rows[0], &mut panes);
+    let active_id = app.active_window_id();
+    let active_area = panes
+        .iter()
+        .find(|(id, _, _)| *id == active_id)
+        .map(|(_, buffer_area, _)| *buffer_area)
+        .unwrap_or(rows[0]);
+    app.prepare_active_view(active_area.width as usize, active_area.height as usize);
+
+    for (id, buffer_area, mode_area) in panes {
+        let Some(window) = app.window(id) else {
+            continue;
+        };
+        let active = id == active_id;
+        let view = if active {
+            let buffer = &app.buffers[window.buffer].buffer;
+            WindowView {
+                point: buffer.point(),
+                scroll: buffer.scroll(),
+                scroll_sub: buffer.scroll_sub(),
+                width: buffer.width(),
+            }
+        } else {
+            window.view
+        };
+        draw_buffer(frame, app, window.buffer, buffer_area, view, active);
+        draw_mode_line(
+            frame,
+            app,
+            window.buffer,
+            view.point.row + 1,
+            mode_area,
+            active,
+        );
+    }
+    draw_minibuffer(frame, app, rows[1]);
 }
 
-fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
+fn collect_panes(tree: &WindowTree, area: Rect, out: &mut Vec<(WindowId, Rect, Rect)>) {
+    match tree {
+        WindowTree::Leaf(id) => {
+            let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+            out.push((*id, rows[0], rows[1]));
+        }
+        WindowTree::Split {
+            axis,
+            first,
+            second,
+        } => {
+            let chunks = match axis {
+                SplitAxis::Below => {
+                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(area)
+                }
+                SplitAxis::Right => {
+                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(area)
+                }
+            };
+            collect_panes(first, chunks[0], out);
+            collect_panes(second, chunks[1], out);
+        }
+    }
+}
+
+fn draw_buffer(
+    frame: &mut Frame,
+    app: &App,
+    idx: usize,
+    area: Rect,
+    view: WindowView,
+    active: bool,
+) {
     let height = area.height as usize;
     let width = area.width as usize;
     if height == 0 || width == 0 {
         return;
     }
-    let buf = &app.current().buffer;
-    let point = buf.point();
-    let cursor_point = display_point(&app.search, point);
+    let buf = &app.buffers[idx].buffer;
+    let cursor_point = display_point(&app.search, view.point);
 
-    let highlights = if app.search.active && !app.search.query.is_empty() {
+    let highlights = if active && app.search.active && !app.search.query.is_empty() {
         buf.matches(&app.search.query)
     } else {
         Vec::new()
     };
-    let current_match = if app.search.active {
+    let current_match = if active && app.search.active {
         app.search.match_end.and_then(|end| {
-            (end.row == point.row && end.col > point.col).then(|| (point, end.col - point.col))
+            (end.row == view.point.row && end.col > view.point.col)
+                .then(|| (view.point, end.col - view.point.col))
         })
     } else {
         None
     };
     // Hex view: the byte under point, highlighted in its hex and ASCII forms
     // with a background colour (Emacs's `highlight` face), not reverse video.
-    let hex_highlights = app.hexl_highlights();
+    let hex_highlights = if active {
+        app.hexl_highlights()
+    } else {
+        Vec::new()
+    };
 
     // Rendering starts at the persisted view top; the buffer keeps the point
     // visible (wrapping-aware), so the view does not drift as point moves.
     let last_line = buf.len().saturating_sub(1);
     let mut lines: Vec<RLine> = Vec::with_capacity(height);
-    let mut row = buf.scroll();
-    let mut sub = buf.scroll_sub();
+    let mut row = view.scroll.min(last_line);
+    let mut sub = view.scroll_sub;
     while row <= last_line && lines.len() < height {
         let mut cells = line_cells(buf.line(row));
         apply_highlights(
@@ -67,7 +135,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
             app.theme.isearch,
         );
         apply_background(&mut cells, row, &hex_highlights, app.theme.hex_highlight);
-        if row == cursor_point.row && matches!(app.prompt, Prompt::None) {
+        if active && row == cursor_point.row && matches!(app.prompt, Prompt::None) {
             place_cursor(&mut cells, cursor_point.col, app.cursor_style);
         }
 
@@ -75,6 +143,7 @@ fn draw_buffer(frame: &mut Frame, app: &App, area: Rect) {
         if total == 0 {
             lines.push(to_rline(&[]));
         } else {
+            let sub = sub.min(total.saturating_sub(1) / width);
             let mut start = (sub * width).min(total);
             while start < total && lines.len() < height {
                 let end = (start + width).min(total);
@@ -99,13 +168,16 @@ fn display_point(search: &Search, point: Pos) -> Pos {
     }
 }
 
-fn draw_mode_line(frame: &mut Frame, app: &App, area: Rect) {
-    let line = app.current().buffer.point().row + 1;
-    let base = RStyle::default().add_modifier(Modifier::REVERSED);
+fn draw_mode_line(frame: &mut Frame, app: &App, idx: usize, line: usize, area: Rect, active: bool) {
+    let base = if active {
+        RStyle::default().add_modifier(Modifier::REVERSED)
+    } else {
+        RStyle::default().add_modifier(Modifier::REVERSED | Modifier::DIM)
+    };
     let text = format!(
         " {}  ({})  L{} ",
-        app.mode_line_name(),
-        app.mode_line_mode(),
+        app.mode_line_name_for(idx),
+        app.mode_line_mode_for(idx),
         line
     );
     frame.render_widget(Paragraph::new(RLine::from(text)).style(base), area);

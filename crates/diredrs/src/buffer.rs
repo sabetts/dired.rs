@@ -290,6 +290,11 @@ impl Buffer {
         self.scroll_sub
     }
 
+    /// The wrap width used for visual-row scrolling.
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
     /// Set the wrap width used for visual-row scrolling.
     pub fn set_width(&mut self, width: usize) {
         self.width = width.max(1);

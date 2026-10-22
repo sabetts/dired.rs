@@ -52,6 +52,46 @@ pub struct Buf {
     last_visited: u64,
 }
 
+/// A window's saved view of its buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowView {
+    pub point: Pos,
+    pub scroll: usize,
+    pub scroll_sub: usize,
+    pub width: usize,
+}
+
+/// A stable identifier for a window.
+pub type WindowId = u64;
+
+/// One window: a buffer plus its saved view.
+#[derive(Debug, Clone)]
+pub struct Window {
+    pub id: WindowId,
+    pub buffer: usize,
+    pub view: WindowView,
+}
+
+/// How a window is divided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitAxis {
+    /// Top and bottom.
+    Below,
+    /// Left and right.
+    Right,
+}
+
+/// The binary tree describing the window layout.
+#[derive(Debug, Clone)]
+pub enum WindowTree {
+    Leaf(WindowId),
+    Split {
+        axis: SplitAxis,
+        first: Box<WindowTree>,
+        second: Box<WindowTree>,
+    },
+}
+
 /// The minibuffer prompt, if one is active.
 #[derive(Debug, Clone)]
 pub enum Prompt {
@@ -61,6 +101,8 @@ pub enum Prompt {
         /// Cursor position within `input`, as a char index.
         cursor: usize,
         selected: usize,
+        /// `C-x 4 b`: switch the buffer in the other window.
+        other_window: bool,
     },
     KillBuffer {
         input: String,
@@ -121,6 +163,8 @@ enum Prefix {
     #[default]
     None,
     CtrlX,
+    /// `C-x 4` (`C-x 4 b`).
+    CtrlX4,
     CtrlC,
     Help,
     /// Dired's `*` marking prefix (`* !`, `* .`).
@@ -180,6 +224,13 @@ pub struct App {
     pub buffers: Vec<Buf>,
     pub current: usize,
     pub previous: usize,
+    pub(crate) windows: Vec<Window>,
+    pub(crate) active_window: WindowId,
+    pub(crate) window_tree: WindowTree,
+    next_window_id: WindowId,
+    /// Incremented whenever the layout or displayed buffers change, forcing a
+    /// clean repaint.
+    layout_version: u64,
     /// Monotonic counter for the most recent buffer visit, for list ordering.
     visit_seq: u64,
     pub history: History,
@@ -217,8 +268,8 @@ pub struct App {
     /// While set, key events are treated as part of an in-progress paste (a
     /// Windows paste delivered as individual keys; see `handle_term_event`).
     pasting_until: Option<Instant>,
-    /// The buffer index last drawn, so a switch can force a full repaint.
-    drawn: Option<usize>,
+    /// The layout version last drawn, so changes force a full repaint.
+    drawn: Option<u64>,
     /// Whether Dired shows sizes human-readably (`ls -h`); `ui.human_sizes`.
     human_sizes: bool,
     /// Rows of padding kept above/below point before scrolling.
@@ -239,6 +290,11 @@ impl App {
             buffers: Vec::new(),
             current: 0,
             previous: 0,
+            windows: Vec::new(),
+            active_window: 0,
+            window_tree: WindowTree::Leaf(0),
+            next_window_id: 1,
+            layout_version: 0,
             visit_seq: 0,
             history: History::default(),
             search: Search::default(),
@@ -272,6 +328,15 @@ impl App {
             .set_content(scratch_lines().into_iter().map(Line::plain).collect());
         app.current = scratch;
         app.previous = scratch;
+        let id = app.next_window_id;
+        app.next_window_id += 1;
+        app.windows.push(Window {
+            id,
+            buffer: scratch,
+            view: capture_view(&app.buffers[scratch].buffer),
+        });
+        app.active_window = id;
+        app.window_tree = WindowTree::Leaf(id);
         // Open a Dired buffer for the home directory and show it on boot.
         if let Some(home) = home_dir() {
             app.open_dired(home);
@@ -314,20 +379,64 @@ impl App {
     }
 
     pub fn mode_line_name(&self) -> String {
-        self.current().name.clone()
+        self.mode_line_name_for(self.current)
     }
 
+    #[cfg(test)]
     pub fn mode_line_mode(&self) -> String {
-        match self.current().kind {
+        self.mode_line_mode_for(self.current)
+    }
+
+    pub fn mode_line_name_for(&self, idx: usize) -> String {
+        self.buffers[idx].name.clone()
+    }
+
+    pub fn mode_line_mode_for(&self, idx: usize) -> String {
+        match self.buffers[idx].kind {
             Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
             // Emacs shows the listing order in the mode name, e.g. "Dired by name".
-            Kind::Dired => match self.current().dired.as_ref() {
+            Kind::Dired => match self.buffers[idx].dired.as_ref() {
                 Some(d) => format!("Dired by {}", d.sort.label()),
                 None => "Dired".to_string(),
             },
             Kind::Hexl => "Hexl".to_string(),
         }
+    }
+
+    pub(crate) fn window(&self, id: WindowId) -> Option<&Window> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    pub(crate) fn window_tree(&self) -> &WindowTree {
+        &self.window_tree
+    }
+
+    pub(crate) fn active_window_id(&self) -> WindowId {
+        self.active_window
+    }
+
+    fn window_ids(&self) -> Vec<WindowId> {
+        let mut ids = Vec::with_capacity(self.windows.len());
+        window_ids(&self.window_tree, &mut ids);
+        ids
+    }
+
+    fn save_active_view(&mut self) {
+        let view = capture_view(&self.buffers[self.current].buffer);
+        if let Some(window) = self.windows.iter_mut().find(|w| w.id == self.active_window) {
+            window.buffer = self.current;
+            window.view = view;
+        }
+    }
+
+    fn touch_layout(&mut self) {
+        self.layout_version = self.layout_version.wrapping_add(1);
+    }
+
+    fn note_buffer_visit(&mut self, idx: usize) {
+        self.visit_seq += 1;
+        self.buffers[idx].last_visited = self.visit_seq;
     }
 
     /// Column ranges to highlight in the hex view, so the byte under point is
@@ -356,17 +465,154 @@ impl App {
         if idx >= self.buffers.len() || idx == self.current {
             return;
         }
+        self.save_active_view();
         let old = self.current;
         self.previous = old;
         self.current = idx;
-        self.visit_seq += 1;
-        self.buffers[idx].last_visited = self.visit_seq;
+        if let Some(window) = self.windows.iter_mut().find(|w| w.id == self.active_window) {
+            window.buffer = idx;
+        }
+        self.note_buffer_visit(idx);
         let cols = self.viewport_cols;
         let height = self.viewport_rows.max(1);
         let margin = self.scroll_margin;
         let buf = &mut self.buffers[idx].buffer;
         buf.set_width(cols);
         buf.ensure_point_visible(height, margin);
+        self.touch_layout();
+    }
+
+    fn select_window(&mut self, id: WindowId) {
+        if id == self.active_window {
+            return;
+        }
+        let Some(pos) = self.windows.iter().position(|w| w.id == id) else {
+            return;
+        };
+        self.save_active_view();
+        let (buffer, view) = {
+            let window = &self.windows[pos];
+            (window.buffer, window.view)
+        };
+        if buffer != self.current {
+            self.previous = self.current;
+        }
+        self.active_window = id;
+        self.current = buffer;
+        restore_view(&mut self.buffers[buffer].buffer, view);
+        self.note_buffer_visit(buffer);
+        self.touch_layout();
+    }
+
+    fn split_active_window(&mut self, axis: SplitAxis) {
+        let too_small = match axis {
+            SplitAxis::Below => self.viewport_rows < 3,
+            SplitAxis::Right => self.viewport_cols < 4,
+        };
+        if too_small {
+            self.message = Some("Window too small to split".to_string());
+            return;
+        }
+        self.save_active_view();
+        let old = self.active_window;
+        let new_id = self.next_window_id;
+        self.next_window_id += 1;
+        self.windows.push(Window {
+            id: new_id,
+            buffer: self.current,
+            view: capture_view(&self.buffers[self.current].buffer),
+        });
+        if !split_leaf(&mut self.window_tree, old, axis, new_id) {
+            self.windows.pop();
+            return;
+        }
+        self.touch_layout();
+    }
+
+    fn delete_active_window(&mut self) {
+        if self.windows.len() <= 1 {
+            self.message = Some("Only one window".to_string());
+            return;
+        }
+        let old = self.active_window;
+        let before = self.window_ids();
+        let pos = before.iter().position(|id| *id == old).unwrap_or(0);
+        let tree = std::mem::replace(&mut self.window_tree, WindowTree::Leaf(old));
+        self.window_tree = remove_leaf(tree, old).unwrap_or(WindowTree::Leaf(old));
+        self.windows.retain(|w| w.id != old);
+        let after = self.window_ids();
+        let Some(new_id) = after.get(pos).copied().or_else(|| after.last().copied()) else {
+            return;
+        };
+        let (buffer, view) = {
+            let window = self.windows.iter().find(|w| w.id == new_id).unwrap();
+            (window.buffer, window.view)
+        };
+        self.active_window = new_id;
+        self.current = buffer;
+        restore_view(&mut self.buffers[buffer].buffer, view);
+        self.note_buffer_visit(buffer);
+        self.touch_layout();
+    }
+
+    fn delete_other_windows(&mut self) {
+        if self.windows.len() <= 1 {
+            self.message = Some("Only one window".to_string());
+            return;
+        }
+        let active = self.active_window;
+        self.save_active_view();
+        self.windows.retain(|w| w.id == active);
+        self.window_tree = WindowTree::Leaf(active);
+        self.touch_layout();
+    }
+
+    fn other_window(&mut self) {
+        let ids = self.window_ids();
+        if ids.len() <= 1 {
+            self.message = Some("Only one window".to_string());
+            return;
+        }
+        let pos = ids
+            .iter()
+            .position(|id| *id == self.active_window)
+            .unwrap_or(0);
+        self.select_window(ids[(pos + 1) % ids.len()]);
+    }
+
+    fn next_window_id(&self) -> Option<WindowId> {
+        let ids = self.window_ids();
+        if ids.len() <= 1 {
+            return None;
+        }
+        let pos = ids
+            .iter()
+            .position(|id| *id == self.active_window)
+            .unwrap_or(0);
+        Some(ids[(pos + 1) % ids.len()])
+    }
+
+    fn switch_buffer_in_other_window(&mut self, idx: usize) {
+        if idx >= self.buffers.len() {
+            return;
+        }
+        if self.windows.len() == 1 {
+            self.split_active_window(SplitAxis::Below);
+        }
+        let Some(other) = self.next_window_id() else {
+            return;
+        };
+        self.save_active_view();
+        let old = self.current;
+        let view = capture_view(&self.buffers[idx].buffer);
+        if let Some(window) = self.windows.iter_mut().find(|w| w.id == other) {
+            if window.buffer != idx {
+                window.buffer = idx;
+                window.view = view;
+            }
+        }
+        self.previous = old;
+        self.select_window(other);
     }
 
     /// Kill a buffer. `*scratch*` cannot be killed.
@@ -378,20 +624,41 @@ impl App {
             self.message = Some("Cannot kill *scratch*".to_string());
             return;
         }
+        let active_killed = self.current == idx;
+        self.save_active_view();
         self.buffers.remove(idx);
+        for window in &mut self.windows {
+            if window.buffer > idx {
+                window.buffer -= 1;
+            } else if window.buffer == idx {
+                window.buffer = usize::MAX;
+            }
+        }
+        let fallback = idx.min(self.buffers.len().saturating_sub(1));
         if self.current > idx {
             self.current -= 1;
         } else if self.current == idx {
-            self.current = idx.min(self.buffers.len().saturating_sub(1));
+            self.current = fallback;
         }
-        if self.previous >= self.buffers.len() {
-            self.previous = self.buffers.len().saturating_sub(1);
+        if self.previous > idx {
+            self.previous -= 1;
+        } else if self.previous == idx {
+            self.previous = fallback;
         }
-        if self.buffers.is_empty() {
-            let scratch = self.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
-            self.current = scratch;
-            self.previous = scratch;
+        let fallback_view = capture_view(&self.buffers[fallback].buffer);
+        for window in &mut self.windows {
+            if window.buffer == usize::MAX {
+                window.buffer = fallback;
+                window.view = fallback_view;
+            }
         }
+        if let Some(window) = self.windows.iter_mut().find(|w| w.id == self.active_window) {
+            window.buffer = self.current;
+            if active_killed {
+                window.view = fallback_view;
+            }
+        }
+        self.touch_layout();
     }
 
     // ---- dired -------------------------------------------------------------
@@ -1277,20 +1544,13 @@ impl App {
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
-            // A buffer switch replaces the whole view; repaint from scratch so
-            // the previous buffer's cells (and any terminal state they left
-            // behind) can't desync the diff-based redraw.
-            if self.drawn != Some(self.current) {
+            // A buffer switch or layout change replaces the whole view;
+            // repaint from scratch so the previous cells can't desync the
+            // diff-based redraw.
+            if self.drawn != Some(self.layout_version) {
                 terminal.clear()?;
-                self.drawn = Some(self.current);
+                self.drawn = Some(self.layout_version);
             }
-            let size = terminal.size()?;
-            let minibuffer = self.minibuffer_height();
-            self.viewport_rows = (size.height as usize).saturating_sub(1 + minibuffer as usize);
-            self.viewport_cols = size.width as usize;
-            let cols = self.viewport_cols;
-            self.current_mut().buffer.set_width(cols);
-            self.ensure_scroll_visible();
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
                 break;
@@ -1402,6 +1662,14 @@ impl App {
         self.current_mut()
             .buffer
             .ensure_point_visible(height, margin);
+    }
+
+    pub(crate) fn prepare_active_view(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        self.viewport_cols = width;
+        self.viewport_rows = height.max(1);
+        self.current_mut().buffer.set_width(width);
+        self.ensure_scroll_visible();
     }
 
     // ---- key handling ------------------------------------------------------
@@ -1616,13 +1884,24 @@ impl App {
             Prefix::None => {}
             Prefix::CtrlX => match key.code {
                 KeyCode::Char('c') if ctrl => self.should_quit = true,
-                KeyCode::Char('b') => self.start_switch_buffer(),
+                KeyCode::Char('2') => self.split_active_window(SplitAxis::Below),
+                KeyCode::Char('3') => self.split_active_window(SplitAxis::Right),
+                KeyCode::Char('0') => self.delete_active_window(),
+                KeyCode::Char('1') => self.delete_other_windows(),
+                KeyCode::Char('o') => self.other_window(),
+                KeyCode::Char('4') => self.start_prefix(Prefix::CtrlX4, "C-x 4-"),
+                KeyCode::Char('b') => self.start_switch_buffer(false),
                 KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
                 KeyCode::Char('f') if ctrl => self.start_find_file(false),
                 KeyCode::Char('d') => self.start_find_file(true),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
+            },
+            Prefix::CtrlX4 => match key.code {
+                KeyCode::Char('b') => self.start_switch_buffer(true),
+                KeyCode::Char('g') if ctrl => {}
+                _ => self.undefined("C-x 4", key),
             },
             Prefix::CtrlC => match key.code {
                 KeyCode::Char('g') if ctrl => {}
@@ -1667,11 +1946,12 @@ impl App {
 
     // ---- prompts -----------------------------------------------------------
 
-    fn start_switch_buffer(&mut self) {
+    fn start_switch_buffer(&mut self, other_window: bool) {
         self.prompt = Prompt::SwitchBuffer {
             input: String::new(),
             cursor: 0,
             selected: 0,
+            other_window,
         };
     }
 
@@ -2265,6 +2545,7 @@ impl App {
                 input,
                 cursor,
                 selected,
+                ..
             }
             | Prompt::KillBuffer {
                 input,
@@ -2412,16 +2693,25 @@ impl App {
         match std::mem::replace(&mut self.prompt, Prompt::None) {
             Prompt::None => {}
             Prompt::SwitchBuffer {
-                input, selected, ..
+                input,
+                selected,
+                other_window,
+                ..
             } => {
                 let candidates = self.switch_candidates(&input);
-                if let Some(&i) = candidates.get(selected) {
-                    self.switch_to(i);
+                let target = if let Some(&i) = candidates.get(selected) {
+                    Some(i)
                 } else if input.trim().is_empty() {
-                    let prev = self.previous;
-                    self.switch_to(prev);
-                } else if let Some(i) = self.find_buffer(input.trim()) {
-                    self.switch_to(i);
+                    Some(self.previous)
+                } else {
+                    self.find_buffer(input.trim())
+                };
+                if let Some(i) = target {
+                    if other_window {
+                        self.switch_buffer_in_other_window(i);
+                    } else {
+                        self.switch_to(i);
+                    }
                 } else {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
@@ -2533,16 +2823,24 @@ impl App {
                 input,
                 cursor,
                 selected,
+                other_window,
             } => {
                 let names = self
                     .switch_candidates(input)
                     .into_iter()
                     .map(|i| self.buffers[i].name.clone())
                     .collect();
-                let prefix = format!(
-                    "Switch to buffer (default {}): ",
-                    self.previous_buffer_name()
-                );
+                let prefix = if *other_window {
+                    format!(
+                        "Switch to buffer in other window (default {}): ",
+                        self.previous_buffer_name()
+                    )
+                } else {
+                    format!(
+                        "Switch to buffer (default {}): ",
+                        self.previous_buffer_name()
+                    )
+                };
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
@@ -3212,6 +3510,75 @@ fn destination_inside_source(src: &std::path::Path, to: &std::path::Path) -> boo
 
 /// Delete each path (recursively for directories), returning a summary. A
 /// symlink is removed as a link, never followed.
+fn capture_view(buffer: &Buffer) -> WindowView {
+    WindowView {
+        point: buffer.point(),
+        scroll: buffer.scroll(),
+        scroll_sub: buffer.scroll_sub(),
+        width: buffer.width(),
+    }
+}
+
+fn restore_view(buffer: &mut Buffer, view: WindowView) {
+    buffer.set_width(view.width);
+    buffer.set_point(view.point);
+    buffer.set_view_top(view.scroll, view.scroll_sub);
+}
+
+fn window_ids(tree: &WindowTree, out: &mut Vec<WindowId>) {
+    match tree {
+        WindowTree::Leaf(id) => out.push(*id),
+        WindowTree::Split { first, second, .. } => {
+            window_ids(first, out);
+            window_ids(second, out);
+        }
+    }
+}
+
+fn split_leaf(tree: &mut WindowTree, target: WindowId, axis: SplitAxis, new_id: WindowId) -> bool {
+    match tree {
+        WindowTree::Leaf(id) if *id == target => {
+            *tree = WindowTree::Split {
+                axis,
+                first: Box::new(WindowTree::Leaf(*id)),
+                second: Box::new(WindowTree::Leaf(new_id)),
+            };
+            true
+        }
+        WindowTree::Leaf(_) => false,
+        WindowTree::Split { first, second, .. } => {
+            split_leaf(first, target, axis, new_id) || split_leaf(second, target, axis, new_id)
+        }
+    }
+}
+
+/// Remove `target`, collapsing its parent. `None` means the whole tree was the
+/// removed leaf.
+fn remove_leaf(tree: WindowTree, target: WindowId) -> Option<WindowTree> {
+    match tree {
+        WindowTree::Leaf(id) if id == target => None,
+        WindowTree::Leaf(_) => Some(tree),
+        WindowTree::Split {
+            axis,
+            first,
+            second,
+        } => {
+            let first = remove_leaf(*first, target);
+            let second = remove_leaf(*second, target);
+            match (first, second) {
+                (None, None) => None,
+                (Some(first), None) => Some(first),
+                (None, Some(second)) => Some(second),
+                (Some(first), Some(second)) => Some(WindowTree::Split {
+                    axis,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+            }
+        }
+    }
+}
+
 fn delete_paths(paths: Vec<PathBuf>) -> String {
     let mut deleted = 0usize;
     let mut errors: Vec<String> = Vec::new();
@@ -3432,7 +3799,11 @@ fn scratch_lines() -> Vec<String> {
         String::new(),
         "Discovering commands".to_string(),
         "  C-h b          list all key bindings in a *Help* buffer".to_string(),
+        "  C-x 2 / C-x 3  split the window below / to the right".to_string(),
+        "  C-x 0 / C-x 1  delete this / other windows".to_string(),
+        "  C-x o          move to the other window".to_string(),
         "  C-x b          switch buffers".to_string(),
+        "  C-x 4 b        switch buffers in the other window".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
     ]
@@ -3500,6 +3871,14 @@ fn help_lines() -> Vec<String> {
         "  C-x C-x        exchange point and mark",
         "  C-x C-c        quit",
         "",
+        "Windows",
+        "  C-x 2          split the window below",
+        "  C-x 3          split the window to the right",
+        "  C-x 0          delete the active window",
+        "  C-x 1          delete all other windows",
+        "  C-x o          move to the next window",
+        "  C-x 4 b        switch buffer in the other window",
+        "",
         "Help",
         "  C-h b          describe bindings (this buffer)",
         "  C-g            abort the current command",
@@ -3538,6 +3917,11 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
 
+    fn ctrl_x(app: &mut App, c: char) {
+        ctrl(app, 'x');
+        press(app, c);
+    }
+
     fn start_find_prompt(app: &mut App, input: &str) {
         app.prompt = Prompt::FindFile {
             input: input.to_string(),
@@ -3572,6 +3956,248 @@ mod tests {
     fn boot_has_a_scratch_buffer() {
         let app = App::new(Config::default());
         assert!(app.buffers.iter().any(|b| b.kind == Kind::Scratch));
+    }
+
+    #[test]
+    fn c_x_2_and_3_split_the_active_window() {
+        let mut app = App::new(Config::default());
+        let active = app.active_window;
+        let current = app.current;
+        assert_eq!(app.windows.len(), 1);
+
+        ctrl_x(&mut app, '2');
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(app.active_window, active);
+        assert_eq!(app.current, current);
+        assert!(app.windows.iter().all(|w| w.buffer == current));
+
+        ctrl_x(&mut app, '3');
+        assert_eq!(app.windows.len(), 3);
+        assert_eq!(app.active_window, active);
+        let ids = app.window_ids();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], active);
+        assert!(app.windows.iter().all(|w| w.buffer == current));
+    }
+
+    #[test]
+    fn c_x_0_deletes_the_active_window_and_c_x_1_keeps_it() {
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '2');
+        ctrl_x(&mut app, '3');
+        let before = app.window_ids();
+        assert_eq!(before.len(), 3);
+
+        ctrl_x(&mut app, '0');
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(app.active_window, before[1]);
+        assert_eq!(app.window_ids(), vec![before[1], before[2]]);
+        assert_eq!(app.current, app.window(app.active_window).unwrap().buffer);
+
+        let active = app.active_window;
+        let current = app.current;
+        ctrl_x(&mut app, '1');
+        assert_eq!(app.windows.len(), 1);
+        assert_eq!(app.active_window, active);
+        assert_eq!(app.current, current);
+        assert_eq!(app.window_ids(), vec![active]);
+
+        app.message = None;
+        ctrl_x(&mut app, '0');
+        assert_eq!(app.windows.len(), 1);
+        assert_eq!(app.message.as_deref(), Some("Only one window"));
+    }
+
+    #[test]
+    fn c_x_o_preserves_independent_views() {
+        let mut app = App::new(Config::default());
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        let first = app.active_window;
+
+        ctrl_x(&mut app, '2');
+        ctrl(&mut app, 'n');
+        let first_point = app.current().buffer.point();
+        assert_eq!(first_point.row, 1);
+
+        ctrl_x(&mut app, 'o');
+        assert_ne!(app.active_window, first);
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 0));
+
+        ctrl(&mut app, 'n');
+        ctrl(&mut app, 'n');
+        let second_point = app.current().buffer.point();
+        assert_eq!(second_point.row, 2);
+
+        ctrl_x(&mut app, 'o');
+        assert_eq!(app.active_window, first);
+        assert_eq!(app.current().buffer.point(), first_point);
+        ctrl_x(&mut app, 'o');
+        assert_eq!(app.current().buffer.point(), second_point);
+    }
+
+    #[test]
+    fn c_x_4_b_splits_when_needed_and_switches_the_other_window() {
+        let dir = temp_dir("other-buffer");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let dired = app.active_window;
+        let dired_buffer = app.current;
+
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'b');
+        assert!(matches!(
+            app.prompt,
+            Prompt::SwitchBuffer {
+                other_window: true,
+                ..
+            }
+        ));
+        assert!(app
+            .prompt_view()
+            .unwrap()
+            .0
+            .starts_with("Switch to buffer in other window"));
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = "*scratch*".to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.windows.len(), 2);
+        assert_ne!(app.active_window, dired);
+        assert_eq!(app.current().kind, Kind::Scratch);
+        assert_eq!(app.window(dired).unwrap().buffer, dired_buffer);
+        let other = app.window(app.active_window).unwrap();
+        assert_eq!(other.buffer, app.current);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_x_4_b_uses_the_next_window_when_already_split() {
+        let dir = temp_dir("other-existing");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        ctrl_x(&mut app, '2');
+        let first = app.active_window;
+        let other = app.next_window_id().unwrap();
+        let dired = app.current;
+
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'b');
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = "*scratch*".to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(app.active_window, other);
+        assert_eq!(app.current().kind, Kind::Scratch);
+        assert_eq!(app.window(first).unwrap().buffer, dired);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn split_windows_render_both_mode_lines() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("split-render");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, '3');
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'b');
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = "*scratch*".to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..40u16)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        let mode_line = row(10);
+        assert!(mode_line.contains("*scratch*"), "{mode_line}");
+        let reversed = (0..40u16)
+            .filter(|x| {
+                buffer[(*x, 10)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .count();
+        assert_eq!(reversed, 40, "{mode_line}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn killing_a_buffer_repairs_every_window() {
+        let dir = temp_dir("kill-window");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let dired = app.current;
+
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'b');
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = "*scratch*".to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current().kind, Kind::Scratch);
+
+        app.kill_buffer(dired);
+        assert_eq!(app.windows.len(), 2);
+        assert!(app.windows.iter().all(|w| w.buffer < app.buffers.len()));
+        assert!(!app
+            .windows
+            .iter()
+            .any(|w| app.buffers[w.buffer].name == dir.display().to_string()));
+        assert_eq!(app.current, app.window(app.active_window).unwrap().buffer);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
