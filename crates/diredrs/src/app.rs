@@ -5060,6 +5060,301 @@ mod tests {
     }
 
     #[test]
+    fn canceling_delete_before_confirmation_leaves_files_untouched() {
+        let dir = temp_dir("delete-cancel");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'd'); // flag a.txt
+        press(&mut app, 'x'); // ask
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        ctrl(&mut app, 'g');
+        assert!(matches!(app.prompt, Prompt::None));
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+
+        // With no marks, `D` offers the file at point; `no` cancels it.
+        press(&mut app, 'D');
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. } if message == "Delete b.txt (yes or no) "
+        ));
+        answer(&mut app, "no");
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("Canceled"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn header_and_parent_rows_never_offer_delete() {
+        let dir = temp_dir("delete-nonfile-rows");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        // Point starts on a.txt; move up onto the synthetic `..` row.
+        press(&mut app, 'p');
+        assert_eq!(app.current().buffer.point().row, 1);
+        press(&mut app, 'd');
+        assert_eq!(app.message.as_deref(), Some("No file on this line"));
+        press(&mut app, 'D');
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("No files marked"));
+        press(&mut app, 'x');
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("No files flagged for deletion")
+        );
+
+        // The header line is equally untouchable.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point().row, 0);
+        press(&mut app, 'D');
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("No files marked"));
+        press(&mut app, 'x');
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("No files flagged for deletion")
+        );
+
+        assert!(dir.join("a.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recursive_delete_handles_hidden_contents_and_preserves_siblings() {
+        let dir = temp_dir("delete-recursive-tree");
+        let victim = dir.join("victim");
+        std::fs::create_dir_all(victim.join("nested")).unwrap();
+        std::fs::create_dir_all(victim.join(".hidden-dir")).unwrap();
+        std::fs::write(victim.join("nested").join("deep.txt"), b"x").unwrap();
+        std::fs::write(victim.join(".hidden"), b"x").unwrap();
+        std::fs::write(victim.join(".hidden-dir").join("secret.txt"), b"x").unwrap();
+        let sibling_dir = dir.join("sibling-dir");
+        std::fs::create_dir(&sibling_dir).unwrap();
+        std::fs::write(sibling_dir.join("keep.txt"), b"x").unwrap();
+        std::fs::write(dir.join("sibling.txt"), b"x").unwrap();
+        let hidden_only = dir.join("hidden-only");
+        std::fs::create_dir(&hidden_only).unwrap();
+        std::fs::write(hidden_only.join(".secret"), b"x").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let idx = app.current;
+        app.dired_goto_name(idx, "victim");
+        press(&mut app, 'D');
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. } if message == "Delete victim (yes or no) "
+        ));
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete victim? (yes, no, all, quit) "
+        ));
+        answer(&mut app, "yes");
+
+        assert!(!victim.exists());
+        assert!(dir.join("sibling.txt").exists());
+        assert!(sibling_dir.join("keep.txt").exists());
+
+        // A directory whose only contents are hidden still needs the warning.
+        let idx = app.current;
+        app.dired_goto_name(idx, "hidden-only");
+        press(&mut app, 'D');
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete hidden-only? (yes, no, all, quit) "
+        ));
+        assert!(hidden_only.join(".secret").exists());
+        answer(&mut app, "yes");
+        assert!(!hidden_only.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recursive_no_skips_only_that_directory_and_continues() {
+        let dir = temp_dir("delete-recursive-no");
+        for name in ["aaa", "bbb"] {
+            let sub = dir.join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("nested.txt"), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        press(&mut app, 'x');
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete aaa? (yes, no, all, quit) "
+        ));
+
+        answer(&mut app, "no");
+        assert!(dir.join("aaa").join("nested.txt").exists());
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete bbb? (yes, no, all, quit) "
+        ));
+
+        answer(&mut app, "yes");
+        assert!(dir.join("aaa").join("nested.txt").exists());
+        assert!(!dir.join("bbb").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recursive_quit_keeps_prior_deletions_and_remaining_targets() {
+        let dir = temp_dir("delete-recursive-partial-quit");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        for name in ["bbb", "ccc"] {
+            let sub = dir.join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("nested.txt"), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 't'); // mark every entry
+        press(&mut app, 'D');
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete bbb? (yes, no, all, quit) "
+        ));
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete ccc? (yes, no, all, quit) "
+        ));
+        answer(&mut app, "quit");
+
+        assert!(!dir.join("a.txt").exists());
+        assert!(!dir.join("bbb").exists());
+        assert!(dir.join("ccc").join("nested.txt").exists());
+        assert!(matches!(app.prompt, Prompt::None));
+        assert_eq!(app.message.as_deref(), Some("OK, canceled"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_symlinks_removes_links_not_targets() {
+        let root = temp_dir("delete-symlinks");
+        let dired_dir = root.join("dired");
+        let target_dir = root.join("target-dir");
+        let target_file = root.join("target-file.txt");
+        std::fs::create_dir(&dired_dir).unwrap();
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::write(target_dir.join("keep.txt"), b"x").unwrap();
+        std::fs::write(&target_file, b"x").unwrap();
+
+        let file_link = dired_dir.join("file-link");
+        let dir_link = dired_dir.join("dir-link");
+        if !try_symlink(&target_file, &file_link, false)
+            || !try_symlink(&target_dir, &dir_link, true)
+        {
+            eprintln!("skipping symlink deletion test: cannot create symlinks");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dired_dir.clone());
+        press(&mut app, 't');
+        press(&mut app, 'x');
+        answer(&mut app, "yes");
+
+        assert!(matches!(app.prompt, Prompt::None));
+        assert!(!file_link.exists());
+        assert!(!dir_link.exists());
+        assert!(target_file.exists());
+        assert!(target_dir.join("keep.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recursive_delete_does_not_follow_nested_symlinks() {
+        let root = temp_dir("delete-nested-symlink");
+        let victim = root.join("victim");
+        let outside = root.join("outside");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(victim.join("ordinary.txt"), b"x").unwrap();
+        std::fs::write(outside.join("keep.txt"), b"x").unwrap();
+        if !try_symlink(&outside, &victim.join("outside-link"), true) {
+            eprintln!("skipping nested symlink test: cannot create symlinks");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let mut app = App::new(Config::default());
+        app.open_dired(root.clone());
+        let idx = app.current;
+        app.dired_goto_name(idx, "victim");
+        press(&mut app, 'D');
+        answer(&mut app, "yes");
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Confirm { message, .. }
+                if message == "Recursively delete victim? (yes, no, all, quit) "
+        ));
+        answer(&mut app, "yes");
+
+        assert!(!victim.exists());
+        assert!(outside.join("keep.txt").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_failure_is_reported_and_does_not_abort_the_batch() {
+        let dir = temp_dir("delete-failure");
+        let missing = dir.join("a-missing.txt");
+        let present = dir.join("b-present.txt");
+        std::fs::write(&missing, b"a").unwrap();
+        std::fs::write(&present, b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'd');
+        press(&mut app, 'd');
+        std::fs::remove_file(&missing).unwrap();
+        press(&mut app, 'x');
+        answer(&mut app, "yes");
+
+        assert!(!present.exists());
+        let message = app.message.as_deref().unwrap();
+        assert!(
+            message.starts_with("Deleted 1; errors: a-missing.txt:"),
+            "unexpected message: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn w_copies_marked_names() {
         let dir = temp_dir("copy");
         std::fs::write(dir.join("a.txt"), b"a").unwrap();
@@ -5087,6 +5382,41 @@ mod tests {
         for c in text.chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
+    }
+
+    fn answer(app: &mut App, text: &str) {
+        type_into_prompt(app, text);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[cfg(unix)]
+    fn try_symlink(target: &Path, link: &Path, _is_dir: bool) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("create symlink");
+        true
+    }
+
+    #[cfg(windows)]
+    fn try_symlink(target: &Path, link: &Path, is_dir: bool) -> bool {
+        let result = if is_dir {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+        match result {
+            Ok(()) => true,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(err) => panic!("cannot create symlink {}: {err}", link.display()),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn try_symlink(_target: &Path, _link: &Path, _is_dir: bool) -> bool {
+        false
     }
 
     #[test]
