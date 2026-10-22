@@ -10,7 +10,7 @@ use crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-use crate::buffer::{Buffer, Line, Pos};
+use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Line, Pos};
 use crate::config::Config;
 use crate::dired::{Dired, Mark};
 use crate::file;
@@ -1380,6 +1380,7 @@ impl App {
                 KeyCode::Char('c') if ctrl => self.should_quit = true,
                 KeyCode::Char('b') => self.start_switch_buffer(),
                 KeyCode::Char('k') => self.start_kill_buffer(),
+                KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
                 KeyCode::Char('f') if ctrl => self.start_find_file(false),
                 KeyCode::Char('d') => self.start_find_file(true),
                 KeyCode::Char('g') if ctrl => {}
@@ -1655,6 +1656,38 @@ impl App {
         }
     }
 
+    fn prompt_transpose_chars(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                let mut chars: Vec<char> = input.chars().collect();
+                if let Some(new_cursor) = transpose_chars_at(&mut chars, *cursor) {
+                    *input = chars.into_iter().collect();
+                    *cursor = new_cursor;
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
+    fn prompt_transpose_words(&mut self) {
+        if self
+            .prompt_edit(|input, cursor| {
+                let mut chars: Vec<char> = input.chars().collect();
+                if let Some(new_cursor) = transpose_words_at(&mut chars, *cursor) {
+                    *input = chars.into_iter().collect();
+                    *cursor = new_cursor;
+                }
+            })
+            .is_some()
+        {
+            self.prompt_reset_selection();
+            self.last_command = LastCommand::Other;
+        }
+    }
+
     fn prompt_move_cursor(&mut self, delta: isize) {
         self.prompt_edit(|input, cursor| {
             let len = input.chars().count();
@@ -1812,6 +1845,8 @@ impl App {
             ForwardChar => self.prompt_move_cursor(1),
             BeginningOfLine => self.prompt_cursor_start(),
             EndOfLine => self.prompt_cursor_end(),
+            TransposeChars => self.prompt_transpose_chars(),
+            TransposeWords => self.prompt_transpose_words(),
             KillLine => self.prompt_kill_line(),
             Yank => self.prompt_yank(),
             PrevLine => self.prompt_move(count, -1),
@@ -2121,6 +2156,8 @@ impl App {
             BackwardWord => self.move_words(-n),
             UpcaseWord => self.case_words(n, true),
             DowncaseWord => self.case_words(n, false),
+            TransposeChars => self.current_mut().buffer.transpose_chars(),
+            TransposeWords => self.current_mut().buffer.transpose_words(),
             DabbrevExpand => self.dabbrev_expand(),
             BeginningOfBuffer => self.current_mut().buffer.beginning_of_buffer(),
             EndOfBuffer => self.current_mut().buffer.end_of_buffer(),
@@ -2205,7 +2242,11 @@ impl App {
     fn move_lines(&mut self, n: i32) {
         for _ in 0..n.abs() {
             if n >= 0 {
+                let at_last = self.current().buffer.point().row == self.current().buffer.last_row();
                 self.current_mut().buffer.next_line();
+                if at_last {
+                    self.message = Some("End of buffer".to_string());
+                }
             } else {
                 self.current_mut().buffer.prev_line();
             }
@@ -2324,6 +2365,13 @@ impl App {
             let mut out = std::io::stdout();
             let _ = std::io::Write::write_all(&mut out, sequence.as_bytes());
             let _ = std::io::Write::flush(&mut out);
+        }
+    }
+
+    /// `C-x C-x`: swap point and mark.
+    fn exchange_point_and_mark(&mut self) {
+        if !self.current_mut().buffer.exchange_point_and_mark() {
+            self.message = Some("No mark set in this buffer".to_string());
         }
     }
 
@@ -2677,6 +2725,7 @@ fn help_lines() -> Vec<String> {
         "  RET            insert a newline",
         "  C-o            insert a newline, leaving point before it",
         "  M-u / M-l      upcase / downcase word",
+        "  C-t / M-t      transpose characters / words",
         "  M-/            dabbrev-expand",
         "  C-k            kill to end of line",
         "  M-Backspace    kill word backward",
@@ -2715,6 +2764,7 @@ fn help_lines() -> Vec<String> {
         "  C-x d          open a directory in Dired",
         "  C-x b          switch buffer",
         "  C-x k          kill buffer",
+        "  C-x C-x        exchange point and mark",
         "  C-x C-c        quit",
         "",
         "Help",
@@ -3599,5 +3649,70 @@ mod tests {
         app.current_mut().buffer.beginning_of_buffer();
         app.handle_paste("hello".to_string());
         assert!(app.current().buffer.line(0).text().contains("hello"));
+    }
+
+    #[test]
+    fn transpose_bindings_edit_the_buffer() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("teh")]);
+        app.current_mut().buffer.end_of_line();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.line(0).text(), "the");
+
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("hello world")]);
+        app.current_mut().buffer.end_of_line();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(app.current().buffer.line(0).text(), "world hello");
+    }
+
+    #[test]
+    fn c_x_c_x_exchanges_point_and_mark() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("hello world")]);
+        app.current_mut().buffer.set_point(Pos::new(0, 6));
+        app.current_mut().buffer.set_mark();
+        app.current_mut().buffer.set_point(Pos::new(0, 11));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 6));
+        assert_eq!(app.current().buffer.region_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn c_x_c_x_without_mark_reports_it() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(app.message.as_deref(), Some("No mark set in this buffer"));
+    }
+
+    #[test]
+    fn c_n_on_last_line_reports_end_of_buffer() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("hello")]);
+        app.current_mut().buffer.beginning_of_line();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 5));
+        assert_eq!(app.message.as_deref(), Some("End of buffer"));
     }
 }

@@ -21,6 +21,8 @@ pub enum Action {
     BackwardWord,
     UpcaseWord,
     DowncaseWord,
+    TransposeChars,
+    TransposeWords,
     DabbrevExpand,
     BeginningOfBuffer,
     EndOfBuffer,
@@ -69,6 +71,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'y' => Yank,
             'g' => Abort,
             'q' => QuotedInsert,
+            't' => TransposeChars,
             ' ' => SetMark,
             _ => None,
         },
@@ -77,6 +80,7 @@ pub fn translate(key: KeyEvent) -> Action {
             'b' | 'B' => BackwardWord,
             'u' | 'U' => UpcaseWord,
             'l' | 'L' => DowncaseWord,
+            't' | 'T' => TransposeWords,
             'd' | 'D' => KillWord,
             '/' => DabbrevExpand,
             'v' | 'V' => PageUp,
@@ -197,6 +201,18 @@ mod tests {
         assert_eq!(
             translate(key(KeyCode::Char('<'), KeyModifiers::ALT)),
             Action::BeginningOfBuffer
+        );
+    }
+
+    #[test]
+    fn transpose_bindings() {
+        assert_eq!(
+            translate(key(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Action::TransposeChars
+        );
+        assert_eq!(
+            translate(key(KeyCode::Char('t'), KeyModifiers::ALT)),
+            Action::TransposeWords
         );
     }
 

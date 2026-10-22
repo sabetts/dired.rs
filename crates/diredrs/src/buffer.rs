@@ -404,6 +404,16 @@ impl Buffer {
         self.mark = None;
     }
 
+    /// Swap point and mark. Returns `false` when no mark is set.
+    pub fn exchange_point_and_mark(&mut self) -> bool {
+        let Some(mark) = self.mark else {
+            return false;
+        };
+        self.mark = Some(self.point);
+        self.set_point(mark);
+        true
+    }
+
     pub fn region(&self) -> Option<(Pos, Pos)> {
         self.mark.map(|m| {
             if m <= self.point {
@@ -466,6 +476,8 @@ impl Buffer {
         if self.point.row < self.last_row() {
             self.point.row += 1;
             self.point.col = self.clamp_col(self.point.row, self.point.col);
+        } else {
+            self.point.col = self.lines[self.point.row].char_len();
         }
         self.scroll_into_view();
     }
@@ -636,13 +648,16 @@ impl Buffer {
         self.backward_case_word(|word| word.iter().flat_map(|c| c.to_lowercase()).collect());
     }
 
+    /// Transform the word before point with `transform`, leaving point in
+    /// place (like Emacs with a negative argument).
     fn backward_case_word(&mut self, transform: impl Fn(&[char]) -> String) {
         if !self.editable() {
             return;
         }
         let row = self.point.row;
+        let point = self.point.col;
         let chars = self.lines[row].chars();
-        let end = self.point.col.min(chars.len());
+        let end = point.min(chars.len());
         let mut i = end;
         while i > 0 && !is_word(chars[i - 1]) {
             i -= 1;
@@ -652,15 +667,44 @@ impl Buffer {
         }
         let start = i;
         if start == end {
-            self.point.col = start;
             return;
         }
         let changed = transform(&chars[start..end]);
+        let new_len = changed.chars().count();
+        let delta = new_len as isize - (end - start) as isize;
         let mut out: Vec<char> = chars[..start].to_vec();
         out.extend(changed.chars());
         out.extend_from_slice(&chars[end..]);
         self.lines[row] = Line::plain(out.into_iter().collect::<String>());
-        self.point.col = start;
+        self.point.col = (point as isize + delta).max(0) as usize;
+        self.scroll_into_view();
+    }
+
+    /// Transpose the characters around point (`transpose-chars`, `C-t`).
+    pub fn transpose_chars(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        let row = self.point.row;
+        let mut chars = self.lines[row].chars();
+        if let Some(new_point) = transpose_chars_at(&mut chars, self.point.col) {
+            self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+            self.point.col = new_point;
+        }
+        self.scroll_into_view();
+    }
+
+    /// Transpose the words around point (`transpose-words`, `M-t`).
+    pub fn transpose_words(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        let row = self.point.row;
+        let mut chars = self.lines[row].chars();
+        if let Some(new_point) = transpose_words_at(&mut chars, self.point.col) {
+            self.lines[row] = Line::plain(chars.into_iter().collect::<String>());
+            self.point.col = new_point;
+        }
         self.scroll_into_view();
     }
 
@@ -990,6 +1034,74 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Transpose the two characters around `point`, returning the new point.
+/// At the end of the text this swaps the last two characters; at the start it
+/// swaps the first two.
+pub(crate) fn transpose_chars_at(chars: &mut [char], point: usize) -> Option<usize> {
+    let len = chars.len();
+    if len < 2 {
+        return None;
+    }
+    let point = point.min(len);
+    let (a, b, new_point) = if point >= len {
+        (len - 2, len - 1, len)
+    } else if point == 0 {
+        (0, 1, 2)
+    } else {
+        (point - 1, point, point + 1)
+    };
+    chars.swap(a, b);
+    Some(new_point)
+}
+
+/// Character ranges covered by words in `chars`.
+fn word_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if is_word(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            ranges.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Transpose the words around `point`, returning the new point. At the end of
+/// the text this swaps the last two words.
+pub(crate) fn transpose_words_at(chars: &mut Vec<char>, point: usize) -> Option<usize> {
+    let len = chars.len();
+    let ranges = word_ranges(chars);
+    if ranges.len() < 2 {
+        return None;
+    }
+    let (before, after) = if point >= len {
+        (ranges.len() - 2, ranges.len() - 1)
+    } else {
+        let before = ranges.iter().rposition(|&(start, _)| start < point)?;
+        let after = ranges.iter().position(|&(_, end)| end > point)?;
+        if before >= after {
+            return None;
+        }
+        (before, after)
+    };
+    let (start1, end1) = ranges[before];
+    let (start2, end2) = ranges[after];
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&chars[..start1]);
+    out.extend_from_slice(&chars[start2..end2]);
+    out.extend_from_slice(&chars[end1..start2]);
+    out.extend_from_slice(&chars[start1..end1]);
+    out.extend_from_slice(&chars[end2..]);
+    *chars = out;
+    Some(if point >= len { len } else { end2 })
+}
+
 /// Split `text` into runs of word characters.
 fn words_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1216,6 +1328,80 @@ mod tests {
         b.beginning_of_line();
         b.downcase_word();
         assert_eq!(b.line_text(0), "hello world");
+    }
+
+    #[test]
+    fn transpose_chars_at_point() {
+        let mut b = Buffer::new();
+        b.insert_str("teh");
+        b.transpose_chars();
+        assert_eq!(b.line_text(0), "the");
+        assert_eq!(b.point().col, 3);
+
+        b.set_content(vec![Line::plain("abcd")]);
+        b.set_point(Pos::new(0, 2));
+        b.transpose_chars();
+        assert_eq!(b.line_text(0), "acbd");
+        assert_eq!(b.point().col, 3);
+
+        b.set_content(vec![Line::plain("ab")]);
+        b.beginning_of_line();
+        b.transpose_chars();
+        assert_eq!(b.line_text(0), "ba");
+        assert_eq!(b.point().col, 2);
+    }
+
+    #[test]
+    fn transpose_words_at_point() {
+        let mut b = Buffer::new();
+        b.insert_str("hello world");
+        b.transpose_words();
+        assert_eq!(b.line_text(0), "world hello");
+        assert_eq!(b.point().col, 11);
+
+        b.set_content(vec![Line::plain("one two three")]);
+        b.set_point(Pos::new(0, 3));
+        b.transpose_words();
+        assert_eq!(b.line_text(0), "two one three");
+        assert_eq!(b.point().col, 7);
+    }
+
+    #[test]
+    fn backward_upcase_word_keeps_point() {
+        let mut b = Buffer::new();
+        b.insert_str("hello world");
+        b.backward_upcase_word();
+        assert_eq!(b.line_text(0), "hello WORLD");
+        assert_eq!(b.point().col, 11);
+    }
+
+    #[test]
+    fn exchange_point_and_mark_swaps_ends() {
+        let mut b = Buffer::new();
+        b.insert_str("hello world");
+        b.set_point(Pos::new(0, 6));
+        b.set_mark();
+        b.set_point(Pos::new(0, 11));
+        assert!(b.exchange_point_and_mark());
+        assert_eq!(b.point(), Pos::new(0, 6));
+        assert_eq!(b.region_text().as_deref(), Some("world"));
+        assert!(b.exchange_point_and_mark());
+        assert_eq!(b.point(), Pos::new(0, 11));
+    }
+
+    #[test]
+    fn exchange_without_mark_fails() {
+        let mut b = Buffer::new();
+        assert!(!b.exchange_point_and_mark());
+    }
+
+    #[test]
+    fn next_line_at_end_moves_to_line_end() {
+        let mut b = Buffer::new();
+        b.insert_str("abc");
+        b.beginning_of_buffer();
+        b.next_line();
+        assert_eq!(b.point(), Pos::new(0, 3));
     }
 
     #[test]
