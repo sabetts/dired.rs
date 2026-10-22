@@ -3881,12 +3881,12 @@ fn is_backup_file(name: &str) -> bool {
 
 /// Whether a `yes-or-no-p` answer means "yes".
 fn answer_is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "yes" | "y")
+    answer.trim().eq_ignore_ascii_case("yes")
 }
 
 /// Whether a `yes-or-no-p` answer means "no".
 fn answer_is_no(answer: &str) -> bool {
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "no" | "n")
+    answer.trim().eq_ignore_ascii_case("no")
 }
 
 /// An answer to the recursive-delete `read-answer` question.
@@ -4972,12 +4972,16 @@ mod tests {
         press(&mut app, 'd'); // flag a.txt
         press(&mut app, 'x'); // ask
 
-        // A bare `y` is just text in the prompt; nothing is deleted yet.
+        // A bare `y` is not an accepted answer, so RET re-asks.
         press(&mut app, 'y');
         assert!(dir.join("a.txt").exists());
         assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(dir.join("a.txt").exists());
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
 
-        // RET confirms the answer.
+        // The full word confirms the answer.
+        type_into_prompt(&mut app, "yes");
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!dir.join("a.txt").exists());
 
