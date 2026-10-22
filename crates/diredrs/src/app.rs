@@ -3746,6 +3746,52 @@ mod tests {
     }
 
     #[test]
+    fn d_and_x_delete_only_their_own_marks() {
+        let dir = temp_dir("mixed-marks");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        std::fs::write(dir.join("c.txt"), b"c").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'm'); // * a.txt
+        press(&mut app, 'd'); // D b.txt
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // `D` removed only the `*` mark; the flagged file remains flagged.
+        assert!(!dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+        assert!(dir.join("c.txt").exists());
+        let marks: Vec<(String, Mark)> = app
+            .current()
+            .dired
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| (e.name.clone(), e.mark))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                ("b.txt".to_string(), Mark::Flagged),
+                ("c.txt".to_string(), Mark::None)
+            ]
+        );
+
+        // `x` then removes only the flagged file.
+        press(&mut app, 'x');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!dir.join("b.txt").exists());
+        assert!(dir.join("c.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn d_without_marks_deletes_the_file_at_point() {
         let dir = temp_dir("delete-current");
         std::fs::write(dir.join("a.txt"), b"a").unwrap();
