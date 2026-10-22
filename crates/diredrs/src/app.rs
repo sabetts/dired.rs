@@ -77,12 +77,14 @@ pub enum Prompt {
         /// the typed `input` is used as-is (the default).
         selected: Option<usize>,
     },
-    /// Read a new name for the marked files, or the file at point (`R`).
+    /// Read a destination for the marked files, or the file at point (`R`
+    /// renames/moves; `C` copies when `copy` is true).
     Rename {
         input: String,
         cursor: usize,
         /// Highlighted completion candidate (a path), moved with Up/Down.
         selected: Option<usize>,
+        copy: bool,
     },
     /// Read a file extension; every file ending in it is marked (`* .`).
     MarkExtension {
@@ -849,7 +851,17 @@ impl App {
 
     /// Prompt for a new name for the marked files, or the file at point (`R`).
     fn start_rename(&mut self) {
-        // Offer the file's own name for a single-file rename; require a
+        self.start_transfer(false);
+    }
+
+    /// Prompt for a destination for the marked files, or the file at point
+    /// (`C`, `dired-do-copy`).
+    fn start_copy(&mut self) {
+        self.start_transfer(true);
+    }
+
+    fn start_transfer(&mut self, copy: bool) {
+        // Offer the file's own name for a single-file rename/copy; require a
         // directory when several files are marked.
         let marked = self.dired_paths(Mark::Marked);
         let input = if marked.is_empty() {
@@ -870,6 +882,7 @@ impl App {
             cursor: input.chars().count(),
             input,
             selected: None,
+            copy,
         };
     }
 
@@ -942,6 +955,77 @@ impl App {
             }
         } else {
             format!("Renamed {} file(s); {errors} failed", renamed.len())
+        });
+    }
+
+    /// Copy the marked files (or the file at point) to `target` (`C`,
+    /// `dired-do-copy`).
+    fn commit_copy(&mut self, target: &str) {
+        let target = target.trim();
+        let marked = self.dired_paths(Mark::Marked);
+        let sources: Vec<PathBuf> = if !marked.is_empty() {
+            marked
+        } else if let Some(i) = self.dired_entry_at_point() {
+            vec![self.current().dired.as_ref().unwrap().entries[i]
+                .path
+                .clone()]
+        } else {
+            self.message = Some("No file on this line".to_string());
+            return;
+        };
+        if target.is_empty() {
+            self.message = Some("No target name given".to_string());
+            return;
+        }
+        let dest = self.expand_path(target);
+        // A single file is copied to `dest`; several files (or an existing
+        // directory) are copied into `dest` as a directory.
+        let into_dir = sources.len() > 1 || dest.is_dir();
+        if sources.len() > 1 && !dest.is_dir() {
+            self.message = Some(format!("Not a directory: {}", dest.display()));
+            return;
+        }
+
+        let mut copied: Vec<PathBuf> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for src in &sources {
+            let to = if into_dir {
+                match src.file_name() {
+                    Some(name) => dest.join(name),
+                    None => {
+                        errors.push(format!("{} has no file name", src.display()));
+                        continue;
+                    }
+                }
+            } else {
+                dest.clone()
+            };
+            if to.exists() {
+                errors.push(format!("{} already exists", to.display()));
+                continue;
+            }
+            match copy_path(src, &to) {
+                Ok(()) => copied.push(to),
+                Err(err) => errors.push(format!("{}: {err}", src.display())),
+            }
+        }
+        self.dired_revert();
+        // Keep point on a copy that landed in this directory.
+        let idx = self.current;
+        if let Some(dir) = self.buffers[idx].dired.as_ref().map(|d| d.dir.clone()) {
+            if let Some(name) = copied.iter().find_map(|new| {
+                (new.parent() == Some(dir.as_path()))
+                    .then(|| new.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .flatten()
+            }) {
+                self.dired_goto_name(idx, &name);
+            }
+        }
+        self.message = Some(match (copied.as_slice(), errors.is_empty()) {
+            ([new], true) => format!("Copied to {}", new.display()),
+            (_, true) => format!("Copied {} file(s)", copied.len()),
+            ([], false) => format!("Copy failed: {}", errors.join("; ")),
+            (_, false) => format!("Copied {} file(s); {} failed", copied.len(), errors.len()),
         });
     }
 
@@ -1116,6 +1200,10 @@ impl App {
             }
             KeyCode::Char('R') => {
                 self.start_rename();
+                true
+            }
+            KeyCode::Char('C') => {
+                self.start_copy();
                 true
             }
             KeyCode::Char('*') => {
@@ -1883,6 +1971,7 @@ impl App {
                 input,
                 cursor,
                 selected,
+                ..
             }
             | Prompt::CreateDirectory {
                 input,
@@ -2017,14 +2106,21 @@ impl App {
                 self.history.push(&chosen);
             }
             Prompt::Rename {
-                input, selected, ..
+                input,
+                selected,
+                copy,
+                ..
             } => {
                 let candidates = self.file_candidates(&input, false);
                 let chosen = match selected {
                     Some(i) => candidates.get(i).cloned().unwrap_or(input),
                     None => input,
                 };
-                self.commit_rename(&chosen);
+                if copy {
+                    self.commit_copy(&chosen);
+                } else {
+                    self.commit_rename(&chosen);
+                }
             }
             Prompt::CreateDirectory {
                 input, selected, ..
@@ -2126,8 +2222,9 @@ impl App {
                 input,
                 cursor,
                 selected,
+                copy,
             } => {
-                let prefix = "Rename to: ";
+                let prefix = if *copy { "Copy to: " } else { "Rename to: " };
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
@@ -2685,6 +2782,66 @@ impl App {
     }
 }
 
+/// Copy a file or directory tree, preserving symlinks as links. The caller
+/// checks that the destination does not already exist.
+fn copy_path(src: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        return copy_symlink(src, to);
+    }
+    if meta.is_dir() {
+        if destination_inside_source(src, to) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot copy a directory into itself",
+            ));
+        }
+        fs::create_dir(to)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_path(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(src, to)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(src: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(src)?, to)
+}
+
+#[cfg(windows)]
+fn copy_symlink(src: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let target = fs::read_link(src)?;
+    if fs::metadata(src)?.is_dir() {
+        std::os::windows::fs::symlink_dir(target, to)
+    } else {
+        std::os::windows::fs::symlink_file(target, to)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(src: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    fs::copy(src, to).map(|_| ())
+}
+
+/// Whether `to` would land inside the directory `src`.
+fn destination_inside_source(src: &std::path::Path, to: &std::path::Path) -> bool {
+    fn normalize(path: &std::path::Path) -> PathBuf {
+        if let Ok(canonical) = fs::canonicalize(path) {
+            return canonical;
+        }
+        if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+            let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            return parent.join(name);
+        }
+        path.to_path_buf()
+    }
+    normalize(to).starts_with(normalize(src))
+}
+
 /// Delete each path (recursively for directories), returning a summary. A
 /// symlink is removed as a link, never followed.
 fn delete_paths(paths: Vec<PathBuf>) -> String {
@@ -2917,6 +3074,7 @@ fn help_lines() -> Vec<String> {
         "  x                   delete flagged files",
         "  D                   delete marked files",
         "  R                   rename / move file(s)",
+        "  C                   copy file(s)",
         "  t / U               toggle / remove all marks",
         "  * !                 unmark all files",
         "  * .                 mark files by extension",
@@ -3668,6 +3826,139 @@ mod tests {
             "new.txt"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_copies_the_file_at_point() {
+        let dir = temp_dir("copy-file");
+        std::fs::write(dir.join("aaa.txt"), b"x").unwrap();
+        std::fs::write(dir.join("old.txt"), b"hello").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'n'); // move to old.txt
+        press(&mut app, 'C');
+        if let Prompt::Rename {
+            input,
+            cursor,
+            copy,
+            ..
+        } = &mut app.prompt
+        {
+            assert!(*copy);
+            assert_eq!(input, "old.txt");
+            *input = "copy.txt".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The original remains and the copy has the same contents.
+        assert_eq!(std::fs::read(dir.join("old.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dir.join("copy.txt")).unwrap(), b"hello");
+        let d = app.current().dired.as_ref().unwrap();
+        assert!(d.entries.iter().any(|e| e.name == "copy.txt"));
+        let i = app.dired_entry_at_point().unwrap();
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[i].name,
+            "copy.txt"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_copies_marked_files_into_a_directory() {
+        let dir = temp_dir("copy-marked");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'm'); // a.txt
+        press(&mut app, 'm'); // b.txt
+        press(&mut app, 'C');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            assert!(input.is_empty());
+            *input = target.display().to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"b");
+        // The originals stay in place.
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_refuses_to_overwrite_an_existing_file() {
+        let dir = temp_dir("copy-exists");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'C');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            *input = "b.txt".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"b");
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already exists"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_copies_a_directory_recursively() {
+        let dir = temp_dir("copy-dir");
+        let src = dir.join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("inner.txt"), b"inner").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'C');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            *input = "src-copy".to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            std::fs::read(dir.join("src-copy").join("inner.txt")).unwrap(),
+            b"inner"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn copying_a_directory_into_itself_is_refused() {
+        let dir = temp_dir("copy-into-self");
+        let src = dir.join("src");
+        std::fs::create_dir(&src).unwrap();
+        assert!(copy_path(&src, &src.join("nested")).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
