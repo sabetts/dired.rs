@@ -2192,11 +2192,23 @@ impl App {
         if candidates.is_empty() {
             return;
         }
-        let completion = if candidates.len() == 1 {
-            candidates[0].clone()
-        } else {
-            common_prefix(&candidates)
+        // A highlighted completion wins over the common prefix, so Tab can
+        // accept the directory picked from the candidate list.
+        let selected = match &self.prompt {
+            Prompt::FindFile { selected, .. }
+            | Prompt::Rename { selected, .. }
+            | Prompt::CreateDirectory { selected, .. } => *selected,
+            _ => None,
         };
+        let completion = selected
+            .and_then(|i| candidates.get(i).cloned())
+            .unwrap_or_else(|| {
+                if candidates.len() == 1 {
+                    candidates[0].clone()
+                } else {
+                    common_prefix(&candidates)
+                }
+            });
         match &mut self.prompt {
             Prompt::SwitchBuffer {
                 input,
@@ -4592,6 +4604,81 @@ mod tests {
         start_find_prompt(&mut app, "HELLO world");
         alt(&mut app, 'l');
         assert_eq!(prompt_text(&app), ("hello world".to_string(), 5));
+    }
+
+    #[test]
+    fn prompt_tab_accepts_the_selected_directory() {
+        let dir = temp_dir("prompt-tab");
+        std::fs::create_dir(dir.join("alpha")).unwrap();
+        std::fs::create_dir(dir.join("beta")).unwrap();
+        let input = directory_input(&dir);
+        let expected = directory_input(&dir.join("beta"));
+        let mut app = App::new(Config::default());
+
+        app.prompt = Prompt::FindFile {
+            input: input.clone(),
+            cursor: input.chars().count(),
+            dired: true,
+            selected: Some(1),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            prompt_text(&app),
+            (expected.clone(), expected.chars().count())
+        );
+        assert!(matches!(
+            app.prompt,
+            Prompt::FindFile { selected: None, .. }
+        ));
+
+        app.prompt = Prompt::Rename {
+            input: input.clone(),
+            cursor: input.chars().count(),
+            selected: Some(1),
+            copy: true,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            &app.prompt,
+            Prompt::Rename {
+                input,
+                cursor,
+                selected: None,
+                ..
+            } if *input == expected && *cursor == expected.chars().count()
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_tab_completion_keeps_the_prompt_open_for_refinement() {
+        let dir = temp_dir("prompt-tab-refine");
+        let alpha = dir.join("alpha");
+        std::fs::create_dir(&alpha).unwrap();
+        std::fs::create_dir(alpha.join("inner")).unwrap();
+        std::fs::create_dir(dir.join("beta")).unwrap();
+        let input = directory_input(&dir);
+        let mut app = App::new(Config::default());
+
+        app.prompt = Prompt::FindFile {
+            input,
+            cursor: directory_input(&dir).chars().count(),
+            dired: true,
+            selected: Some(0),
+        };
+        // Tab completes the highlighted directory but does not submit it.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(prompt_text(&app).0, directory_input(&alpha));
+        assert!(matches!(app.prompt, Prompt::FindFile { .. }));
+
+        // The candidate list now shows alpha's children; pick and complete one.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(prompt_text(&app).0, directory_input(&alpha.join("inner")));
+        assert!(matches!(app.prompt, Prompt::FindFile { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
