@@ -1158,10 +1158,8 @@ impl App {
     fn next_event(&mut self) -> Result<Option<TermEvent>> {
         if let Some((_, deadline)) = &self.prefix_echo {
             let now = Instant::now();
-            if *deadline > now {
-                if event::poll(*deadline - now)? {
-                    return Ok(Some(event::read()?));
-                }
+            if *deadline > now && event::poll(*deadline - now)? {
+                return Ok(Some(event::read()?));
             }
             self.echo_pending_prefix(Instant::now());
             return Ok(None);
