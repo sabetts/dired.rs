@@ -228,9 +228,6 @@ pub struct App {
     pub(crate) active_window: WindowId,
     pub(crate) window_tree: WindowTree,
     next_window_id: WindowId,
-    /// Incremented whenever the layout or displayed buffers change, forcing a
-    /// clean repaint.
-    layout_version: u64,
     /// Monotonic counter for the most recent buffer visit, for list ordering.
     visit_seq: u64,
     pub history: History,
@@ -268,8 +265,6 @@ pub struct App {
     /// While set, key events are treated as part of an in-progress paste (a
     /// Windows paste delivered as individual keys; see `handle_term_event`).
     pasting_until: Option<Instant>,
-    /// The layout version last drawn, so changes force a full repaint.
-    drawn: Option<u64>,
     /// Whether Dired shows sizes human-readably (`ls -h`); `ui.human_sizes`.
     human_sizes: bool,
     /// Rows of padding kept above/below point before scrolling.
@@ -294,7 +289,6 @@ impl App {
             active_window: 0,
             window_tree: WindowTree::Leaf(0),
             next_window_id: 1,
-            layout_version: 0,
             visit_seq: 0,
             history: History::default(),
             search: Search::default(),
@@ -318,7 +312,6 @@ impl App {
             dabbrev: None,
             clipboard: true,
             pasting_until: None,
-            drawn: None,
             human_sizes,
             scroll_margin,
         };
@@ -430,10 +423,6 @@ impl App {
         }
     }
 
-    fn touch_layout(&mut self) {
-        self.layout_version = self.layout_version.wrapping_add(1);
-    }
-
     fn note_buffer_visit(&mut self, idx: usize) {
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
@@ -479,7 +468,6 @@ impl App {
         let buf = &mut self.buffers[idx].buffer;
         buf.set_width(cols);
         buf.ensure_point_visible(height, margin);
-        self.touch_layout();
     }
 
     fn select_window(&mut self, id: WindowId) {
@@ -501,7 +489,6 @@ impl App {
         self.current = buffer;
         restore_view(&mut self.buffers[buffer].buffer, view);
         self.note_buffer_visit(buffer);
-        self.touch_layout();
     }
 
     fn split_active_window(&mut self, axis: SplitAxis) {
@@ -524,9 +511,7 @@ impl App {
         });
         if !split_leaf(&mut self.window_tree, old, axis, new_id) {
             self.windows.pop();
-            return;
         }
-        self.touch_layout();
     }
 
     fn delete_active_window(&mut self) {
@@ -552,7 +537,6 @@ impl App {
         self.current = buffer;
         restore_view(&mut self.buffers[buffer].buffer, view);
         self.note_buffer_visit(buffer);
-        self.touch_layout();
     }
 
     fn delete_other_windows(&mut self) {
@@ -564,7 +548,6 @@ impl App {
         self.save_active_view();
         self.windows.retain(|w| w.id == active);
         self.window_tree = WindowTree::Leaf(active);
-        self.touch_layout();
     }
 
     fn other_window(&mut self) {
@@ -658,7 +641,6 @@ impl App {
                 window.view = fallback_view;
             }
         }
-        self.touch_layout();
     }
 
     // ---- dired -------------------------------------------------------------
@@ -1544,13 +1526,6 @@ impl App {
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
-            // A buffer switch or layout change replaces the whole view;
-            // repaint from scratch so the previous cells can't desync the
-            // diff-based redraw.
-            if self.drawn != Some(self.layout_version) {
-                terminal.clear()?;
-                self.drawn = Some(self.layout_version);
-            }
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
                 break;
