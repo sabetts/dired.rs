@@ -861,19 +861,27 @@ impl App {
     }
 
     fn start_transfer(&mut self, copy: bool) {
-        // Offer the file's own name for a single-file rename/copy; require a
-        // directory when several files are marked.
+        // Dired offers the current directory (plus the file's own name for a
+        // single file); with several files marked it prompts for a directory.
         let marked = self.dired_paths(Mark::Marked);
-        let input = if marked.is_empty() {
-            self.dired_entry_at_point()
-                .and_then(|i| {
-                    self.current().dired.as_ref().and_then(|d| {
-                        d.entries[i]
-                            .path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                    })
-                })
+        let dir = self.default_directory();
+        let single = self.dired_entry_at_point().and_then(|i| {
+            self.current()
+                .dired
+                .as_ref()
+                .map(|d| d.entries[i].path.clone())
+        });
+        let input = if copy {
+            if marked.is_empty() {
+                single
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| directory_input(&dir))
+            } else {
+                directory_input(&dir)
+            }
+        } else if marked.is_empty() {
+            single
+                .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -978,6 +986,14 @@ impl App {
             return;
         }
         let dest = self.expand_path(target);
+        // A target written as a directory must already exist.
+        if target.ends_with(['/', '\\']) && !dest.is_dir() {
+            self.message = Some(format!(
+                "Target directory does not exist: {}",
+                dest.display()
+            ));
+            return;
+        }
         // A single file is copied to `dest`; several files (or an existing
         // directory) are copied into `dest` as a directory.
         let into_dir = sources.len() > 1 || dest.is_dir();
@@ -2897,6 +2913,15 @@ fn answer_is_no(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "no" | "n")
 }
 
+/// A directory name as minibuffer input, with a trailing separator.
+fn directory_input(dir: &std::path::Path) -> String {
+    let mut input = dir.display().to_string();
+    if !input.ends_with(std::path::MAIN_SEPARATOR) {
+        input.push(std::path::MAIN_SEPARATOR);
+    }
+    input
+}
+
 fn home_dir() -> Option<PathBuf> {
     if let Some(dirs) = directories::UserDirs::new() {
         return Some(dirs.home_dir().to_path_buf());
@@ -3847,7 +3872,7 @@ mod tests {
         } = &mut app.prompt
         {
             assert!(*copy);
-            assert_eq!(input, "old.txt");
+            assert_eq!(*input, dir.join("old.txt").display().to_string());
             *input = "copy.txt".to_string();
             *cursor = input.chars().count();
         } else {
@@ -3883,7 +3908,7 @@ mod tests {
         press(&mut app, 'm'); // b.txt
         press(&mut app, 'C');
         if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
-            assert!(input.is_empty());
+            assert_eq!(*input, directory_input(&dir));
             *input = target.display().to_string();
             *cursor = input.chars().count();
         } else {
@@ -3896,6 +3921,30 @@ mod tests {
         // The originals stay in place.
         assert!(dir.join("a.txt").exists());
         assert!(dir.join("b.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_copies_a_single_file_into_a_chosen_directory() {
+        let dir = temp_dir("copy-single-dir");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'C');
+        if let Prompt::Rename { input, cursor, .. } = &mut app.prompt {
+            *input = target.display().to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the copy prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
+        assert!(dir.join("a.txt").exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
