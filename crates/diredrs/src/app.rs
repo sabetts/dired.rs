@@ -164,6 +164,10 @@ const PASTE_LATCH: Duration = Duration::from_millis(50);
 /// Emacs's `echo-keystrokes` (default one second).
 const PREFIX_ECHO_DELAY: Duration = Duration::from_secs(1);
 
+/// How long to show the other end of a copied region, like Emacs's
+/// `indicate-copied-region`.
+const COPY_FLASH: Duration = Duration::from_millis(220);
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -192,6 +196,8 @@ pub struct App {
     /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
     /// Emacs's `echo-keystrokes` does.
     prefix_echo: Option<(String, Instant)>,
+    /// Pending `M-w` indication: (position to restore, deadline).
+    copy_flash: Option<(Pos, Instant)>,
     numeric_arg: Option<ArgState>,
     quoted: bool,
     last_command: LastCommand,
@@ -236,6 +242,7 @@ impl App {
             minibuffer_rows: 1,
             prefix: Prefix::None,
             prefix_echo: None,
+            copy_flash: None,
             numeric_arg: None,
             quoted: false,
             last_command: LastCommand::Other,
@@ -1153,15 +1160,34 @@ impl App {
         Ok(())
     }
 
-    /// Wait for the next terminal event, or echo a pending prefix hint once its
-    /// delay has elapsed. Returns `None` when a hint was echoed instead.
+    /// Wait for the next terminal event, or handle a due prefix hint / `M-w`
+    /// indication once its delay has elapsed. Returns `None` when a timer fired
+    /// instead of an event arriving.
     fn next_event(&mut self) -> Result<Option<TermEvent>> {
-        if let Some((_, deadline)) = &self.prefix_echo {
+        let prefix_deadline = self.prefix_echo.as_ref().map(|(_, deadline)| *deadline);
+        let flash_deadline = self.copy_flash.as_ref().map(|(_, deadline)| *deadline);
+        let deadline = match (prefix_deadline, flash_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(deadline) = deadline {
             let now = Instant::now();
-            if *deadline > now && event::poll(*deadline - now)? {
+            if deadline > now && event::poll(deadline - now)? {
                 return Ok(Some(event::read()?));
             }
-            self.echo_pending_prefix(Instant::now());
+            let now = Instant::now();
+            if self
+                .copy_flash
+                .as_ref()
+                .is_some_and(|(_, deadline)| *deadline <= now)
+            {
+                if let Some((restore, _)) = self.copy_flash.take() {
+                    self.current_mut().buffer.set_point(restore);
+                }
+            }
+            self.echo_pending_prefix(now);
             return Ok(None);
         }
         Ok(Some(event::read()?))
@@ -1174,7 +1200,7 @@ impl App {
         use crossterm::event::KeyEventKind;
         match event {
             TermEvent::Paste(text) => self.handle_paste(text),
-            TermEvent::Key(key) => {
+            TermEvent::Key(mut key) => {
                 if key.kind == KeyEventKind::Release {
                     return;
                 }
@@ -1190,6 +1216,11 @@ impl App {
                     self.handle_paste(text);
                 } else {
                     self.pasting_until = None;
+                    // Alacritty on Windows reports Ctrl+Space as a plain
+                    // Space. Only promote a lone key; paste bursts have
+                    // already been routed above and keep their spaces.
+                    #[cfg(windows)]
+                    keymap::promote_ctrl_space(&mut key, keymap::ctrl_is_down());
                     self.handle_key(key);
                 }
             }
@@ -1238,7 +1269,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        // Any keystroke cancels an overdue-but-unshown prefix hint.
+        // Any keystroke cancels a pending `M-w` indication.
+        self.copy_flash = None;
+        // ...and an overdue-but-unshown prefix hint.
         self.prefix_echo = None;
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
@@ -2441,6 +2474,7 @@ impl App {
         }
     }
 
+    /// `M-w`: save the region to the kill ring (no deletion).
     fn copy_region(&mut self, prev: LastCommand) {
         let i = self.current;
         let Some((start, end)) = self.buffers[i].buffer.region() else {
@@ -2450,10 +2484,37 @@ impl App {
         let Some(text) = self.buffers[i].buffer.region_text() else {
             return;
         };
-        if start != end {
-            self.kill_new(&text, prev == LastCommand::Kill);
-            self.last_command = LastCommand::Kill;
+        if start == end {
+            return;
         }
+        self.kill_new(&text, prev == LastCommand::Kill);
+        self.last_command = LastCommand::Kill;
+
+        // Emacs `indicate-copied-region`: flash the far end of the region, or
+        // echo `Saved text until "..."` if it is off screen.
+        let point = self.buffers[i].buffer.point();
+        let other = if point == end { start } else { end };
+        if self.visible_row(i, other.row) {
+            self.copy_flash = Some((point, Instant::now() + COPY_FLASH));
+            self.buffers[i].buffer.set_point(other);
+        } else {
+            let snippet = snippet(&text);
+            self.message = Some(format!("Saved text until \"{snippet}\""));
+        }
+    }
+
+    /// Whether `row` is currently within the buffer viewport.
+    fn visible_row(&self, buf: usize, row: usize) -> bool {
+        let height = self.viewport_rows.max(1);
+        let point = self.buffers[buf].buffer.point();
+        let mut top = self.buffers[buf].buffer.scroll();
+        if point.row < top {
+            top = point.row;
+        }
+        if point.row >= top + height {
+            top = point.row + 1 - height;
+        }
+        row >= top && row < top + height
     }
 
     fn kill_region(&mut self, prev: LastCommand) {
@@ -2753,6 +2814,16 @@ fn step_point(pos: Pos, direction: SearchDirection) -> Pos {
 /// Byte offset of the `idx`-th char in `s`, clamped to the end.
 fn char_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// A one-line, length-limited rendering of region text for the `M-w` echo.
+fn snippet(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() > 40 {
+        joined.chars().take(40).collect::<String>() + "…"
+    } else {
+        joined
+    }
 }
 
 fn common_prefix(items: &[String]) -> String {
@@ -3811,6 +3882,37 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT));
         assert_eq!(app.kill_ring.current().as_deref(), Some("world"));
         assert_eq!(app.current().buffer.line(0).text(), "hello world");
+        // Point flashes at the far end of the region (the mark).
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 11));
+        assert!(app.copy_flash.is_some());
+    }
+
+    #[test]
+    fn copy_flash_restores_point_after_its_deadline() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("hello world")]);
+        app.current_mut().buffer.set_point(Pos::new(0, 6));
+        app.current_mut().buffer.set_mark();
+        app.current_mut().buffer.set_point(Pos::new(0, 11));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT));
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 6));
+
+        app.copy_flash = Some((Pos::new(0, 11), Instant::now()));
+        assert!(app.next_event().unwrap().is_none());
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 11));
+        assert!(app.copy_flash.is_none());
+    }
+
+    #[test]
+    fn snippet_is_single_line_and_limited() {
+        assert_eq!(snippet("a\nb   c"), "a b c");
+        let long = "x".repeat(100);
+        assert!(snippet(&long).chars().count() <= 41);
     }
 
     #[test]

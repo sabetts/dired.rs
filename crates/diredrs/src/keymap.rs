@@ -53,13 +53,6 @@ pub fn translate(key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Alacritty on Windows reports Ctrl+Space exactly like a plain Space (the
-    // control flag is lost in ConPTY). Recover it from the live key state.
-    #[cfg(windows)]
-    if !ctrl && !alt && key.code == KeyCode::Char(' ') && ctrl_is_down() {
-        return SetMark;
-    }
-
     match key.code {
         // Terminals report `C-SPC` in several ways: a space with CONTROL,
         // `C-@` (the same character historically), NUL, or `KeyCode::Null`.
@@ -163,13 +156,29 @@ pub fn describe(key: KeyEvent) -> Option<String> {
 /// Whether a Ctrl key is currently held. Used to recover `C-SPC` from
 /// terminals (notably Alacritty on Windows) that report it as a plain space.
 #[cfg(windows)]
-fn ctrl_is_down() -> bool {
+pub(crate) fn ctrl_is_down() -> bool {
     const VK_CONTROL: i32 = 0x11;
     #[link(name = "user32")]
     extern "system" {
         fn GetAsyncKeyState(v_key: i32) -> i16;
     }
     unsafe { GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000 != 0 }
+}
+
+/// Promote a lone plain Space to `C-SPC` when Alacritty on Windows has lost the
+/// control modifier. Paste bursts never reach this: they are routed to
+/// `handle_paste` before key translation.
+#[cfg(windows)]
+pub(crate) fn promote_ctrl_space(key: &mut KeyEvent, ctrl_down: bool) {
+    if !ctrl_down {
+        return;
+    }
+    if key.code == KeyCode::Char(' ')
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        key.modifiers |= KeyModifiers::CONTROL;
+    }
 }
 
 #[cfg(test)]
@@ -278,6 +287,22 @@ mod tests {
             translate(key(KeyCode::Char('@'), KeyModifiers::NONE)),
             Action::SelfInsert('@')
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alacritty_ctrl_space_promotion_only_touches_a_lone_space() {
+        let mut space = key(KeyCode::Char(' '), KeyModifiers::NONE);
+        promote_ctrl_space(&mut space, true);
+        assert!(space.modifiers.contains(KeyModifiers::CONTROL));
+
+        let mut plain = key(KeyCode::Char(' '), KeyModifiers::NONE);
+        promote_ctrl_space(&mut plain, false);
+        assert!(!plain.modifiers.contains(KeyModifiers::CONTROL));
+
+        let mut letter = key(KeyCode::Char('a'), KeyModifiers::NONE);
+        promote_ctrl_space(&mut letter, true);
+        assert!(!letter.modifiers.contains(KeyModifiers::CONTROL));
     }
 
     #[cfg(windows)]
