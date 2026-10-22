@@ -3814,6 +3814,29 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_space_then_m_w_copies_a_dired_region() {
+        let dir = temp_dir("copy-region");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        app.current_mut().buffer.beginning_of_buffer();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('>'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT));
+
+        let copied = app.kill_ring.current().unwrap();
+        assert!(copied.contains("a.txt"));
+        assert!(copied.contains("b.txt"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn c_x_c_x_exchanges_point_and_mark() {
         let mut app = App::new(Config::default());
         if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
