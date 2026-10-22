@@ -895,8 +895,8 @@ impl App {
     }
 
     fn start_transfer(&mut self, copy: bool) {
-        // A copy always asks for a target directory. Rename offers the file's
-        // own name for a single file, and a directory when several are marked.
+        // A copy and a group rename ask for a target directory. Rename offers
+        // the file's own name when only a single file is involved.
         let marked = self.dired_paths(Mark::Marked);
         let dir = self.default_directory();
         let single = self.dired_entry_at_point().and_then(|i| {
@@ -905,7 +905,7 @@ impl App {
                 .as_ref()
                 .map(|d| d.entries[i].path.clone())
         });
-        let input = if copy {
+        let input = if copy || marked.len() > 1 {
             directory_input(&dir)
         } else if marked.is_empty() {
             single
@@ -2227,7 +2227,9 @@ impl App {
                 .map(|i| self.buffers[i].name.clone())
                 .collect::<Vec<_>>(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired),
-            Prompt::Rename { input, copy, .. } => self.file_candidates(input, *copy),
+            Prompt::Rename { input, copy, .. } => {
+                self.file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1)
+            }
             Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false),
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => return,
         };
@@ -2349,7 +2351,9 @@ impl App {
             Prompt::SwitchBuffer { input, .. } => self.switch_candidates(input).len(),
             Prompt::KillBuffer { input, .. } => self.kill_candidates(input).len(),
             Prompt::FindFile { input, dired, .. } => self.file_candidates(input, *dired).len(),
-            Prompt::Rename { input, copy, .. } => self.file_candidates(input, *copy).len(),
+            Prompt::Rename { input, copy, .. } => self
+                .file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1)
+                .len(),
             Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false).len(),
             Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
         };
@@ -2585,7 +2589,7 @@ impl App {
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
-                    self.file_candidates(input, *copy),
+                    self.file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1),
                     selected.unwrap_or(usize::MAX),
                 ))
             }
@@ -4339,6 +4343,45 @@ mod tests {
             app.current().dired.as_ref().unwrap().entries[i].name,
             "new.txt"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn r_renames_marked_files_into_a_target_directory() {
+        let dir = temp_dir("rename-marked");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'm'); // a.txt
+        press(&mut app, 'm'); // b.txt
+        press(&mut app, 'R');
+        if let Prompt::Rename {
+            input,
+            cursor,
+            copy,
+            ..
+        } = &mut app.prompt
+        {
+            // A group rename prompts for a directory, defaulting to the
+            // current one.
+            assert!(!*copy);
+            assert_eq!(*input, directory_input(&dir));
+            *input = target.display().to_string();
+            *cursor = input.chars().count();
+        } else {
+            panic!("expected the rename prompt");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!dir.join("a.txt").exists());
+        assert!(!dir.join("b.txt").exists());
+        assert_eq!(std::fs::read(target.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(target.join("b.txt")).unwrap(), b"b");
 
         std::fs::remove_dir_all(&dir).ok();
     }
