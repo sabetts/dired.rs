@@ -3,6 +3,7 @@
 
 mod app;
 mod buffer;
+mod buffer_menu;
 mod config;
 mod dired;
 mod disk;

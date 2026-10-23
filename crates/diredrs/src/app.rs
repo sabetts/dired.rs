@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Style};
+use crate::buffer_menu::{BufferMenu, BufferMenuEntry, MenuMark};
 use crate::config::Config;
 use crate::dired::{Dired, Mark, SortKey};
 use crate::file;
@@ -33,6 +34,8 @@ pub enum Kind {
     Scratch,
     /// The `*Help*` buffer.
     Help,
+    /// The `*Buffer List*` buffer.
+    BufferMenu,
     /// A Dired directory listing.
     Dired,
     /// A read-only file view.
@@ -48,6 +51,8 @@ pub struct Buf {
     pub buffer: Buffer,
     /// Directory listing state, for `Dired` buffers.
     pub dired: Option<Dired>,
+    /// Buffer-list state, for `*Buffer List*`.
+    buffer_menu: Option<BufferMenu>,
     /// Editable filename state, for Wdired buffers.
     dired_edit: Option<DiredEdit>,
     /// Offset column width, for `Hexl` buffers (see `hexl_highlights`).
@@ -442,6 +447,7 @@ impl App {
             kind,
             buffer,
             dired: None,
+            buffer_menu: None,
             dired_edit: None,
             hexl_width: None,
             last_visited: 0,
@@ -488,6 +494,7 @@ impl App {
         match self.buffers[idx].kind {
             Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
+            Kind::BufferMenu => "Buffer Menu".to_string(),
             // Emacs shows the listing order in the mode name, e.g. "Dired by name".
             Kind::Dired if self.buffers[idx].dired_edit.is_some() => "Editable Dired".to_string(),
             Kind::Dired => match self.buffers[idx].dired.as_ref() {
@@ -2767,6 +2774,13 @@ impl App {
             }
         }
 
+        if self.current().kind == Kind::BufferMenu {
+            self.message = None;
+            if self.handle_buffer_menu_key(key) {
+                return;
+            }
+        }
+
         // Plain keys in a Dired buffer drive Dired commands (n, p, f, ^, g,
         // q, ...) rather than inserting text. Clear the echo area first (as
         // Emacs does before each command) so a command that reports something
@@ -2927,6 +2941,7 @@ impl App {
                 KeyCode::Char('1') => self.delete_other_windows(),
                 KeyCode::Char('o') => self.other_window(),
                 KeyCode::Char('4') => self.start_prefix(Prefix::CtrlX4, "C-x 4-"),
+                KeyCode::Char('b') if ctrl => self.list_buffers(),
                 KeyCode::Char('b') => self.start_switch_buffer(false),
                 KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
@@ -3000,6 +3015,522 @@ impl App {
         };
         self.switch_to(idx);
         self.buffers[idx].buffer.beginning_of_buffer();
+    }
+
+    // ---- buffer menu -------------------------------------------------------
+
+    /// `C-x C-b`: show the `*Buffer List*`, like `list-buffers`.
+    fn list_buffers(&mut self) {
+        let from_menu = self.current().kind == Kind::BufferMenu;
+        let origin = if from_menu {
+            self.current()
+                .buffer_menu
+                .as_ref()
+                .and_then(|menu| menu.origin.clone())
+        } else {
+            Some(self.current().name.clone())
+        };
+        let preferred = from_menu
+            .then(|| self.buffer_menu_target_at_point())
+            .flatten();
+        let idx = match self.find_buffer("*Buffer List*") {
+            Some(idx) => idx,
+            None => {
+                let buffer = Buffer::read_only_from(vec![Line::plain("")]);
+                let idx = self.new_buffer("*Buffer List*".to_string(), Kind::BufferMenu, buffer);
+                self.buffers[idx].buffer_menu = Some(BufferMenu::default());
+                idx
+            }
+        };
+        if self.buffers[idx].buffer_menu.is_none() {
+            self.buffers[idx].buffer_menu = Some(BufferMenu::default());
+        }
+        self.rebuild_buffer_menu(idx, origin, preferred);
+        self.show_buffer_menu(idx);
+    }
+
+    /// Rebuild the table from the current buffers, preserving marks by name and
+    /// optionally restoring point to `preferred`.
+    fn rebuild_buffer_menu(
+        &mut self,
+        idx: usize,
+        origin: Option<String>,
+        preferred: Option<String>,
+    ) {
+        let marks: HashMap<String, MenuMark> = self.buffers[idx]
+            .buffer_menu
+            .as_ref()
+            .map(|menu| {
+                menu.entries
+                    .iter()
+                    .filter(|entry| entry.mark != MenuMark::None)
+                    .map(|entry| (entry.name.clone(), entry.mark))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut indices: Vec<usize> = (0..self.buffers.len()).filter(|i| *i != idx).collect();
+        indices.sort_by(|a, b| {
+            self.buffers[*b]
+                .last_visited
+                .cmp(&self.buffers[*a].last_visited)
+                .then_with(|| self.buffers[*a].name.cmp(&self.buffers[*b].name))
+        });
+        let entries: Vec<BufferMenuEntry> = indices
+            .into_iter()
+            .map(|i| {
+                let buf = &self.buffers[i];
+                let file = match buf.kind {
+                    Kind::Dired | Kind::File | Kind::Hexl => buf.name.clone(),
+                    Kind::Scratch | Kind::Help | Kind::BufferMenu => String::new(),
+                };
+                BufferMenuEntry {
+                    name: buf.name.clone(),
+                    size: buffer_char_size(&buf.buffer),
+                    mode: self.mode_line_mode_for(i),
+                    file,
+                    read_only: !buf.buffer.editable(),
+                    mark: marks.get(&buf.name).copied().unwrap_or(MenuMark::None),
+                }
+            })
+            .collect();
+        let menu = BufferMenu { entries, origin };
+        let lines = menu.render(&self.theme, self.viewport_cols);
+        let target_row = preferred
+            .and_then(|name| {
+                menu.entries
+                    .iter()
+                    .position(|entry| entry.name == name)
+                    .map(|i| menu.row_of(i))
+            })
+            .or_else(|| (!menu.entries.is_empty()).then(|| menu.row_of(0)));
+        self.buffers[idx].buffer_menu = Some(menu);
+        self.buffers[idx].buffer.set_content(lines);
+        if let Some(row) = target_row {
+            self.buffers[idx].buffer.set_point(Pos::new(row, 0));
+        }
+    }
+
+    /// Display the menu in another window, keeping the current window selected.
+    /// Reuse an existing menu window when one is already visible.
+    fn show_buffer_menu(&mut self, idx: usize) {
+        if self.current == idx {
+            return;
+        }
+        if let Some(id) = self
+            .windows
+            .iter()
+            .find(|window| window.buffer == idx)
+            .map(|window| window.id)
+        {
+            let width = self.window_width(id);
+            self.resize_buffer_menu(idx, width);
+            let view = capture_view(&self.buffers[idx].buffer);
+            if let Some(window) = self.windows.iter_mut().find(|window| window.id == id) {
+                window.view = view;
+            }
+            return;
+        }
+        if self.windows.len() == 1 {
+            if self.viewport_rows < 3 {
+                self.switch_to(idx);
+                return;
+            }
+            self.split_active_window(SplitAxis::Below);
+            if self.windows.len() == 1 {
+                self.switch_to(idx);
+                return;
+            }
+        }
+        let Some(other) = self.next_window_id() else {
+            self.switch_to(idx);
+            return;
+        };
+        self.save_active_view();
+        let width = self.window_width(other);
+        self.resize_buffer_menu(idx, width);
+        let view = capture_view(&self.buffers[idx].buffer);
+        if let Some(window) = self.windows.iter_mut().find(|window| window.id == other) {
+            window.buffer = idx;
+            window.view = view;
+        }
+    }
+
+    fn window_width(&self, id: WindowId) -> usize {
+        self.window_areas
+            .iter()
+            .find(|(window, _)| *window == id)
+            .map(|(_, area)| usize::from(area.width))
+            .unwrap_or(self.viewport_cols)
+            .max(1)
+    }
+
+    fn resize_buffer_menu(&mut self, idx: usize, width: usize) {
+        if self.buffers[idx].buffer_menu.is_none() {
+            return;
+        }
+        let point = self.buffers[idx].buffer.point();
+        let lines = self.buffers[idx]
+            .buffer_menu
+            .as_ref()
+            .map(|menu| menu.render(&self.theme, width))
+            .unwrap_or_default();
+        self.buffers[idx].buffer.set_width(width);
+        self.buffers[idx].buffer.set_content(lines);
+        self.buffers[idx].buffer.set_point(point);
+    }
+
+    fn buffer_menu_entry_at_point(&self) -> Option<usize> {
+        let menu = self.current().buffer_menu.as_ref()?;
+        menu.entry_index_at(self.current().buffer.point().row)
+    }
+
+    fn buffer_menu_target_at_point(&self) -> Option<String> {
+        let menu = self.current().buffer_menu.as_ref()?;
+        let index = self.buffer_menu_entry_at_point()?;
+        menu.entries.get(index).map(|entry| entry.name.clone())
+    }
+
+    fn buffer_menu_move(&mut self, delta: isize, times: i32) {
+        let idx = self.current;
+        let Some(menu) = self.buffers[idx].buffer_menu.as_ref() else {
+            return;
+        };
+        if menu.entries.is_empty() {
+            return;
+        }
+        let current = self.buffers[idx]
+            .buffer_menu
+            .as_ref()
+            .and_then(|menu| menu.entry_index_at(self.buffers[idx].buffer.point().row))
+            .unwrap_or(0);
+        let last = menu.entries.len() - 1;
+        let target = (current as isize + delta * times as isize).clamp(0, last as isize) as usize;
+        let row = menu.row_of(target);
+        self.buffers[idx].buffer.set_point(Pos::new(row, 0));
+    }
+
+    fn buffer_menu_redraw(&mut self, idx: usize) {
+        let point = self.buffers[idx].buffer.point();
+        let lines = self.buffers[idx]
+            .buffer_menu
+            .as_ref()
+            .map(|menu| menu.render(&self.theme, self.viewport_cols))
+            .unwrap_or_default();
+        self.buffers[idx].buffer.set_content(lines);
+        self.buffers[idx].buffer.set_point(point);
+    }
+
+    fn buffer_menu_set_mark(&mut self, mark: MenuMark, advance: isize) {
+        let Some(index) = self.buffer_menu_entry_at_point() else {
+            return;
+        };
+        let idx = self.current;
+        if let Some(menu) = self.buffers[idx].buffer_menu.as_mut() {
+            menu.entries[index].mark = mark;
+        }
+        self.buffer_menu_redraw(idx);
+        if advance != 0 {
+            self.buffer_menu_move(advance, 1);
+        }
+    }
+
+    fn buffer_menu_mark_delete(&mut self, count: i32) {
+        let count = if count == 0 { 1 } else { count };
+        let direction = if count < 0 { -1 } else { 1 };
+        for _ in 0..count.unsigned_abs() {
+            self.buffer_menu_set_mark(MenuMark::Delete, direction);
+        }
+    }
+
+    fn buffer_menu_unmark(&mut self, backup: bool) {
+        self.buffer_menu_set_mark(MenuMark::None, if backup { -1 } else { 1 });
+    }
+
+    fn buffer_menu_backup_unmark(&mut self) {
+        if self.current().buffer.point().row <= 1 {
+            return;
+        }
+        self.buffer_menu_move(-1, 1);
+        self.buffer_menu_set_mark(MenuMark::None, 0);
+    }
+
+    fn buffer_menu_unmark_all(&mut self) {
+        let idx = self.current;
+        if let Some(menu) = self.buffers[idx].buffer_menu.as_mut() {
+            for entry in &mut menu.entries {
+                entry.mark = MenuMark::None;
+            }
+        }
+        self.buffer_menu_redraw(idx);
+    }
+
+    fn buffer_menu_execute(&mut self) {
+        let menu_idx = self.current;
+        let Some(menu) = self.buffers[menu_idx].buffer_menu.as_ref() else {
+            return;
+        };
+        let names: Vec<String> = menu
+            .entries
+            .iter()
+            .filter(|entry| entry.mark == MenuMark::Delete)
+            .map(|entry| entry.name.clone())
+            .collect();
+        if names.is_empty() {
+            self.message = Some("No buffers marked for deletion".to_string());
+            return;
+        }
+        let origin = menu.origin.clone();
+        let menu_name = self.buffers[menu_idx].name.clone();
+        let mut killed = 0usize;
+        let mut refused = Vec::new();
+        for name in names {
+            let Some(target) = self.find_buffer(&name) else {
+                continue;
+            };
+            if self.buffers[target].kind == Kind::Scratch || self.buffers[target].name == menu_name
+            {
+                refused.push(name);
+                continue;
+            }
+            self.kill_buffer(target);
+            killed += 1;
+        }
+        let Some(menu_idx) = self.find_buffer(&menu_name) else {
+            return;
+        };
+        if let Some(menu) = self.buffers[menu_idx].buffer_menu.as_mut() {
+            for entry in &mut menu.entries {
+                if entry.mark == MenuMark::Delete {
+                    entry.mark = MenuMark::None;
+                }
+            }
+        }
+        self.rebuild_buffer_menu(menu_idx, origin, None);
+        let mut parts = Vec::new();
+        if killed > 0 {
+            parts.push(format!("Killed {killed} buffer(s)"));
+        }
+        if !refused.is_empty() {
+            parts.push(format!("Cannot kill {}", refused.join(", ")));
+        }
+        self.message = Some(parts.join("; "));
+    }
+
+    fn buffer_menu_select(&mut self, other_window: bool) {
+        let Some(name) = self.buffer_menu_target_at_point() else {
+            self.message = Some("No buffer on this line".to_string());
+            return;
+        };
+        let Some(idx) = self.find_buffer(&name) else {
+            self.message = Some(format!("This buffer has been killed: {name}"));
+            return;
+        };
+        if other_window {
+            self.switch_buffer_in_other_window(idx);
+        } else {
+            self.switch_to(idx);
+        }
+    }
+
+    /// `v`: show this line's buffer and every buffer marked with `>`.
+    fn buffer_menu_select_marked(&mut self) {
+        let Some(name) = self.buffer_menu_target_at_point() else {
+            self.message = Some("No buffer on this line".to_string());
+            return;
+        };
+        let Some(target) = self.find_buffer(&name) else {
+            self.message = Some(format!("This buffer has been killed: {name}"));
+            return;
+        };
+        let idx = self.current;
+        let marked: Vec<String> = self.buffers[idx]
+            .buffer_menu
+            .as_ref()
+            .map(|menu| {
+                menu.entries
+                    .iter()
+                    .filter(|entry| entry.mark == MenuMark::Display)
+                    .map(|entry| entry.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(menu) = self.buffers[idx].buffer_menu.as_mut() {
+            for entry in &mut menu.entries {
+                if entry.mark == MenuMark::Display {
+                    entry.mark = MenuMark::None;
+                }
+            }
+        }
+        if self.windows.len() > 1 {
+            self.delete_other_windows();
+        }
+        let first = self.active_window;
+        self.switch_to(target);
+        for name in marked {
+            if name == self.buffers[self.current].name {
+                continue;
+            }
+            let Some(target) = self.find_buffer(&name) else {
+                continue;
+            };
+            let before = self.windows.len();
+            self.split_active_window(SplitAxis::Below);
+            if self.windows.len() == before {
+                break;
+            }
+            let Some(other) = self.next_window_id() else {
+                break;
+            };
+            self.select_window(other);
+            self.switch_to(target);
+        }
+        if self.windows.len() > 1 {
+            self.select_window(first);
+        }
+    }
+
+    fn buffer_menu_revert(&mut self) {
+        let idx = self.current;
+        let Some(menu) = self.buffers[idx].buffer_menu.as_ref() else {
+            return;
+        };
+        let origin = menu.origin.clone();
+        let preferred = self.buffer_menu_target_at_point();
+        self.rebuild_buffer_menu(idx, origin, preferred);
+        self.message = Some("Reverted *Buffer List*".to_string());
+    }
+
+    /// `q`: remove the menu from the display without killing its buffer.
+    fn buffer_menu_quit(&mut self) {
+        if self.windows.len() > 1 {
+            self.delete_active_window();
+            return;
+        }
+        let origin = self
+            .current()
+            .buffer_menu
+            .as_ref()
+            .and_then(|menu| menu.origin.clone());
+        let fallback = origin
+            .and_then(|name| self.find_buffer(&name))
+            .or_else(|| {
+                let previous = self.previous;
+                self.buffers
+                    .get(previous)
+                    .filter(|buf| buf.kind != Kind::BufferMenu)
+                    .map(|buf| buf.name.clone())
+                    .and_then(|name| self.find_buffer(&name))
+            })
+            .or_else(|| {
+                self.buffers
+                    .iter()
+                    .position(|buf| buf.kind == Kind::Scratch)
+            });
+        if let Some(idx) = fallback {
+            self.switch_to(idx);
+        }
+    }
+
+    fn take_menu_arg(&mut self) -> (i32, bool) {
+        let arg = self.numeric_arg.take();
+        (arg.map(ArgState::value).unwrap_or(1), arg.is_some())
+    }
+
+    fn handle_buffer_menu_key(&mut self, key: KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('n') => {
+                let (count, _) = self.take_menu_arg();
+                self.buffer_menu_move(1, count);
+                true
+            }
+            KeyCode::Char('p') => {
+                let (count, _) = self.take_menu_arg();
+                self.buffer_menu_move(-1, count);
+                true
+            }
+            KeyCode::Char(' ') if !ctrl => {
+                let (count, _) = self.take_menu_arg();
+                self.buffer_menu_move(1, count);
+                true
+            }
+            KeyCode::Char('m') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_set_mark(MenuMark::Display, 1);
+                true
+            }
+            KeyCode::Char('d') if !ctrl => {
+                let (count, _) = self.take_menu_arg();
+                self.buffer_menu_mark_delete(count);
+                true
+            }
+            KeyCode::Char('d') if ctrl => {
+                let (count, _) = self.take_menu_arg();
+                let count = if count == 0 { 1 } else { count };
+                self.buffer_menu_mark_delete(-count);
+                true
+            }
+            KeyCode::Char('k') => {
+                let (count, _) = self.take_menu_arg();
+                self.buffer_menu_mark_delete(count);
+                true
+            }
+            KeyCode::Char('u') if !ctrl => {
+                let (_, backup) = self.take_menu_arg();
+                self.buffer_menu_unmark(backup);
+                true
+            }
+            KeyCode::Char('U') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_unmark_all();
+                true
+            }
+            KeyCode::Char('x') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_execute();
+                true
+            }
+            KeyCode::Char('f') | KeyCode::Char('e') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_select(false);
+                true
+            }
+            KeyCode::Char('o') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_select(true);
+                true
+            }
+            KeyCode::Char('v') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_select_marked();
+                true
+            }
+            KeyCode::Char('g') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_revert();
+                true
+            }
+            KeyCode::Char('q') if !ctrl => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_quit();
+                true
+            }
+            KeyCode::Enter => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_select(false);
+                true
+            }
+            KeyCode::Backspace => {
+                let _ = self.take_menu_arg();
+                self.buffer_menu_backup_unmark();
+                true
+            }
+            _ => false,
+        }
     }
 
     // ---- prompts -----------------------------------------------------------
@@ -4695,6 +5226,14 @@ fn restore_view(buffer: &mut Buffer, view: WindowView) {
     buffer.set_view_top(view.scroll, view.scroll_sub);
 }
 
+/// Emacs's `buffer-size`: text characters plus the newline between lines.
+fn buffer_char_size(buffer: &Buffer) -> usize {
+    let text: usize = (0..buffer.len())
+        .map(|row| buffer.line(row).char_len())
+        .sum();
+    text + buffer.len().saturating_sub(1)
+}
+
 fn divider_contains(rect: Rect, column: u16, row: u16) -> bool {
     let column = u32::from(column);
     let row = u32::from(row);
@@ -5172,6 +5711,7 @@ fn scratch_lines() -> Vec<String> {
         "  C-x 0 / C-x 1  delete this / other windows".to_string(),
         "  C-x o          move to the other window".to_string(),
         "  C-x b          switch buffers".to_string(),
+        "  C-x C-b        list buffers".to_string(),
         "  C-x 4 b        switch buffers in the other window".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
@@ -5240,10 +5780,22 @@ fn help_lines() -> Vec<String> {
         "  typing              edit the filename at point",
         "  C-k / M-d / C-y     kill and yank within the filename",
         "",
+        "Buffer Menu (C-x C-b)",
+        "  n / p / SPC         next / previous line",
+        "  m                   mark for display (then v)",
+        "  d / k / C-d         mark for deletion / move back",
+        "  x                   kill buffers marked for deletion",
+        "  u / U / DEL         unmark / unmark all / back up and unmark",
+        "  f / e / RET         select this line's buffer",
+        "  o                   select it in another window",
+        "  v                   select it and show display-marked buffers",
+        "  g / q               revert / quit the Buffer Menu",
+        "",
         "Files and buffers",
         "  C-x C-f        find file (visit a file by path; TAB completes)",
         "  C-x d          open a directory in Dired",
         "  C-x b          switch buffer",
+        "  C-x C-b        list buffers",
         "  C-x k          kill buffer",
         "  C-x C-x        exchange point and mark",
         "  C-x C-c        quit",
@@ -5321,6 +5873,39 @@ mod tests {
     fn ctrl_x(app: &mut App, c: char) {
         ctrl(app, 'x');
         press(app, c);
+    }
+
+    fn ctrl_x_ctrl(app: &mut App, c: char) {
+        ctrl(app, 'x');
+        ctrl(app, c);
+    }
+
+    fn open_buffer_menu(app: &mut App) {
+        ctrl_x_ctrl(app, 'b');
+        if app.current().kind != Kind::BufferMenu {
+            ctrl_x(app, 'o');
+        }
+    }
+
+    fn buffer_menu_row(app: &App, name: &str) -> usize {
+        let menu = app.current().buffer_menu.as_ref().unwrap();
+        let index = menu
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the Buffer Menu"));
+        menu.row_of(index)
+    }
+
+    fn menu_entry<'a>(app: &'a App, name: &str) -> &'a crate::buffer_menu::BufferMenuEntry {
+        app.current()
+            .buffer_menu
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
     }
 
     fn switch_to_scratch_in_other_window(app: &mut App) {
@@ -6858,6 +7443,235 @@ mod tests {
 
         std::fs::remove_dir_all(&a).ok();
         std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn c_x_b_still_opens_the_switch_prompt() {
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, 'b');
+        assert!(matches!(app.prompt, Prompt::SwitchBuffer { .. }));
+        assert!(app.find_buffer("*Buffer List*").is_none());
+    }
+
+    #[test]
+    fn c_x_c_b_opens_the_buffer_list_in_another_window() {
+        let dir = temp_dir("buffer-menu-open");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let origin = app.current;
+        let active = app.active_window;
+        let before = app.buffers.len();
+
+        ctrl_x_ctrl(&mut app, 'b');
+
+        assert_eq!(app.buffers.len(), before + 1);
+        assert_eq!(app.current, origin);
+        assert_eq!(app.active_window, active);
+        assert_eq!(app.windows.len(), 2);
+        let menu_idx = app.find_buffer("*Buffer List*").unwrap();
+        assert_eq!(app.buffers[menu_idx].kind, Kind::BufferMenu);
+        assert_eq!(
+            app.windows
+                .iter()
+                .filter(|window| window.buffer == menu_idx)
+                .count(),
+            1
+        );
+
+        let text: Vec<String> = (0..app.buffers[menu_idx].buffer.len())
+            .map(|row| app.buffers[menu_idx].buffer.line_text(row))
+            .collect();
+        assert!(text[0].starts_with("C R M Buffer"));
+        assert!(text.iter().any(|line| line.starts_with(". ")));
+        assert!(text.iter().any(|line| line.contains("*scratch*")));
+        assert!(!text.iter().any(|line| line.contains("*Buffer List*")));
+
+        open_buffer_menu(&mut app);
+        assert_eq!(app.buffers.len(), before + 1);
+        assert_eq!(app.current().kind, Kind::BufferMenu);
+        assert_eq!(app.windows.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_fits_an_existing_side_by_side_window() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("buffer-menu-width");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        ctrl_x(&mut app, '3');
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        ctrl_x_ctrl(&mut app, 'b');
+        let menu = app.find_buffer("*Buffer List*").unwrap();
+        let width = app
+            .window_areas
+            .iter()
+            .find(|(id, _)| {
+                app.windows
+                    .iter()
+                    .any(|window| window.id == *id && window.buffer == menu)
+            })
+            .map(|(_, area)| usize::from(area.width))
+            .unwrap();
+        assert!(app.buffers[menu].buffer.line_text(0).chars().count() <= width);
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_navigation_and_unmarking() {
+        let dir = temp_dir("buffer-menu-nav");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        open_buffer_menu(&mut app);
+
+        let first = app.current().buffer_menu.as_ref().unwrap().entries[0]
+            .name
+            .clone();
+        let second = app.current().buffer_menu.as_ref().unwrap().entries[1]
+            .name
+            .clone();
+        app.current_mut().buffer.set_point(Pos::new(1, 0));
+        press(&mut app, 'm');
+        assert_eq!(menu_entry(&app, &first).mark, MenuMark::Display);
+        assert_eq!(app.current().buffer.point().row, 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.current().buffer.point().row, 1);
+        assert_eq!(menu_entry(&app, &first).mark, MenuMark::None);
+
+        press(&mut app, 'n');
+        press(&mut app, 'm');
+        assert_eq!(menu_entry(&app, &second).mark, MenuMark::Display);
+        app.current_mut().buffer.set_point(Pos::new(2, 0));
+        press(&mut app, 'u');
+        assert_eq!(menu_entry(&app, &second).mark, MenuMark::None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_marks_reverts_and_selects() {
+        let dir = temp_dir("buffer-menu-select");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        open_buffer_menu(&mut app);
+
+        let scratch = app.find_buffer("*scratch*").unwrap();
+        let scratch_name = app.buffers[scratch].name.clone();
+        let row = buffer_menu_row(&app, &scratch_name);
+        app.current_mut().buffer.set_point(Pos::new(row, 0));
+        press(&mut app, 'm');
+        assert_eq!(menu_entry(&app, &scratch_name).mark, MenuMark::Display);
+        let marked_row = app.current().buffer.point().row;
+
+        press(&mut app, 'g');
+        assert_eq!(app.current().buffer.point().row, marked_row);
+        assert_eq!(menu_entry(&app, &scratch_name).mark, MenuMark::Display);
+        assert_eq!(app.message.as_deref(), Some("Reverted *Buffer List*"));
+
+        press(&mut app, 'U');
+        assert!(app
+            .current()
+            .buffer_menu
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| entry.mark == MenuMark::None));
+
+        app.current_mut().buffer.set_point(Pos::new(row, 0));
+        press(&mut app, 'f');
+        assert_eq!(app.current().kind, Kind::Scratch);
+        assert_eq!(app.current().name, scratch_name);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_deletes_marked_buffers_and_protects_scratch() {
+        let dir = temp_dir("buffer-menu-delete");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        app.open_file(victim.clone());
+        let victim_name = victim.display().to_string();
+        open_buffer_menu(&mut app);
+
+        let scratch = app.find_buffer("*scratch*").unwrap();
+        let scratch_name = app.buffers[scratch].name.clone();
+        let victim_row = buffer_menu_row(&app, &victim_name);
+        app.current_mut().buffer.set_point(Pos::new(victim_row, 0));
+        press(&mut app, 'd');
+        let scratch_row = buffer_menu_row(&app, &scratch_name);
+        app.current_mut().buffer.set_point(Pos::new(scratch_row, 0));
+        press(&mut app, 'd');
+
+        press(&mut app, 'x');
+
+        assert!(app.find_buffer(&victim_name).is_none());
+        assert!(app.find_buffer(&scratch_name).is_some());
+        assert!(app.find_buffer("*Buffer List*").is_some());
+        let message = app.message.as_deref().unwrap();
+        assert!(message.contains("Killed 1 buffer"));
+        assert!(message.contains("Cannot kill *scratch*"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_v_shows_marked_buffers_and_q_quits() {
+        let dir = temp_dir("buffer-menu-v");
+        let file = dir.join("target.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        app.open_file(file.clone());
+        let target = app.current().name.clone();
+        open_buffer_menu(&mut app);
+
+        let scratch_name = app.buffers[app.find_buffer("*scratch*").unwrap()]
+            .name
+            .clone();
+        let scratch_row = buffer_menu_row(&app, &scratch_name);
+        app.current_mut().buffer.set_point(Pos::new(scratch_row, 0));
+        press(&mut app, 'm');
+        let target_row = buffer_menu_row(&app, &target);
+        app.current_mut().buffer.set_point(Pos::new(target_row, 0));
+
+        press(&mut app, 'v');
+
+        assert_eq!(app.current().name, target);
+        assert_eq!(app.windows.len(), 2);
+        let shown: Vec<String> = app
+            .windows
+            .iter()
+            .map(|window| app.buffers[window.buffer].name.clone())
+            .collect();
+        assert!(shown.contains(&target));
+        assert!(shown.contains(&scratch_name));
+        let menu = app.find_buffer("*Buffer List*").unwrap();
+        assert!(app.buffers[menu]
+            .buffer_menu
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| entry.mark == MenuMark::None));
+
+        open_buffer_menu(&mut app);
+        press(&mut app, 'q');
+        assert_eq!(app.windows.len(), 1);
+        assert_eq!(app.current().name, target);
+        assert!(app.find_buffer("*Buffer List*").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
