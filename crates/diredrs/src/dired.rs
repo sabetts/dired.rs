@@ -241,6 +241,12 @@ impl Dired {
 
     /// Render the listing as styled lines (header, `..`, then one per entry).
     pub fn render(&self, theme: &Theme) -> Vec<Line> {
+        self.render_with_names(theme, &[])
+    }
+
+    /// Render the listing using `names` in place of entry names. A missing
+    /// override falls back to the entry's original name.
+    pub fn render_with_names(&self, theme: &Theme, names: &[String]) -> Vec<Line> {
         let mut lines = Vec::with_capacity(
             self.entries.len() + HEADER_LINES + usize::from(self.parent.is_some()),
         );
@@ -259,20 +265,26 @@ impl Dired {
             ),
         ]));
         if let Some(parent) = &self.parent {
-            lines.push(self.render_entry(parent, theme));
+            lines.push(self.render_entry(parent, &parent.name, theme));
         }
         for i in 0..self.entries.len() {
-            lines.push(self.render_line(i, theme));
+            let name = names.get(i).unwrap_or(&self.entries[i].name);
+            lines.push(self.render_line_with_name(i, name, theme));
         }
         lines
     }
 
     /// Render a single entry's line, including its mark and name face.
     pub fn render_line(&self, i: usize, theme: &Theme) -> Line {
-        self.render_entry(&self.entries[i], theme)
+        self.render_entry(&self.entries[i], &self.entries[i].name, theme)
     }
 
-    fn render_entry(&self, entry: &Entry, theme: &Theme) -> Line {
+    /// Render an entry line with `name` in place of its real filename.
+    pub fn render_line_with_name(&self, i: usize, name: &str, theme: &Theme) -> Line {
+        self.render_entry(&self.entries[i], name, theme)
+    }
+
+    fn render_entry(&self, entry: &Entry, name: &str, theme: &Theme) -> Line {
         let mut chars: Vec<char> = entry
             .head(self.human_sizes, self.links_width, self.size_width)
             .chars()
@@ -290,7 +302,7 @@ impl Dired {
         let mut spans = vec![
             Span::new(mark, theme.mark),
             Span::new(rest, Style::default()),
-            Span::new(entry.name.clone(), name_style),
+            Span::new(name, name_style),
         ];
         if let Some(target) = &entry.target {
             spans.push(Span::new(format!(" -> {target}"), Style::default()));

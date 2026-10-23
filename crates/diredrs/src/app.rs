@@ -1,7 +1,8 @@
 //! Application state and the event loop.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -13,7 +14,7 @@ use ratatui::Terminal;
 
 use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Style};
 use crate::config::Config;
-use crate::dired::{Dired, Mark};
+use crate::dired::{Dired, Mark, SortKey};
 use crate::file;
 use crate::hexl;
 use crate::input::History;
@@ -47,10 +48,21 @@ pub struct Buf {
     pub buffer: Buffer,
     /// Directory listing state, for `Dired` buffers.
     pub dired: Option<Dired>,
+    /// Editable filename state, for Wdired buffers.
+    dired_edit: Option<DiredEdit>,
     /// Offset column width, for `Hexl` buffers (see `hexl_highlights`).
     pub hexl_width: Option<usize>,
     /// Monotonic stamp of the most recent visit, for buffer-list ordering.
     last_visited: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DiredEdit {
+    /// The original listing, restored when changes are aborted.
+    old_lines: Vec<Line>,
+    old_point: Pos,
+    /// Edited names, one per `Dired.entries` item.
+    names: Vec<String>,
 }
 
 /// A window's saved view of its buffer.
@@ -191,6 +203,37 @@ pub enum PendingAction {
         errors: Vec<String>,
         all: bool,
     },
+    /// Continue a Wdired commit after confirming an overwrite.
+    WdiredCommit(WdiredCommit),
+}
+
+/// Rename operations and pending overwrite confirmations for Wdired.
+#[derive(Debug, Clone)]
+pub struct WdiredCommit {
+    /// Entry index, source path, and target path for each changed name.
+    renames: Vec<(usize, PathBuf, PathBuf)>,
+    /// Positions in `renames` whose target already exists.
+    conflicts: Vec<usize>,
+    next_conflict: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RenameWork {
+    /// Index of the corresponding entry in the old listing.
+    plan: usize,
+    original: PathBuf,
+    current: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct DiredReload {
+    dir: PathBuf,
+    sort: SortKey,
+    marks: Vec<(String, Mark)>,
+    preferred: Option<String>,
+    fallback: Vec<String>,
+    default_point: Pos,
 }
 
 /// A pending multi-key prefix (`C-x`, `C-c`, `C-h`, or Dired's `*`).
@@ -399,6 +442,7 @@ impl App {
             kind,
             buffer,
             dired: None,
+            dired_edit: None,
             hexl_width: None,
             last_visited: 0,
         });
@@ -445,6 +489,7 @@ impl App {
             Kind::Scratch | Kind::File => "Fundamental".to_string(),
             Kind::Help => "Help".to_string(),
             // Emacs shows the listing order in the mode name, e.g. "Dired by name".
+            Kind::Dired if self.buffers[idx].dired_edit.is_some() => "Editable Dired".to_string(),
             Kind::Dired => match self.buffers[idx].dired.as_ref() {
                 Some(d) => format!("Dired by {}", d.sort.label()),
                 None => "Dired".to_string(),
@@ -1040,6 +1085,43 @@ impl App {
             .filter(|e| e.mark != Mark::None)
             .map(|e| (e.name.clone(), e.mark))
             .collect();
+        let preferred = point_index.map(|index| names[index].clone());
+        let fallback = point_index
+            .map(|index| {
+                names[index + 1..]
+                    .iter()
+                    .chain(names[..index].iter().rev())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let reload = DiredReload {
+            dir,
+            sort,
+            marks,
+            preferred,
+            fallback,
+            default_point: point,
+        };
+        if self.reload_dired(idx, reload) {
+            self.message = Some(format!(
+                "Reverted {}",
+                self.buffers[idx].dired.as_ref().unwrap().dir.display()
+            ));
+        }
+    }
+
+    /// Re-read `idx`'s directory, applying `marks`, preserving its sort order,
+    /// and placing point on the first name in `preferred` or `fallback`.
+    fn reload_dired(&mut self, idx: usize, reload: DiredReload) -> bool {
+        let DiredReload {
+            dir,
+            sort,
+            marks,
+            preferred,
+            fallback,
+            default_point,
+        } = reload;
         match Dired::read(&dir, self.config.ui.show_hidden, self.human_sizes) {
             Ok(mut dired) => {
                 for entry in &mut dired.entries {
@@ -1048,31 +1130,667 @@ impl App {
                     }
                 }
                 dired.set_sort(sort);
-                let target_row = point_index.and_then(|index| {
+                let target_row = preferred.into_iter().chain(fallback).find_map(|name| {
                     dired
                         .entries
                         .iter()
-                        .position(|e| e.name == names[index])
-                        .or_else(|| {
-                            names[index + 1..]
-                                .iter()
-                                .chain(names[..index].iter().rev())
-                                .find_map(|name| dired.entries.iter().position(|e| e.name == *name))
-                        })
+                        .position(|e| e.name == name)
                         .map(|i| dired.row_of(i))
                 });
                 let target = target_row
                     .map(|row| Pos::new(row, dired.filename_col(row).unwrap_or(0)))
-                    .unwrap_or(point);
+                    .unwrap_or(default_point);
                 let lines = dired.render(&self.theme);
                 self.buffers[idx].buffer.set_content(lines);
                 self.buffers[idx].dired = Some(dired);
                 self.buffers[idx].buffer.set_point(target);
-                self.message = Some(format!("Reverted {}", dir.display()));
+                true
             }
             Err(err) => {
                 self.message = Some(format!("Cannot read {}: {err}", dir.display()));
+                false
             }
+        }
+    }
+
+    // ---- wdired ------------------------------------------------------------
+
+    fn wdired_active(&self) -> bool {
+        self.current().dired_edit.is_some()
+    }
+
+    fn wdired_toggle(&mut self) {
+        if self.wdired_active() {
+            self.wdired_commit();
+        } else {
+            self.wdired_enter();
+        }
+    }
+
+    fn wdired_enter(&mut self) {
+        let idx = self.current;
+        if self.buffers[idx].kind != Kind::Dired || self.buffers[idx].dired_edit.is_some() {
+            return;
+        }
+        let theme = self.theme;
+        let Some((old_lines, names, old_point)) = self.buffers[idx].dired.as_ref().map(|d| {
+            (
+                d.render(&theme),
+                d.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+                self.buffers[idx].buffer.point(),
+            )
+        }) else {
+            self.message = Some("Not a Dired buffer".to_string());
+            return;
+        };
+        let lines = self.buffers[idx]
+            .dired
+            .as_ref()
+            .map(|d| d.render_with_names(&theme, &names))
+            .unwrap_or_default();
+        self.buffers[idx].buffer.set_content(lines);
+        self.buffers[idx].buffer.set_point(old_point);
+        self.buffers[idx].dired_edit = Some(DiredEdit {
+            old_lines,
+            old_point,
+            names,
+        });
+        self.wdired_clamp_point();
+        self.message =
+            Some("Press C-c C-c or C-x C-q when finished; C-c ESC aborts changes".to_string());
+    }
+
+    fn wdired_abort(&mut self) {
+        let idx = self.current;
+        let Some(edit) = self.buffers[idx].dired_edit.take() else {
+            self.message = Some("Not editing file names".to_string());
+            return;
+        };
+        self.buffers[idx].buffer.set_content(edit.old_lines);
+        self.buffers[idx].buffer.set_point(edit.old_point);
+        self.message = Some("Changes aborted".to_string());
+    }
+
+    fn wdired_commit(&mut self) {
+        let idx = self.current;
+        let Some(edit) = self.buffers[idx].dired_edit.clone() else {
+            self.message = Some("Not editing file names".to_string());
+            return;
+        };
+        let Some(dired) = self.buffers[idx].dired.as_ref() else {
+            return;
+        };
+        let dir = dired.dir.clone();
+        let mut renames = Vec::new();
+        for (i, name) in edit.names.iter().enumerate() {
+            if *name == dired.entries[i].name {
+                continue;
+            }
+            if let Err(err) = wdired_validate_name(name) {
+                self.message = Some(err);
+                return;
+            }
+            renames.push((i, dired.entries[i].path.clone(), dir.join(name)));
+        }
+        if renames.is_empty() {
+            self.buffers[idx].dired_edit = None;
+            self.buffers[idx].buffer.set_content(edit.old_lines);
+            self.buffers[idx].buffer.set_point(edit.old_point);
+            self.message = Some("(No changes to be performed)".to_string());
+            return;
+        }
+
+        let mut targets = HashMap::new();
+        for (position, (_, _, target)) in renames.iter().enumerate() {
+            if targets.insert(wdired_path_key(target), position).is_some() {
+                self.message = Some("Trying to rename 2 files to the same name".to_string());
+                return;
+            }
+        }
+
+        let sources: HashSet<String> = renames
+            .iter()
+            .map(|(_, old, _)| wdired_path_key(old))
+            .collect();
+        let conflicts: Vec<usize> = renames
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, old, target))| {
+                wdired_target_exists(target)
+                    && !wdired_same_file(old, target)
+                    && !sources.contains(&wdired_path_key(target))
+            })
+            .map(|(position, _)| position)
+            .collect();
+        let commit = WdiredCommit {
+            renames,
+            conflicts,
+            next_conflict: 0,
+        };
+        self.ask_wdired_conflict(commit);
+    }
+
+    fn ask_wdired_conflict(&mut self, commit: WdiredCommit) {
+        if let Some(&position) = commit.conflicts.get(commit.next_conflict) {
+            let target = commit.renames[position].2.display();
+            self.prompt = Prompt::Confirm {
+                message: format!("Overwrite {}? (yes or no) ", target),
+                input: String::new(),
+                cursor: 0,
+                action: PendingAction::WdiredCommit(commit),
+            };
+        } else {
+            self.run_wdired_renames(commit);
+        }
+    }
+
+    fn run_wdired_renames(&mut self, commit: WdiredCommit) {
+        let idx = self.current;
+        let Some((dir, sort, old_names, old_marks, point_index, default_point)) =
+            self.buffers[idx].dired.as_ref().map(|d| {
+                let entries = &d.entries;
+                (
+                    d.dir.clone(),
+                    d.sort,
+                    entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+                    entries
+                        .iter()
+                        .map(|e| (e.name.clone(), e.path.clone(), e.mark))
+                        .collect::<Vec<_>>(),
+                    d.entry_index_at(self.buffers[idx].buffer.point().row),
+                    self.buffers[idx].buffer.point(),
+                )
+            })
+        else {
+            return;
+        };
+
+        let overwrite_keys: HashSet<String> = commit
+            .conflicts
+            .iter()
+            .map(|position| wdired_path_key(&commit.renames[*position].2))
+            .collect();
+        let mut pending: Vec<RenameWork> = commit
+            .renames
+            .iter()
+            .map(|(plan, old, target)| RenameWork {
+                plan: *plan,
+                original: old.clone(),
+                current: old.clone(),
+                target: target.clone(),
+            })
+            .collect();
+        let mut sources: HashMap<String, usize> = pending
+            .iter()
+            .map(|work| (wdired_path_key(&work.current), work.plan))
+            .collect();
+        let mut successful: Vec<(usize, PathBuf, PathBuf)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        while !pending.is_empty() {
+            let mut residue = Vec::new();
+            let mut progressed = false;
+            for mut work in pending.drain(..) {
+                let current_key = wdired_path_key(&work.current);
+                let target_key = wdired_path_key(&work.target);
+                let target_exists = wdired_target_exists(&work.target);
+                let same_file = target_exists && wdired_same_file(&work.current, &work.target);
+                let occupied_by_source = sources
+                    .get(&target_key)
+                    .is_some_and(|plan| *plan != work.plan);
+
+                if target_exists && !same_file && occupied_by_source {
+                    residue.push(work);
+                    continue;
+                }
+                if target_exists && !same_file && !overwrite_keys.contains(&target_key) {
+                    errors.push(format!("{} already exists", work.target.display()));
+                    sources.remove(&current_key);
+                    continue;
+                }
+                if same_file {
+                    match wdired_temp_path(&work.current) {
+                        Ok(temp) => match fs::rename(&work.current, &temp) {
+                            Ok(()) => {
+                                sources.remove(&current_key);
+                                work.current = temp;
+                                sources.insert(wdired_path_key(&work.current), work.plan);
+                                residue.push(work);
+                                progressed = true;
+                            }
+                            Err(err) => {
+                                errors.push(format!(
+                                    "Rename {} failed: {err}",
+                                    work.current.display()
+                                ));
+                                sources.remove(&current_key);
+                            }
+                        },
+                        Err(err) => {
+                            errors.push(format!("Cannot create temporary name: {err}"));
+                            sources.remove(&current_key);
+                        }
+                    }
+                    continue;
+                }
+                let parent_ready = match work.target.parent() {
+                    Some(parent) => fs::create_dir_all(parent).is_ok(),
+                    None => true,
+                };
+                if !parent_ready {
+                    errors.push(format!(
+                        "Cannot create directory for {}",
+                        work.target.display()
+                    ));
+                    sources.remove(&current_key);
+                    continue;
+                }
+                let backup = if target_exists {
+                    match wdired_temp_path(&work.target)
+                        .and_then(|temp| fs::rename(&work.target, &temp).map(|()| temp))
+                    {
+                        Ok(temp) => Some(temp),
+                        Err(err) => {
+                            errors
+                                .push(format!("Cannot overwrite {}: {err}", work.target.display()));
+                            sources.remove(&current_key);
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                match fs::rename(&work.current, &work.target) {
+                    Ok(()) => {
+                        if let Some(backup) = backup {
+                            remove_wdired_path(&backup);
+                        }
+                        sources.remove(&current_key);
+                        successful.push((work.plan, work.original, work.target));
+                        progressed = true;
+                    }
+                    Err(err) => {
+                        if let Some(backup) = backup {
+                            let _ = fs::rename(&backup, &work.target);
+                        }
+                        if work.current != work.original
+                            && !wdired_target_exists(&work.original)
+                            && fs::rename(&work.current, &work.original).is_ok()
+                        {
+                            work.current = work.original.clone();
+                        }
+                        if work.current == work.original {
+                            errors.push(format!(
+                                "Rename {} to {} failed: {err}",
+                                work.original.display(),
+                                work.target.display()
+                            ));
+                        } else {
+                            errors.push(format!(
+                                "Rename {} to {} failed: {err}; left at {}",
+                                work.original.display(),
+                                work.target.display(),
+                                work.current.display()
+                            ));
+                        }
+                        sources.remove(&current_key);
+                    }
+                }
+            }
+
+            if residue.is_empty() {
+                break;
+            }
+            if !progressed {
+                let mut work = residue.remove(0);
+                let current_key = wdired_path_key(&work.current);
+                match wdired_temp_path(&work.current)
+                    .and_then(|temp| fs::rename(&work.current, &temp).map(|()| temp))
+                {
+                    Ok(temp) => {
+                        sources.remove(&current_key);
+                        work.current = temp;
+                        sources.insert(wdired_path_key(&work.current), work.plan);
+                        residue.push(work);
+                    }
+                    Err(err) => {
+                        errors.push(format!(
+                            "Cannot break rename cycle at {}: {err}",
+                            work.current.display()
+                        ));
+                        sources.remove(&current_key);
+                    }
+                }
+            }
+            pending = residue;
+        }
+
+        for (_, old, new) in &successful {
+            self.rename_open_buffers(old, new);
+        }
+
+        let mut successful_by_entry: HashMap<usize, (&PathBuf, &PathBuf)> = HashMap::new();
+        for (plan, old, target) in &successful {
+            successful_by_entry.insert(*plan, (old, target));
+        }
+        let overwritten: HashSet<String> = commit
+            .conflicts
+            .iter()
+            .map(|position| wdired_path_key(&commit.renames[*position].2))
+            .collect();
+        let mut marks: Vec<(String, Mark)> = Vec::new();
+        for (i, (old_name, old_path, mark)) in old_marks.iter().enumerate() {
+            if successful_by_entry.contains_key(&i) {
+                continue;
+            }
+            if overwritten.contains(&wdired_path_key(old_path)) {
+                continue;
+            }
+            marks.push((old_name.clone(), *mark));
+        }
+        for (plan, _, target) in &successful {
+            if target.parent() == Some(dir.as_path()) {
+                if let Some(name) = target.file_name() {
+                    marks.push((name.to_string_lossy().into_owned(), old_marks[*plan].2));
+                }
+            }
+        }
+
+        let preferred = point_index.and_then(|index| {
+            successful_by_entry
+                .get(&index)
+                .and_then(|(_, target)| {
+                    (target.parent() == Some(dir.as_path()))
+                        .then(|| target.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (!successful_by_entry.contains_key(&index)).then(|| old_names[index].clone())
+                })
+        });
+        let fallback = point_index
+            .map(|index| {
+                old_names[index + 1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, name)| {
+                        let entry = index + 1 + offset;
+                        wdired_final_name(name, entry, &successful_by_entry, &dir)
+                    })
+                    .chain(
+                        old_names[..index]
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .map(|(entry, name)| {
+                                wdired_final_name(name, entry, &successful_by_entry, &dir)
+                            }),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.buffers[idx].dired_edit = None;
+        let renamed = successful.len();
+        let reloaded = self.reload_dired(
+            idx,
+            DiredReload {
+                dir,
+                sort,
+                marks,
+                preferred,
+                fallback,
+                default_point,
+            },
+        );
+        if !reloaded {
+            return;
+        }
+        self.message = Some(if errors.is_empty() {
+            format!("Renamed {renamed} file(s)")
+        } else if renamed == 0 {
+            format!("Rename failed: {}", errors[0])
+        } else {
+            format!(
+                "Renamed {renamed} file(s); {} failed: {}",
+                errors.len(),
+                errors[0]
+            )
+        });
+    }
+
+    fn wdired_name_range(&self) -> Option<(usize, usize, usize)> {
+        let buf = self.current();
+        let edit = buf.dired_edit.as_ref()?;
+        let dired = buf.dired.as_ref()?;
+        let row = buf.buffer.point().row;
+        let i = dired.entry_index_at(row)?;
+        let start = dired.filename_col(row)?;
+        let end = start + edit.names.get(i)?.chars().count();
+        Some((i, start, end))
+    }
+
+    fn wdired_clamp_point(&mut self) {
+        let Some((_, start, end)) = self.wdired_name_range() else {
+            return;
+        };
+        let point = self.current().buffer.point();
+        let col = point.col.clamp(start, end);
+        if col != point.col {
+            self.current_mut()
+                .buffer
+                .set_point(Pos::new(point.row, col));
+        }
+    }
+
+    fn wdired_redraw_name(&mut self, i: usize, cursor_col: usize) {
+        let idx = self.current;
+        let theme = self.theme;
+        let Some((row, line)) = ({
+            let buf = &self.buffers[idx];
+            let dired = buf.dired.as_ref();
+            let name = buf
+                .dired_edit
+                .as_ref()
+                .and_then(|edit| edit.names.get(i))
+                .cloned();
+            dired.zip(name).map(|(dired, name)| {
+                (
+                    dired.row_of(i),
+                    dired.render_line_with_name(i, &name, &theme),
+                )
+            })
+        }) else {
+            return;
+        };
+        self.buffers[idx].buffer.set_line(row, line);
+        self.buffers[idx]
+            .buffer
+            .set_point(Pos::new(row, cursor_col));
+    }
+
+    fn wdired_store_name(&mut self, i: usize, start: usize, chars: &[char], offset: usize) {
+        let idx = self.current;
+        if let Some(edit) = self.buffers[idx].dired_edit.as_mut() {
+            edit.names[i] = chars.iter().collect();
+        }
+        self.wdired_redraw_name(i, start + offset);
+    }
+
+    fn wdired_insert_text(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        if text.chars().any(|c| matches!(c, '\n' | '\r' | '\0')) {
+            self.message = Some("File names cannot contain newlines".to_string());
+            return true;
+        }
+        let Some((i, start, _)) = self.wdired_name_range() else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        let mut chars: Vec<char> = self.current().dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let offset = self
+            .current()
+            .buffer
+            .point()
+            .col
+            .saturating_sub(start)
+            .min(chars.len());
+        let inserted = text.chars().count();
+        chars.splice(offset..offset, text.chars());
+        self.wdired_store_name(i, start, &chars, offset + inserted);
+        true
+    }
+
+    fn wdired_delete_backward(&mut self) -> bool {
+        let Some((i, start, _)) = self.wdired_name_range() else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        let mut chars: Vec<char> = self.current().dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let offset = self
+            .current()
+            .buffer
+            .point()
+            .col
+            .saturating_sub(start)
+            .min(chars.len());
+        if offset == 0 {
+            self.message = Some("Beginning of file name".to_string());
+            return true;
+        }
+        chars.remove(offset - 1);
+        self.wdired_store_name(i, start, &chars, offset - 1);
+        true
+    }
+
+    fn wdired_delete_forward(&mut self) -> bool {
+        let Some((i, start, _)) = self.wdired_name_range() else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        let mut chars: Vec<char> = self.current().dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let offset = self
+            .current()
+            .buffer
+            .point()
+            .col
+            .saturating_sub(start)
+            .min(chars.len());
+        if offset >= chars.len() {
+            self.message = Some("End of file name".to_string());
+            return true;
+        }
+        chars.remove(offset);
+        self.wdired_store_name(i, start, &chars, offset);
+        true
+    }
+
+    fn wdired_kill_line(&mut self, prev: LastCommand) -> bool {
+        let Some((i, start, _)) = self.wdired_name_range() else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        let mut chars: Vec<char> = self.current().dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let offset = self
+            .current()
+            .buffer
+            .point()
+            .col
+            .saturating_sub(start)
+            .min(chars.len());
+        let killed: String = chars[offset..].iter().collect();
+        chars.truncate(offset);
+        self.wdired_store_name(i, start, &chars, offset);
+        if !killed.is_empty() {
+            self.kill_new(&killed, prev == LastCommand::Kill);
+            self.last_command = LastCommand::Kill;
+        }
+        true
+    }
+
+    fn wdired_kill_word(&mut self, backward: bool, prev: LastCommand) -> bool {
+        let Some((i, start, _)) = self.wdired_name_range() else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        let mut chars: Vec<char> = self.current().dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let point = self
+            .current()
+            .buffer
+            .point()
+            .col
+            .saturating_sub(start)
+            .min(chars.len());
+        let (from, to) = if backward {
+            let mut from = point;
+            while from > 0 && !wdired_word(chars[from - 1]) {
+                from -= 1;
+            }
+            while from > 0 && wdired_word(chars[from - 1]) {
+                from -= 1;
+            }
+            (from, point)
+        } else {
+            let mut to = point;
+            while to < chars.len() && !wdired_word(chars[to]) {
+                to += 1;
+            }
+            while to < chars.len() && wdired_word(chars[to]) {
+                to += 1;
+            }
+            (point, to)
+        };
+        if from == to {
+            return true;
+        }
+        let killed: String = chars[from..to].iter().collect();
+        chars.drain(from..to);
+        self.wdired_store_name(i, start, &chars, from);
+        self.kill_new(&killed, prev == LastCommand::Kill);
+        self.last_command = LastCommand::Kill;
+        true
+    }
+
+    fn wdired_yank(&mut self) -> bool {
+        let Some(text) = self.kill_ring.current() else {
+            self.message = Some("Kill ring is empty".to_string());
+            return true;
+        };
+        self.wdired_insert_text(&text)
+    }
+
+    fn handle_wdired_key(&mut self, key: KeyEvent) -> bool {
+        let prev = self.last_command;
+        self.last_command = LastCommand::Other;
+        match keymap::translate(key) {
+            Action::SelfInsert(c) => self.wdired_insert_text(&c.to_string()),
+            Action::DeleteBackward => self.wdired_delete_backward(),
+            Action::DeleteForward => self.wdired_delete_forward(),
+            Action::KillLine => self.wdired_kill_line(prev),
+            Action::BackwardKillWord => self.wdired_kill_word(true, prev),
+            Action::KillWord => self.wdired_kill_word(false, prev),
+            Action::Yank => self.wdired_yank(),
+            Action::Open | Action::Complete | Action::OpenLine => {
+                self.message = Some(
+                    keymap::describe(key)
+                        .map(|key| format!("{key} is undefined"))
+                        .unwrap_or_default(),
+                );
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1408,7 +2126,7 @@ impl App {
             }
         }
         for (old, new) in &renamed {
-            self.rename_open_buffer(old, new);
+            self.rename_open_buffers(old, new);
         }
         self.dired_revert();
         // Keep point on the renamed file when it is still in this listing
@@ -1538,11 +2256,17 @@ impl App {
         }
     }
 
-    /// Point an open file/hexl buffer at `new` after its file was renamed.
-    fn rename_open_buffer(&mut self, old: &std::path::Path, new: &std::path::Path) {
-        let old_name = old.display().to_string();
-        if let Some(idx) = self.buffers.iter().position(|b| b.name == old_name) {
-            self.buffers[idx].name = new.display().to_string();
+    /// Point open file/hexl buffers at `new` after their path was renamed.
+    fn rename_open_buffers(&mut self, old: &Path, new: &Path) {
+        for buf in &mut self.buffers {
+            let path = Path::new(&buf.name);
+            if path == old {
+                buf.name = new.display().to_string();
+            } else if let Ok(suffix) = path.strip_prefix(old) {
+                if !suffix.as_os_str().is_empty() {
+                    buf.name = new.join(suffix).display().to_string();
+                }
+            }
         }
     }
 
@@ -1609,6 +2333,11 @@ impl App {
                 all = delete_all;
                 delete_one(&paths[index], &mut deleted, &mut errors);
                 (paths, index + 1)
+            }
+            PendingAction::WdiredCommit(mut commit) => {
+                commit.next_conflict += 1;
+                self.ask_wdired_conflict(commit);
+                return;
             }
         };
         self.continue_delete(paths, index, deleted, errors, all);
@@ -2031,6 +2760,13 @@ impl App {
             return;
         }
 
+        if self.wdired_active() {
+            self.message = None;
+            if self.handle_wdired_key(key) {
+                return;
+            }
+        }
+
         // Plain keys in a Dired buffer drive Dired commands (n, p, f, ^, g,
         // q, ...) rather than inserting text. Clear the echo area first (as
         // Emacs does before each command) so a command that reports something
@@ -2054,6 +2790,9 @@ impl App {
             }
         } else {
             self.perform(action);
+            if self.wdired_active() {
+                self.wdired_clamp_point();
+            }
         }
     }
 
@@ -2193,6 +2932,7 @@ impl App {
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
                 KeyCode::Char('f') if ctrl => self.start_find_file(false),
                 KeyCode::Char('d') => self.start_find_file(true),
+                KeyCode::Char('q') if self.current().kind == Kind::Dired => self.wdired_toggle(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
             },
@@ -2219,6 +2959,9 @@ impl App {
                 }
             }
             Prefix::CtrlC => match key.code {
+                KeyCode::Char('c') if ctrl && self.wdired_active() => self.wdired_commit(),
+                KeyCode::Char('k') if ctrl && self.wdired_active() => self.wdired_abort(),
+                KeyCode::Esc if self.wdired_active() => self.wdired_abort(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-c", key),
             },
@@ -3837,6 +4580,12 @@ impl App {
             self.kill_ring.push(&filtered, false);
             return;
         }
+        if self.wdired_active() {
+            let filtered: String = text.chars().filter(|c| *c != '\r').collect();
+            self.wdired_insert_text(&filtered);
+            self.kill_ring.push(&text, false);
+            return;
+        }
         if !self.current().buffer.editable() {
             self.message = Some("Text is read-only".to_string());
             return;
@@ -3941,6 +4690,130 @@ fn divider_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < left + u32::from(rect.width)
         && row >= top
         && row < top + u32::from(rect.height)
+}
+
+fn wdired_validate_name(name: &str) -> std::result::Result<(), String> {
+    if name.is_empty() {
+        return Err("File name cannot be empty".to_string());
+    }
+    if name.chars().any(|c| matches!(c, '\0' | '\n' | '\r')) {
+        return Err("File name cannot contain newlines".to_string());
+    }
+    let path = Path::new(name);
+    if path.is_absolute() || path.has_root() {
+        return Err("File name must be relative to the Dired directory".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+    {
+        return Err("File name must be relative to the Dired directory".to_string());
+    }
+    match path.components().next_back() {
+        Some(Component::Normal(_)) => Ok(()),
+        _ => Err("Invalid file name".to_string()),
+    }
+}
+
+fn wdired_normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            component => out.push(component.as_os_str()),
+        }
+    }
+    out
+}
+
+fn wdired_path_key(path: &Path) -> String {
+    let normalized = wdired_normalize_path(path);
+    #[cfg(windows)]
+    {
+        normalized.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized.to_string_lossy().into_owned()
+    }
+}
+
+fn wdired_target_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn wdired_same_file(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn wdired_temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rename".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    for counter in 0..1000 {
+        let candidate = parent.join(format!(
+            ".diredrs-{stem}-{}-{stamp}-{counter}.tmp",
+            std::process::id()
+        ));
+        if !wdired_target_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "cannot find a temporary name",
+    ))
+}
+
+fn remove_wdired_path(path: &Path) {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_dir() {
+            let _ = fs::remove_dir_all(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn wdired_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn wdired_final_name(
+    old_name: &str,
+    entry: usize,
+    successful: &HashMap<usize, (&PathBuf, &PathBuf)>,
+    dir: &Path,
+) -> String {
+    successful
+        .get(&entry)
+        .and_then(|(_, target)| {
+            (target.parent() == Some(dir))
+                .then(|| {
+                    target
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .flatten()
+        })
+        .unwrap_or_else(|| old_name.to_string())
 }
 
 fn window_ids(tree: &WindowTree, out: &mut Vec<WindowId>) {
@@ -4344,6 +5217,13 @@ fn help_lines() -> Vec<String> {
         "  w                   copy marked file name(s) to the kill ring",
         "  s                   cycle sorting: name / date / size",
         "  < / >               previous / next directory line",
+        "  C-x C-q             edit file names in the listing (Wdired)",
+        "",
+        "Wdired",
+        "  C-c C-c / C-x C-q   commit renames and return to Dired",
+        "  C-c ESC / C-c C-k   abort changes and return to Dired",
+        "  typing              edit the filename at point",
+        "  C-k / M-d / C-y     kill and yank within the filename",
         "",
         "Files and buffers",
         "  C-x C-f        find file (visit a file by path; TAB completes)",
@@ -4401,6 +5281,18 @@ mod tests {
 
     fn press(app: &mut App, c: char) {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, c);
+        }
+    }
+
+    fn replace_wdired_name(app: &mut App, name: &str) {
+        ctrl(app, 'a');
+        ctrl(app, 'k');
+        type_text(app, name);
     }
 
     fn alt(app: &mut App, c: char) {
@@ -7043,5 +7935,285 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.current().buffer.point(), Pos::new(0, 5));
         assert_eq!(app.message.as_deref(), Some("End of buffer"));
+    }
+
+    #[test]
+    fn wdired_enters_and_edits_only_the_displayed_name() {
+        let dir = temp_dir("wdired-edit");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        assert_eq!(app.mode_line_mode(), "Editable Dired");
+        assert!(app.current().dired_edit.is_some());
+
+        press(&mut app, 'X');
+        assert_eq!(
+            app.current().dired_edit.as_ref().unwrap().names[0],
+            "Xa.txt"
+        );
+        let row = app.current().dired.as_ref().unwrap().row_of(0);
+        assert!(app.current().buffer.line_text(row).contains("Xa.txt"));
+        assert!(dir.join("a.txt").exists());
+        assert!(!dir.join("Xa.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_c_c_c_commits_renames_and_returns_to_dired() {
+        let dir = temp_dir("wdired-commit");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "c.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        assert_eq!(app.mode_line_mode(), "Dired by name");
+        assert!(app.current().dired_edit.is_none());
+        assert!(dir.join("c.txt").exists());
+        assert!(!dir.join("a.txt").exists());
+        let dired = app.current().dired.as_ref().unwrap();
+        let index = dired
+            .entry_index_at(app.current().buffer.point().row)
+            .unwrap();
+        assert_eq!(dired.entries[index].name, "c.txt");
+        assert_eq!(app.message.as_deref(), Some("Renamed 1 file(s)"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_x_c_q_also_commits_and_updates_open_buffers() {
+        let dir = temp_dir("wdired-toggle-commit");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_file(dir.join("a.txt"));
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "c.txt");
+        ctrl_x(&mut app, 'q');
+
+        assert!(dir.join("c.txt").exists());
+        assert!(app
+            .buffers
+            .iter()
+            .any(|buf| buf.name == dir.join("c.txt").display().to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_c_esc_aborts_and_restores_the_listing() {
+        let dir = temp_dir("wdired-abort");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "changed.txt");
+        ctrl(&mut app, 'c');
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode_line_mode(), "Dired by name");
+        assert!(app.current().dired_edit.is_none());
+        assert!(dir.join("a.txt").exists());
+        assert!(!dir.join("changed.txt").exists());
+        let row = app.current().dired.as_ref().unwrap().row_of(0);
+        assert!(app.current().buffer.line_text(row).contains("a.txt"));
+        assert_eq!(app.message.as_deref(), Some("Changes aborted"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_rejects_duplicate_target_names_without_changes() {
+        let dir = temp_dir("wdired-duplicate");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "same.txt");
+        ctrl(&mut app, 'n');
+        replace_wdired_name(&mut app, "same.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        assert!(app.current().dired_edit.is_some());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Trying to rename 2 files to the same name")
+        );
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+        assert!(!dir.join("same.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_swaps_names_through_temporary_paths() {
+        let dir = temp_dir("wdired-swap");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "b.txt");
+        ctrl(&mut app, 'n');
+        replace_wdired_name(&mut app, "a.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"b");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_handles_rename_chains() {
+        let dir = temp_dir("wdired-chain");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "b.txt");
+        ctrl(&mut app, 'n');
+        replace_wdired_name(&mut app, "c.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        assert!(!dir.join("a.txt").exists());
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.join("c.txt")).unwrap(), b"b");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_creates_parent_directories_for_relative_paths() {
+        let dir = temp_dir("wdired-subpath");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "sub/c.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        assert_eq!(std::fs::read(dir.join("sub/c.txt")).unwrap(), b"a");
+        assert!(!dir.join("a.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_prompts_before_overwriting_and_can_cancel() {
+        let dir = temp_dir("wdired-overwrite");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "b.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+
+        answer(&mut app, "no");
+        assert!(app.current().dired_edit.is_some());
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"b");
+
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+        answer(&mut app, "yes");
+        assert!(app.current().dired_edit.is_none());
+        assert!(!dir.join("a.txt").exists());
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"a");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_rejects_empty_names_and_protected_text() {
+        let dir = temp_dir("wdired-protected");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'k');
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+        assert_eq!(app.message.as_deref(), Some("File name cannot be empty"));
+        assert!(app.current().dired_edit.is_some());
+
+        app.current_mut().buffer.set_point(Pos::new(0, 0));
+        press(&mut app, 'X');
+        assert_eq!(app.message.as_deref(), Some("Text is read-only"));
+        assert!(app.current().buffer.line_text(0).starts_with("  "));
+        assert!(dir.join("a.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_preserves_marks_when_renaming() {
+        let dir = temp_dir("wdired-marks");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        press(&mut app, 'm');
+        ctrl_x(&mut app, 'q');
+        ctrl(&mut app, 'p');
+        replace_wdired_name(&mut app, "c.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        let dired = app.current().dired.as_ref().unwrap();
+        let entry = dired.entries.iter().find(|e| e.name == "c.txt").unwrap();
+        assert_eq!(entry.mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wdired_handles_case_only_renames() {
+        let dir = temp_dir("wdired-case");
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        ctrl_x(&mut app, 'q');
+        replace_wdired_name(&mut app, "A.txt");
+        ctrl(&mut app, 'c');
+        ctrl(&mut app, 'c');
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"A.txt".to_string()));
+        assert!(!names.contains(&"a.txt".to_string()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
