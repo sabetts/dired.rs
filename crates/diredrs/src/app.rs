@@ -998,11 +998,11 @@ impl App {
     /// Re-read the current directory listing (`g`), preserving marks by name.
     fn dired_revert(&mut self) {
         let idx = self.current;
-        let Some((dir, sort)) = self.buffers[idx]
-            .dired
-            .as_ref()
-            .map(|d| (d.dir.clone(), d.sort))
-        else {
+        let point = self.buffers[idx].buffer.point();
+        let Some((dir, sort, names, point_index)) = self.buffers[idx].dired.as_ref().map(|d| {
+            let names: Vec<String> = d.entries.iter().map(|e| e.name.clone()).collect();
+            (d.dir.clone(), d.sort, names, d.entry_index_at(point.row))
+        }) else {
             return;
         };
         let marks: Vec<(String, Mark)> = self.buffers[idx]
@@ -1022,12 +1022,26 @@ impl App {
                     }
                 }
                 dired.set_sort(sort);
+                let target_row = point_index.and_then(|index| {
+                    dired
+                        .entries
+                        .iter()
+                        .position(|e| e.name == names[index])
+                        .or_else(|| {
+                            names[index + 1..]
+                                .iter()
+                                .chain(names[..index].iter().rev())
+                                .find_map(|name| dired.entries.iter().position(|e| e.name == *name))
+                        })
+                        .map(|i| dired.row_of(i))
+                });
+                let target = target_row
+                    .map(|row| Pos::new(row, dired.filename_col(row).unwrap_or(0)))
+                    .unwrap_or(point);
                 let lines = dired.render(&self.theme);
                 self.buffers[idx].buffer.set_content(lines);
                 self.buffers[idx].dired = Some(dired);
-                // Land on the first file line near where point was.
-                self.buffers[idx].buffer.beginning_of_buffer();
-                self.goto_first_file(idx);
+                self.buffers[idx].buffer.set_point(target);
                 self.message = Some(format!("Reverted {}", dir.display()));
             }
             Err(err) => {
@@ -4957,6 +4971,38 @@ mod tests {
 
         assert!(!dir.join("a.txt").exists());
         assert!(dir.join("b.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_file_keeps_point_on_the_nearest_entry() {
+        let dir = temp_dir("delete-point");
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let idx = app.current;
+        app.dired_goto_name(idx, "c.txt");
+
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let entry = app.dired_entry_at_point().unwrap();
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[entry].name,
+            "d.txt"
+        );
+
+        press(&mut app, 'D');
+        type_into_prompt(&mut app, "yes");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let entry = app.dired_entry_at_point().unwrap();
+        assert_eq!(
+            app.current().dired.as_ref().unwrap().entries[entry].name,
+            "b.txt"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
