@@ -1,8 +1,13 @@
-//! A text buffer with an Emacs-style point, mark, and incremental search.
+//! A text buffer with an Emacs-style point, mark ring, and incremental search.
 //!
 //! Buffers are free text: the whole buffer is editable unless it has been
 //! marked read-only. Directory listings, file views, and the hex viewer are
 //! read-only; `*scratch*` is editable.
+
+use std::collections::VecDeque;
+
+/// Emacs's default `mark-ring-max`.
+const MARK_RING_MAX: usize = 16;
 
 /// A logical position: a row index and a character column within that row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -194,6 +199,8 @@ pub struct Buffer {
     lines: Vec<Line>,
     point: Pos,
     mark: Option<Pos>,
+    /// Former marks, most recent first (Emacs's buffer-local `mark-ring`).
+    mark_ring: VecDeque<Pos>,
     /// Top line of the view.
     scroll: usize,
     /// Wrapped row within the top line, when a wrapped line is taller than the
@@ -217,6 +224,7 @@ impl Buffer {
             lines: vec![Line::plain("")],
             point: Pos::new(0, 0),
             mark: None,
+            mark_ring: VecDeque::new(),
             scroll: 0,
             scroll_sub: 0,
             width: 80,
@@ -251,6 +259,7 @@ impl Buffer {
         self.scroll = 0;
         self.scroll_sub = 0;
         self.mark = None;
+        self.mark_ring.clear();
         self.clamp_point();
     }
 
@@ -442,8 +451,30 @@ impl Buffer {
 
     // ---- marks, region -----------------------------------------------------
 
+    /// Set the mark at point, pushing the old active mark onto the ring.
     pub fn set_mark(&mut self) {
+        if let Some(old) = self.mark {
+            self.mark_ring.push_front(old);
+            self.mark_ring.truncate(MARK_RING_MAX);
+        }
         self.mark = Some(self.point);
+    }
+
+    /// Jump to the active mark and rotate the mark ring like `pop-mark`.
+    ///
+    /// Returns `None` when no mark is set, otherwise whether point was already
+    /// at the mark before the jump.
+    pub fn pop_to_mark(&mut self) -> Option<bool> {
+        let mark = self.clamped_pos(self.mark?);
+        let at_mark = self.point == mark;
+        self.set_point(mark);
+        if let Some(next) = self.mark_ring.pop_front() {
+            self.mark = Some(self.clamped_pos(next));
+            self.mark_ring.push_back(mark);
+        } else {
+            self.mark = Some(self.point);
+        }
+        Some(at_mark)
     }
 
     pub fn clear_mark(&mut self) {
@@ -1066,6 +1097,11 @@ impl Buffer {
         col.min(self.lines[row].char_len())
     }
 
+    fn clamped_pos(&self, pos: Pos) -> Pos {
+        let row = pos.row.min(self.last_row());
+        Pos::new(row, self.clamp_col(row, pos.col))
+    }
+
     fn scroll_into_view(&mut self) {
         let psub = self.sub_of(self.point.row, self.point.col);
         if self.point.row < self.scroll || (self.point.row == self.scroll && psub < self.scroll_sub)
@@ -1439,6 +1475,72 @@ mod tests {
     fn exchange_without_mark_fails() {
         let mut b = Buffer::new();
         assert!(!b.exchange_point_and_mark());
+    }
+
+    #[test]
+    fn push_mark_keeps_the_most_recent_sixteen_entries() {
+        let mut b = Buffer::new();
+        b.insert_str("01234567890123456789");
+        for col in 0..=17 {
+            b.set_point(Pos::new(0, col));
+            b.set_mark();
+        }
+        assert_eq!(b.mark_ring.len(), MARK_RING_MAX);
+        assert_eq!(b.mark_ring.front(), Some(&Pos::new(0, 16)));
+        assert_eq!(b.mark_ring.back(), Some(&Pos::new(0, 1)));
+    }
+
+    #[test]
+    fn pop_to_mark_jumps_and_rotates_the_ring() {
+        let mut b = Buffer::new();
+        b.insert_str("abcd");
+        for col in 0..=2 {
+            b.set_point(Pos::new(0, col));
+            b.set_mark();
+        }
+        b.set_point(Pos::new(0, 3));
+
+        assert_eq!(b.pop_to_mark(), Some(false));
+        assert_eq!(b.point(), Pos::new(0, 2));
+        assert_eq!(b.mark, Some(Pos::new(0, 1)));
+        assert_eq!(
+            b.mark_ring,
+            VecDeque::from([Pos::new(0, 0), Pos::new(0, 2)])
+        );
+
+        assert_eq!(b.pop_to_mark(), Some(false));
+        assert_eq!(b.point(), Pos::new(0, 1));
+        assert_eq!(b.mark, Some(Pos::new(0, 0)));
+
+        assert_eq!(b.pop_to_mark(), Some(false));
+        assert_eq!(b.point(), Pos::new(0, 0));
+        assert_eq!(b.mark, Some(Pos::new(0, 2)));
+    }
+
+    #[test]
+    fn pop_to_mark_without_a_mark_or_ring() {
+        let mut b = Buffer::new();
+        assert_eq!(b.pop_to_mark(), None);
+
+        b.insert_str("abc");
+        b.set_point(Pos::new(0, 1));
+        b.set_mark();
+        b.set_point(Pos::new(0, 2));
+        assert_eq!(b.pop_to_mark(), Some(false));
+        assert_eq!(b.point(), Pos::new(0, 1));
+        assert_eq!(b.mark, Some(Pos::new(0, 1)));
+        assert_eq!(b.pop_to_mark(), Some(true));
+    }
+
+    #[test]
+    fn replacing_content_clears_the_mark_ring() {
+        let mut b = Buffer::new();
+        b.set_mark();
+        b.set_point(Pos::new(0, 1));
+        b.set_mark();
+        b.set_content(vec![Line::plain("new")]);
+        assert_eq!(b.mark, None);
+        assert!(b.mark_ring.is_empty());
     }
 
     #[test]

@@ -4103,7 +4103,13 @@ impl App {
         }
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
+        let arg = self.numeric_arg;
         let n = self.take_arg();
+        let mark_prefix = arg.is_some();
+        // `C-u C-u C-SPC` sets the mark even though other prefixes pop it,
+        // matching `set-mark-command`'s raw universal-argument case.
+        let mark_set_unconditionally =
+            arg.is_some_and(|arg| !arg.digits && arg.sign > 0 && arg.magnitude > 4);
         match action {
             None => {}
             SelfInsert(c) => {
@@ -4193,8 +4199,16 @@ impl App {
                 }
             }
             SetMark => {
-                self.current_mut().buffer.set_mark();
-                self.message = Some("Mark set".to_string());
+                if mark_prefix && !mark_set_unconditionally {
+                    if let Some(at_mark) = self.current_mut().buffer.pop_to_mark() {
+                        self.message = at_mark.then(|| "Mark popped".to_string());
+                    } else {
+                        self.message = Some("No mark set in this buffer".to_string());
+                    }
+                } else {
+                    self.current_mut().buffer.set_mark();
+                    self.message = Some("Mark set".to_string());
+                }
             }
             KillRegion => self.kill_region(prev),
             CopyRegion => self.copy_region(prev),
@@ -5190,6 +5204,7 @@ fn help_lines() -> Vec<String> {
         "  M-d            kill word forward",
         "  C-d            delete character forward",
         "  C-SPC          set mark",
+        "  C-u C-SPC      pop mark",
         "  C-w / M-w      kill / copy region",
         "  C-y / M-y      yank / yank-pop",
         "  C-q            quoted insert",
@@ -7796,6 +7811,85 @@ mod tests {
         // Point flashes at the far end of the region (the mark).
         assert_eq!(app.current().buffer.point(), Pos::new(0, 11));
         assert!(app.copy_flash.is_some());
+    }
+
+    #[test]
+    fn c_u_c_space_pops_the_mark_ring() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("0123456789")]);
+        for col in 0..=2 {
+            app.current_mut().buffer.set_point(Pos::new(0, col));
+            ctrl(&mut app, ' ');
+        }
+        app.current_mut().buffer.set_point(Pos::new(0, 3));
+
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 2));
+        assert_eq!(
+            app.current().buffer.region(),
+            Some((Pos::new(0, 1), Pos::new(0, 2)))
+        );
+        assert_eq!(app.message, None);
+
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 1));
+        assert_eq!(
+            app.current().buffer.region(),
+            Some((Pos::new(0, 0), Pos::new(0, 1)))
+        );
+
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 0));
+        assert_eq!(
+            app.current().buffer.region(),
+            Some((Pos::new(0, 0), Pos::new(0, 2)))
+        );
+    }
+
+    #[test]
+    fn c_u_c_space_without_a_mark_reports_it() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.message.as_deref(), Some("No mark set in this buffer"));
+
+        ctrl(&mut app, ' ');
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.message.as_deref(), Some("Mark popped"));
+    }
+
+    #[test]
+    fn c_u_c_u_c_space_sets_the_mark_instead_of_popping() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut()
+            .buffer
+            .set_content(vec![Line::plain("0123456789")]);
+        app.current_mut().buffer.set_point(Pos::new(0, 1));
+
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, ' ');
+        assert_eq!(app.current().buffer.point(), Pos::new(0, 1));
+        assert_eq!(
+            app.current().buffer.region(),
+            Some((Pos::new(0, 1), Pos::new(0, 1)))
+        );
+        assert_eq!(app.message.as_deref(), Some("Mark set"));
     }
 
     #[test]
