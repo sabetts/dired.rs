@@ -3130,23 +3130,27 @@ impl App {
             }
             return;
         }
-        if self.windows.len() == 1 {
-            if self.viewport_rows < 3 {
-                self.switch_to(idx);
-                return;
-            }
-            self.split_active_window(SplitAxis::Below);
+        let axis = if self.windows.len() == 1 {
+            let axis = self.sensible_split_axis();
+            self.split_active_window(axis);
             if self.windows.len() == 1 {
                 self.switch_to(idx);
                 return;
             }
-        }
+            Some(axis)
+        } else {
+            None
+        };
         let Some(other) = self.next_window_id() else {
             self.switch_to(idx);
             return;
         };
         self.save_active_view();
-        let width = self.window_width(other);
+        let width = match axis {
+            Some(SplitAxis::Right) => self.viewport_cols.saturating_sub(1) / 2,
+            Some(SplitAxis::Below) | None => self.window_width(other),
+        }
+        .max(1);
         self.resize_buffer_menu(idx, width);
         let view = capture_view(&self.buffers[idx].buffer);
         if let Some(window) = self.windows.iter_mut().find(|window| window.id == other) {
@@ -7457,6 +7461,7 @@ mod tests {
     fn c_x_c_b_opens_the_buffer_list_in_another_window() {
         let dir = temp_dir("buffer-menu-open");
         let mut app = App::new(Config::default());
+        app.prepare_active_view(100, 20);
         app.open_dired(dir.clone());
         let origin = app.current;
         let active = app.active_window;
@@ -7490,6 +7495,53 @@ mod tests {
         assert_eq!(app.buffers.len(), before + 1);
         assert_eq!(app.current().kind, Kind::BufferMenu);
         assert_eq!(app.windows.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_splits_wide_windows_side_by_side() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("buffer-menu-smart-split");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        ctrl_x_ctrl(&mut app, 'b');
+
+        assert_eq!(only_split_axis(&app), SplitAxis::Right);
+        let menu = app.find_buffer("*Buffer List*").unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let width = app
+            .window_areas
+            .iter()
+            .find(|(id, _)| {
+                app.windows
+                    .iter()
+                    .any(|window| window.id == *id && window.buffer == menu)
+            })
+            .map(|(_, area)| usize::from(area.width))
+            .unwrap();
+        assert!(app.buffers[menu].buffer.line_text(0).chars().count() <= width);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_menu_stacks_tall_windows_below() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("buffer-menu-smart-tall");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(30, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        ctrl_x_ctrl(&mut app, 'b');
+
+        assert_eq!(only_split_axis(&app), SplitAxis::Below);
 
         std::fs::remove_dir_all(&dir).ok();
     }
