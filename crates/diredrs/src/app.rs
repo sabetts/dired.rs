@@ -97,9 +97,27 @@ pub enum WindowTree {
     Leaf(WindowId),
     Split {
         axis: SplitAxis,
+        first_weight: u16,
+        second_weight: u16,
         first: Box<WindowTree>,
         second: Box<WindowTree>,
     },
+}
+
+/// A split boundary that can be dragged with the mouse.
+#[derive(Debug, Clone)]
+pub(crate) struct Divider {
+    pub axis: SplitAxis,
+    pub rect: Rect,
+    pub container: Rect,
+    pub(crate) path: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct DividerDrag {
+    axis: SplitAxis,
+    container: Rect,
+    path: Vec<usize>,
 }
 
 /// The minibuffer prompt, if one is active.
@@ -253,6 +271,8 @@ pub struct App {
     pub(crate) window_tree: WindowTree,
     /// Buffer areas from the last draw, used for directional movement.
     window_areas: Vec<(WindowId, Rect)>,
+    dividers: Vec<Divider>,
+    divider_drag: Option<DividerDrag>,
     /// Whether the idle `M-g` number overlay is showing.
     show_window_numbers: bool,
     next_window_id: WindowId,
@@ -320,6 +340,8 @@ impl App {
             active_window: 0,
             window_tree: WindowTree::Leaf(0),
             window_areas: Vec::new(),
+            dividers: Vec::new(),
+            divider_drag: None,
             show_window_numbers: false,
             next_window_id: 1,
             visit_seq: 0,
@@ -445,6 +467,10 @@ impl App {
 
     pub(crate) fn set_window_areas(&mut self, areas: Vec<(WindowId, Rect)>) {
         self.window_areas = areas;
+    }
+
+    pub(crate) fn set_dividers(&mut self, dividers: Vec<Divider>) {
+        self.dividers = dividers;
     }
 
     pub(crate) fn show_window_numbers(&self) -> bool {
@@ -1793,6 +1819,7 @@ impl App {
         use crossterm::event::KeyEventKind;
         match event {
             TermEvent::Paste(text) => self.handle_paste(text),
+            TermEvent::Mouse(mouse) => self.handle_mouse(mouse),
             TermEvent::Key(mut key) => {
                 if key.kind == KeyEventKind::Release {
                     return;
@@ -1817,6 +1844,62 @@ impl App {
                     self.handle_key(key);
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.divider_drag = self
+                    .dividers
+                    .iter()
+                    .find(|d| divider_contains(d.rect, mouse.column, mouse.row))
+                    .map(|d| DividerDrag {
+                        axis: d.axis,
+                        container: d.container,
+                        path: d.path.clone(),
+                    });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = self.divider_drag.clone() else {
+                    return;
+                };
+                let (first_weight, second_weight) = match drag.axis {
+                    SplitAxis::Right => {
+                        if drag.container.width < 3 {
+                            return;
+                        }
+                        let content = u32::from(drag.container.width) - 1;
+                        let x = u32::from(mouse.column).clamp(
+                            u32::from(drag.container.x) + 1,
+                            u32::from(drag.container.x) + content - 1,
+                        );
+                        let first = x - u32::from(drag.container.x);
+                        (first as u16, (content - first) as u16)
+                    }
+                    SplitAxis::Below => {
+                        if drag.container.height < 4 {
+                            return;
+                        }
+                        let total = u32::from(drag.container.height);
+                        let y = u32::from(mouse.row).clamp(
+                            u32::from(drag.container.y) + 1,
+                            u32::from(drag.container.y) + total - 3,
+                        );
+                        let first = y - u32::from(drag.container.y) + 1;
+                        (first as u16, (total - first) as u16)
+                    }
+                };
+                resize_split(
+                    &mut self.window_tree,
+                    &drag.path,
+                    first_weight,
+                    second_weight,
+                );
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.divider_drag = None,
             _ => {}
         }
     }
@@ -3849,6 +3932,17 @@ fn restore_view(buffer: &mut Buffer, view: WindowView) {
     buffer.set_view_top(view.scroll, view.scroll_sub);
 }
 
+fn divider_contains(rect: Rect, column: u16, row: u16) -> bool {
+    let column = u32::from(column);
+    let row = u32::from(row);
+    let left = u32::from(rect.x);
+    let top = u32::from(rect.y);
+    column >= left
+        && column < left + u32::from(rect.width)
+        && row >= top
+        && row < top + u32::from(rect.height)
+}
+
 fn window_ids(tree: &WindowTree, out: &mut Vec<WindowId>) {
     match tree {
         WindowTree::Leaf(id) => out.push(*id),
@@ -3864,6 +3958,8 @@ fn split_leaf(tree: &mut WindowTree, target: WindowId, axis: SplitAxis, new_id: 
         WindowTree::Leaf(id) if *id == target => {
             *tree = WindowTree::Split {
                 axis,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(WindowTree::Leaf(*id)),
                 second: Box::new(WindowTree::Leaf(new_id)),
             };
@@ -3876,6 +3972,34 @@ fn split_leaf(tree: &mut WindowTree, target: WindowId, axis: SplitAxis, new_id: 
     }
 }
 
+fn resize_split(
+    tree: &mut WindowTree,
+    path: &[usize],
+    first_weight: u16,
+    second_weight: u16,
+) -> bool {
+    let WindowTree::Split {
+        first_weight: current_first,
+        second_weight: current_second,
+        first,
+        second,
+        ..
+    } = tree
+    else {
+        return false;
+    };
+    match path.first() {
+        None => {
+            *current_first = first_weight;
+            *current_second = second_weight;
+            true
+        }
+        Some(0) => resize_split(first, &path[1..], first_weight, second_weight),
+        Some(1) => resize_split(second, &path[1..], first_weight, second_weight),
+        Some(_) => false,
+    }
+}
+
 /// Remove `target`, collapsing its parent. `None` means the whole tree was the
 /// removed leaf.
 fn remove_leaf(tree: WindowTree, target: WindowId) -> Option<WindowTree> {
@@ -3884,6 +4008,8 @@ fn remove_leaf(tree: WindowTree, target: WindowId) -> Option<WindowTree> {
         WindowTree::Leaf(_) => Some(tree),
         WindowTree::Split {
             axis,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
@@ -3895,6 +4021,8 @@ fn remove_leaf(tree: WindowTree, target: WindowId) -> Option<WindowTree> {
                 (None, Some(second)) => Some(second),
                 (Some(first), Some(second)) => Some(WindowTree::Split {
                     axis,
+                    first_weight,
+                    second_weight,
                     first: Box::new(first),
                     second: Box::new(second),
                 }),
@@ -4260,7 +4388,16 @@ fn help_lines() -> Vec<String> {
 mod tests {
     use super::*;
     use crate::dired::SortKey;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_term_event(TermEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
 
     fn press(app: &mut App, c: char) {
         app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -4359,6 +4496,174 @@ mod tests {
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], active);
         assert!(app.windows.iter().all(|w| w.buffer == current));
+    }
+
+    #[test]
+    fn dragging_the_vertical_divider_resizes_windows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '3');
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let first = app.window_ids()[0];
+        let width = |app: &App, id| {
+            app.window_areas
+                .iter()
+                .find(|(window, _)| *window == id)
+                .unwrap()
+                .1
+                .width
+        };
+        let before = width(&app, first);
+        let divider = app
+            .dividers
+            .iter()
+            .find(|d| d.axis == SplitAxis::Right)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            divider.rect.x + 5,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            divider.rect.x + 5,
+            divider.rect.y,
+        );
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(width(&app, first), before + 5);
+
+        // Dragging past the left edge clamps the first pane to one column.
+        let divider = app
+            .dividers
+            .iter()
+            .find(|d| d.axis == SplitAxis::Right)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            0,
+            divider.rect.y,
+        );
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(width(&app, first), 1);
+    }
+
+    #[test]
+    fn dragging_the_upper_mode_line_resizes_stacked_windows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '2');
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        let first = app.window_ids()[0];
+        let height = |app: &App, id| {
+            app.window_areas
+                .iter()
+                .find(|(window, _)| *window == id)
+                .unwrap()
+                .1
+                .height
+        };
+        let before = height(&app, first);
+        let divider = app
+            .dividers
+            .iter()
+            .find(|d| d.axis == SplitAxis::Below)
+            .cloned()
+            .unwrap();
+        assert_eq!(divider.rect.height, 1);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y + 3,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y + 3,
+        );
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(height(&app, first), before + 3);
+
+        // Dragging to the top clamps the upper pane to one content row.
+        let divider = app
+            .dividers
+            .iter()
+            .find(|d| d.axis == SplitAxis::Below)
+            .cloned()
+            .unwrap();
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            divider.rect.x,
+            divider.rect.y,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            divider.rect.x,
+            0,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            divider.rect.x,
+            0,
+        );
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(height(&app, first), 1);
+    }
+
+    #[test]
+    fn dragging_outside_a_divider_does_not_resize_windows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, '3');
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let before: Vec<(WindowId, Rect)> = app.window_areas.clone();
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 20, 10);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 20, 10);
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(app.window_areas, before);
     }
 
     #[test]

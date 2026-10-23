@@ -6,7 +6,7 @@ use ratatui::text::{Line as RLine, Span as RSpan, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Prompt, SplitAxis, WindowId, WindowTree, WindowView};
+use crate::app::{App, Divider, Prompt, SplitAxis, WindowId, WindowTree, WindowView};
 use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::{Search, SearchDirection};
 
@@ -17,7 +17,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let mut panes = Vec::new();
     let mut dividers = Vec::new();
-    collect_panes(app.window_tree(), rows[0], &mut panes, &mut dividers);
+    let mut path = Vec::new();
+    collect_panes(
+        app.window_tree(),
+        rows[0],
+        &mut path,
+        &mut panes,
+        &mut dividers,
+    );
     app.set_window_areas(
         panes
             .iter()
@@ -59,9 +66,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             active,
         );
     }
-    for divider in dividers {
-        draw_vertical_border(frame, divider);
+    for divider in &dividers {
+        if divider.axis == SplitAxis::Right {
+            draw_vertical_border(frame, divider.rect);
+        }
     }
+    app.set_dividers(dividers);
     if app.show_window_numbers() {
         draw_window_numbers(frame, app, &panes);
     }
@@ -71,8 +81,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn collect_panes(
     tree: &WindowTree,
     area: Rect,
+    path: &mut Vec<usize>,
     out: &mut Vec<(WindowId, Rect, Rect)>,
-    dividers: &mut Vec<Rect>,
+    dividers: &mut Vec<Divider>,
 ) {
     match tree {
         WindowTree::Leaf(id) => {
@@ -81,32 +92,49 @@ fn collect_panes(
         }
         WindowTree::Split {
             axis,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
             let chunks = match axis {
-                SplitAxis::Below => {
-                    Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(area)
-                }
+                SplitAxis::Below => Layout::vertical([
+                    Constraint::Fill(*first_weight),
+                    Constraint::Fill(*second_weight),
+                ])
+                .split(area),
                 SplitAxis::Right => Layout::horizontal([
-                    Constraint::Fill(1),
+                    Constraint::Fill(*first_weight),
                     Constraint::Length(1),
-                    Constraint::Fill(1),
+                    Constraint::Fill(*second_weight),
                 ])
                 .split(area),
             };
-            match axis {
-                SplitAxis::Below => {
-                    collect_panes(first, chunks[0], out, dividers);
-                    collect_panes(second, chunks[1], out, dividers);
-                }
-                SplitAxis::Right => {
-                    collect_panes(first, chunks[0], out, dividers);
-                    dividers.push(chunks[1]);
-                    collect_panes(second, chunks[2], out, dividers);
-                }
-            }
+            let divider_rect = match axis {
+                SplitAxis::Below => Rect {
+                    x: chunks[0].x,
+                    y: chunks[0].y + chunks[0].height.saturating_sub(1),
+                    width: chunks[0].width,
+                    height: 1,
+                },
+                SplitAxis::Right => chunks[1],
+            };
+            dividers.push(Divider {
+                axis: *axis,
+                rect: divider_rect,
+                container: area,
+                path: path.clone(),
+            });
+            path.push(0);
+            collect_panes(first, chunks[0], path, out, dividers);
+            path.pop();
+            path.push(1);
+            let second_area = match axis {
+                SplitAxis::Below => chunks[1],
+                SplitAxis::Right => chunks[2],
+            };
+            collect_panes(second, second_area, path, out, dividers);
+            path.pop();
         }
     }
 }

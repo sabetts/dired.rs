@@ -22,7 +22,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -43,10 +45,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.config.unwrap_or_else(config::default_path);
     let cfg = config::Config::load(&path)?;
+    let mouse = cfg.ui.mouse;
 
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    if mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
@@ -54,6 +60,9 @@ fn main() -> Result<()> {
     let result = app.run(&mut terminal);
 
     disable_raw_mode().ok();
+    if mouse {
+        execute!(terminal.backend_mut(), DisableMouseCapture).ok();
+    }
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
