@@ -710,12 +710,20 @@ impl App {
         }
     }
 
+    fn sensible_split_axis(&self) -> SplitAxis {
+        if self.viewport_cols > self.viewport_rows {
+            SplitAxis::Right
+        } else {
+            SplitAxis::Below
+        }
+    }
+
     fn switch_buffer_in_other_window(&mut self, idx: usize) {
         if idx >= self.buffers.len() {
             return;
         }
         if self.windows.len() == 1 {
-            self.split_active_window(SplitAxis::Below);
+            self.split_active_window(self.sensible_split_axis());
         }
         let Some(other) = self.next_window_id() else {
             return;
@@ -4257,6 +4265,30 @@ mod tests {
         press(app, c);
     }
 
+    fn switch_to_scratch_in_other_window(app: &mut App) {
+        ctrl_x(app, '4');
+        press(app, 'b');
+        if let Prompt::SwitchBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = "*scratch*".to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn only_split_axis(app: &App) -> SplitAxis {
+        match app.window_tree() {
+            WindowTree::Split { axis, .. } => *axis,
+            WindowTree::Leaf(_) => panic!("expected a split window tree"),
+        }
+    }
+
     fn start_find_prompt(app: &mut App, input: &str) {
         app.prompt = Prompt::FindFile {
             input: input.to_string(),
@@ -4520,6 +4552,36 @@ mod tests {
         assert_eq!(app.window(dired).unwrap().buffer, dired_buffer);
         let other = app.window(app.active_window).unwrap();
         assert_eq!(other.buffer, app.current);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_x_4_b_splits_wide_windows_side_by_side() {
+        let dir = temp_dir("other-buffer-wide");
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(100, 20);
+        app.open_dired(dir.clone());
+
+        switch_to_scratch_in_other_window(&mut app);
+
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(only_split_axis(&app), SplitAxis::Right);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_x_4_b_stacks_tall_windows() {
+        let dir = temp_dir("other-buffer-tall");
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(30, 40);
+        app.open_dired(dir.clone());
+
+        switch_to_scratch_in_other_window(&mut app);
+
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(only_split_axis(&app), SplitAxis::Below);
 
         std::fs::remove_dir_all(&dir).ok();
     }
