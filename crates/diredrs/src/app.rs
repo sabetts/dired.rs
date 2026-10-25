@@ -374,6 +374,9 @@ pub struct App {
     /// Height of the minibuffer during the current prompt, never shrinking as
     /// the candidate list narrows.
     minibuffer_rows: u16,
+    /// Whether the previous frame had an active minibuffer prompt. Used so a
+    /// prompt can shrink after a multi-line echo message.
+    minibuffer_had_prompt: bool,
     prefix: Prefix,
     /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
     /// Emacs's `echo-keystrokes` does.
@@ -444,6 +447,7 @@ impl App {
             should_quit: false,
             prompt: Prompt::None,
             minibuffer_rows: 1,
+            minibuffer_had_prompt: false,
             prefix: Prefix::None,
             prefix_echo: None,
             confirm_flash: None,
@@ -5068,7 +5072,9 @@ impl App {
     /// Height of the minibuffer area, expanded to show prompt candidates or
     /// multi-line shell output in the echo area.
     pub fn minibuffer_height(&mut self) -> u16 {
-        let desired = if let Some((_, _, candidates, _)) = self.prompt_view() {
+        let prompt = self.prompt_view();
+        let prompt_active = prompt.is_some();
+        let desired = if let Some((_, _, candidates, _)) = prompt {
             (1 + candidates.len().min(5)) as u16
         } else if self.search.active {
             1
@@ -5078,11 +5084,12 @@ impl App {
                 .map(|message| message.split('\n').count().max(1) as u16)
                 .unwrap_or(1)
         };
-        self.minibuffer_rows = if matches!(self.prompt, Prompt::None) {
-            desired
-        } else {
+        self.minibuffer_rows = if prompt_active && self.minibuffer_had_prompt {
             self.minibuffer_rows.max(desired)
+        } else {
+            desired
         };
+        self.minibuffer_had_prompt = prompt_active;
         self.minibuffer_rows
     }
 
@@ -6460,6 +6467,17 @@ mod tests {
         #[cfg(not(windows))]
         {
             "echo started; sleep 5"
+        }
+    }
+
+    fn five_shell_lines() -> &'static str {
+        #[cfg(windows)]
+        {
+            "echo one& echo two& echo three& echo four& echo five"
+        }
+        #[cfg(not(windows))]
+        {
+            "echo one; echo two; echo three; echo four; echo five"
         }
     }
 
@@ -9729,6 +9747,59 @@ mod tests {
         assert_eq!(app.windows.len(), 1);
         assert_eq!(app.message.as_deref(), Some("hello"));
         assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_prompt_shrinks_an_expanded_echo_area() {
+        let dir = temp_dir("shell-echo-shrink");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, five_shell_lines());
+        wait_for_shell(&mut app);
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+        assert_eq!(app.minibuffer_height(), 5);
+
+        alt(&mut app, '!');
+        assert!(matches!(app.prompt, Prompt::ShellCommand { .. }));
+        assert_eq!(app.minibuffer_height(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_prompt_clears_previous_multiline_echo_output() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("shell-echo-clear");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        enter_shell_command(&mut app, five_shell_lines());
+        wait_for_shell(&mut app);
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        alt(&mut app, '!');
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rows: Vec<String> = buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().all(|row| !row.contains("one")),
+            "stale shell output remained: {rows:#?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
