@@ -21,6 +21,7 @@ use crate::hexl;
 use crate::input::History;
 use crate::keymap::{self, Action};
 use crate::killring::KillRing;
+use crate::message_log::MessageLog;
 use crate::paste;
 use crate::search::{Search, SearchDirection};
 use crate::shell;
@@ -45,6 +46,8 @@ pub enum Kind {
     Hexl,
     /// Read-only output from a shell command.
     Shell,
+    /// The `*Messages*` log of echo-area messages.
+    Messages,
 }
 
 /// One buffer.
@@ -364,6 +367,10 @@ pub struct App {
     /// Where to draw point in a non-prompt echo-area message (used while a
     /// foreground shell command runs).
     message_cursor: Option<usize>,
+    /// The log shown by `C-h e`.
+    message_log: MessageLog,
+    /// The most recent message copied into `message_log`.
+    last_logged_message: Option<String>,
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
@@ -441,6 +448,8 @@ impl App {
             search: Search::default(),
             message: None,
             message_cursor: None,
+            message_log: MessageLog::default(),
+            last_logged_message: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
             viewport_cols: 80,
@@ -552,6 +561,7 @@ impl App {
             },
             Kind::Hexl => "Hexl".to_string(),
             Kind::Shell => "Shell Command".to_string(),
+            Kind::Messages => "Messages".to_string(),
         }
     }
 
@@ -900,6 +910,10 @@ impl App {
         if self.buffers[idx].kind == Kind::Scratch {
             self.message = Some("Cannot kill *scratch*".to_string());
             return;
+        }
+        if self.buffers[idx].kind == Kind::Messages {
+            self.message_log.clear();
+            self.last_logged_message = self.message.clone();
         }
         let name = self.buffers[idx].name.clone();
         if self
@@ -3377,6 +3391,7 @@ impl App {
             },
             Prefix::Help => match key.code {
                 KeyCode::Char('b') => self.show_help(),
+                KeyCode::Char('e') => self.show_messages(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-h", key),
             },
@@ -3410,6 +3425,64 @@ impl App {
         };
         self.switch_to(idx);
         self.buffers[idx].buffer.beginning_of_buffer();
+    }
+
+    // ---- messages ----------------------------------------------------------
+
+    /// Log the echo-area message currently on screen, if it has changed.
+    pub(crate) fn capture_echo_message(&mut self) {
+        if !matches!(self.prompt, Prompt::None) || self.search.active {
+            return;
+        }
+        let Some(message) = self.message.clone() else {
+            self.last_logged_message = None;
+            return;
+        };
+        if message.is_empty() || self.last_logged_message.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        self.last_logged_message = Some(message.clone());
+        self.message_log.push(&message);
+        self.refresh_messages_buffer();
+    }
+
+    fn ensure_messages_buffer(&mut self) -> usize {
+        if let Some(idx) = self.find_buffer("*Messages*") {
+            self.buffers[idx].kind = Kind::Messages;
+            self.buffers[idx].buffer.set_read_only(true);
+            return idx;
+        }
+        let buffer = Buffer::read_only_from(vec![Line::plain("")]);
+        self.new_buffer("*Messages*".to_string(), Kind::Messages, buffer)
+    }
+
+    fn refresh_messages_buffer(&mut self) {
+        let Some(idx) = self.find_buffer("*Messages*") else {
+            return;
+        };
+        let lines: Vec<Line> = if self.message_log.is_empty() {
+            vec![Line::plain("")]
+        } else {
+            self.message_log.lines().map(Line::plain).collect()
+        };
+        self.buffers[idx].kind = Kind::Messages;
+        self.buffers[idx].buffer.set_content(lines);
+        self.buffers[idx].buffer.set_read_only(true);
+        self.buffers[idx].buffer.end_of_buffer();
+        let view = capture_view(&self.buffers[idx].buffer);
+        for window in &mut self.windows {
+            if window.buffer == idx {
+                window.view = view;
+            }
+        }
+    }
+
+    /// `C-h e`: show the echo-area message log without selecting it.
+    fn show_messages(&mut self) {
+        self.capture_echo_message();
+        let idx = self.ensure_messages_buffer();
+        self.refresh_messages_buffer();
+        self.display_buffer_in_other_window(idx, true);
     }
 
     // ---- buffer menu -------------------------------------------------------
@@ -3476,7 +3549,11 @@ impl App {
                 let buf = &self.buffers[i];
                 let file = match buf.kind {
                     Kind::Dired | Kind::File | Kind::Hexl => buf.name.clone(),
-                    Kind::Scratch | Kind::Help | Kind::BufferMenu | Kind::Shell => String::new(),
+                    Kind::Scratch
+                    | Kind::Help
+                    | Kind::BufferMenu
+                    | Kind::Shell
+                    | Kind::Messages => String::new(),
                 };
                 BufferMenuEntry {
                     name: buf.name.clone(),
@@ -6189,6 +6266,7 @@ fn scratch_lines() -> Vec<String> {
         String::new(),
         "Discovering commands".to_string(),
         "  C-h b          list all key bindings in a *Help* buffer".to_string(),
+        "  C-h e          show recent echo-area messages in *Messages*".to_string(),
         "  C-x 2 / C-x 3  split the window below / to the right".to_string(),
         "  C-x 0 / C-x 1  delete this / other windows".to_string(),
         "  C-x o          move to the other window".to_string(),
@@ -6305,6 +6383,7 @@ fn help_lines() -> Vec<String> {
         "",
         "Help",
         "  C-h b          describe bindings (this buffer)",
+        "  C-h e          show recent echo-area messages (*Messages*)",
         "  C-g            abort the current command",
         "",
         "Arguments",
@@ -6370,6 +6449,11 @@ mod tests {
     fn ctrl_x_ctrl(app: &mut App, c: char) {
         ctrl(app, 'x');
         ctrl(app, c);
+    }
+
+    fn ctrl_h(app: &mut App, c: char) {
+        ctrl(app, 'h');
+        press(app, c);
     }
 
     fn open_buffer_menu(app: &mut App) {
@@ -8000,6 +8084,82 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.find_buffer("*Help*").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_h_e_shows_recent_messages_without_selecting() {
+        let dir = temp_dir("messages-view");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let origin = app.current;
+
+        press(&mut app, 's');
+        app.capture_echo_message();
+        ctrl_h(&mut app, 'e');
+
+        let idx = app.find_buffer("*Messages*").unwrap();
+        assert_eq!(app.current, origin);
+        assert!(app.windows.iter().any(|window| window.buffer == idx));
+        assert_eq!(app.buffers[idx].kind, Kind::Messages);
+        assert!(!app.buffers[idx].buffer.editable());
+        let text: String = (0..app.buffers[idx].buffer.len())
+            .map(|row| app.buffers[idx].buffer.line_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Sorting by"), "{text:?}");
+        assert_eq!(
+            app.buffers[idx].buffer.point().row,
+            app.buffers[idx].buffer.last_row()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn messages_log_shows_multiline_shell_output() {
+        let dir = temp_dir("messages-shell");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, five_shell_lines());
+        wait_for_shell(&mut app);
+        app.capture_echo_message();
+        ctrl_h(&mut app, 'e');
+
+        let idx = app.find_buffer("*Messages*").unwrap();
+        let text: String = (0..app.buffers[idx].buffer.len())
+            .map(|row| app.buffers[idx].buffer.line_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for word in ["one", "two", "three", "four", "five"] {
+            assert!(text.contains(word), "{word} missing from {text:?}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn killing_messages_clears_the_log() {
+        let dir = temp_dir("messages-kill");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        app.message = Some("remember me".to_string());
+        app.capture_echo_message();
+        ctrl_h(&mut app, 'e');
+        let idx = app.find_buffer("*Messages*").unwrap();
+        app.kill_buffer(idx);
+        assert!(app.message_log.is_empty());
+
+        ctrl_h(&mut app, 'e');
+        let idx = app.find_buffer("*Messages*").unwrap();
+        let text: String = (0..app.buffers[idx].buffer.len())
+            .map(|row| app.buffers[idx].buffer.line_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("remember me"), "{text:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -12,6 +12,7 @@ mod hexl;
 mod input;
 mod keymap;
 mod killring;
+mod message_log;
 mod paste;
 mod search;
 mod shell;

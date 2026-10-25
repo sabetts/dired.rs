@@ -11,6 +11,7 @@ use crate::buffer::{Color, Line, Pos, Style};
 use crate::search::{Search, SearchDirection};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.capture_echo_message();
     let minibuffer = app.minibuffer_height().max(1);
     let rows =
         Layout::vertical([Constraint::Min(0), Constraint::Length(minibuffer)]).split(frame.area());
