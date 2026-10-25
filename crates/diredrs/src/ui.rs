@@ -334,6 +334,14 @@ fn draw_minibuffer(frame: &mut Frame, app: &App, area: Rect) {
         let suffix = if app.search.failed { " [failing]" } else { "" };
         format!("{prefix}: {}{suffix}", app.search.query)
     } else {
+        if let Some(cursor) = app.message_cursor() {
+            let text = app.message.clone().unwrap_or_default();
+            let mut cells: Vec<(char, Style)> =
+                text.chars().map(|c| (c, Style::default())).collect();
+            place_cursor(&mut cells, cursor, app.cursor_style);
+            frame.render_widget(Paragraph::new(to_rline(&cells)), area);
+            return;
+        }
         app.message.clone().unwrap_or_default()
     };
     frame.render_widget(Paragraph::new(text), area);

@@ -361,6 +361,9 @@ pub struct App {
     pub history: History,
     pub search: Search,
     pub message: Option<String>,
+    /// Where to draw point in a non-prompt echo-area message (used while a
+    /// foreground shell command runs).
+    message_cursor: Option<usize>,
     pub kill_ring: KillRing,
     /// Height (in rows) of the buffer view, from the last draw.
     pub viewport_rows: usize,
@@ -434,6 +437,7 @@ impl App {
             history: History::default(),
             search: Search::default(),
             message: None,
+            message_cursor: None,
             kill_ring: KillRing::new(),
             viewport_rows: 20,
             viewport_cols: 80,
@@ -975,9 +979,13 @@ impl App {
                     buffer_name: None,
                     rendered: 0,
                 });
-                self.message = Some("Shell command running (C-g to cancel)".to_string());
+                self.message = Some(format!("Shell command: {command}"));
+                self.message_cursor = Some(0);
             }
-            Err(err) => self.message = Some(format!("Cannot run shell command: {err}")),
+            Err(err) => {
+                self.message = Some(format!("Cannot run shell command: {err}"));
+                self.message_cursor = None;
+            }
         }
     }
 
@@ -1001,6 +1009,7 @@ impl App {
             job.process.kill();
         }
         self.message = Some("Shell command canceled".to_string());
+        self.message_cursor = None;
     }
 
     /// Advance the active shell job, finalizing it or moving it to the output
@@ -1036,6 +1045,7 @@ impl App {
             job.rendered = output.len();
             self.show_shell_output(&output, true);
             self.message = Some("Shell command running in background".to_string());
+            self.message_cursor = None;
             return;
         }
         if job.buffer_name.is_some() {
@@ -1053,6 +1063,7 @@ impl App {
         output: &[u8],
         status: std::process::ExitStatus,
     ) {
+        self.message_cursor = None;
         if output.is_empty() {
             if background.is_some() {
                 self.show_shell_output(output, true);
@@ -3087,8 +3098,6 @@ impl App {
         if foreground_shell {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
                 self.cancel_foreground_shell();
-            } else {
-                self.message = Some("Shell command running (C-g to cancel)".to_string());
             }
             return;
         }
@@ -5068,6 +5077,10 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn message_cursor(&self) -> Option<usize> {
+        self.message_cursor
+    }
+
     /// Height of the minibuffer area, expanded to show prompt candidates or
     /// multi-line shell output in the echo area.
     pub fn minibuffer_height(&mut self) -> u16 {
@@ -5585,7 +5598,6 @@ impl App {
             .as_ref()
             .is_some_and(|job| job.foreground_until.is_some())
         {
-            self.message = Some("Shell command running (C-g to cancel)".to_string());
             return;
         }
         if self.confirm_flash.is_some() {
@@ -9830,11 +9842,17 @@ mod tests {
 
         enter_shell_command(&mut app, long_shell_command());
         assert!(app.shell_job.is_some());
+        assert_eq!(
+            app.message,
+            Some(format!("Shell command: {}", long_shell_command()))
+        );
+        assert_eq!(app.message_cursor(), Some(0));
         ctrl(&mut app, 'g');
 
         assert!(app.shell_job.is_none());
         assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
         assert_eq!(app.message.as_deref(), Some("Shell command canceled"));
+        assert!(app.message_cursor().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
