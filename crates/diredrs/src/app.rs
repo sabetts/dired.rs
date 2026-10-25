@@ -3137,6 +3137,9 @@ impl App {
             }
             return;
         }
+        // A new command may produce the same text as the previous one; allow
+        // the message log to count it as a repeat rather than suppressing it.
+        self.last_logged_message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         if self.handle_argument(key, ctrl) {
@@ -3434,6 +3437,9 @@ impl App {
         if !matches!(self.prompt, Prompt::None) || self.search.active {
             return;
         }
+        if self.message_cursor.is_some() {
+            return;
+        }
         let Some(message) = self.message.clone() else {
             self.last_logged_message = None;
             return;
@@ -3463,7 +3469,11 @@ impl App {
         let lines: Vec<Line> = if self.message_log.is_empty() {
             vec![Line::plain("")]
         } else {
-            self.message_log.lines().map(Line::plain).collect()
+            self.message_log
+                .lines()
+                .into_iter()
+                .map(Line::plain)
+                .collect()
         };
         self.buffers[idx].kind = Kind::Messages;
         self.buffers[idx].buffer.set_content(lines);
@@ -8136,8 +8146,34 @@ mod tests {
         for word in ["one", "two", "three", "four", "five"] {
             assert!(text.contains(word), "{word} missing from {text:?}");
         }
+        assert!(!text.contains("Shell command:"), "{text:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repeated_echo_messages_are_counted() {
+        let mut app = App::new(Config::default());
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+        app.current_mut().buffer.end_of_buffer();
+
+        ctrl(&mut app, 'n');
+        app.capture_echo_message();
+        ctrl(&mut app, 'n');
+        app.capture_echo_message();
+        ctrl_h(&mut app, 'e');
+
+        let idx = app.find_buffer("*Messages*").unwrap();
+        let text: String = (0..app.buffers[idx].buffer.len())
+            .map(|row| app.buffers[idx].buffer.line_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("End of buffer [2 times]"), "{text:?}");
     }
 
     #[test]
