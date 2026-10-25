@@ -1067,8 +1067,6 @@ impl App {
         if output.is_empty() {
             if background.is_some() {
                 self.show_shell_output(output, true);
-            } else {
-                self.update_existing_shell_output(output);
             }
             self.message = Some(if status.success() {
                 "(Shell command succeeded with no output)".to_string()
@@ -1091,7 +1089,6 @@ impl App {
             echo.push_str(&shell_failure_message(status));
         }
         if self.shell_output_echoes(&echo) {
-            self.update_existing_shell_output(output);
             self.message = Some(echo);
         } else {
             self.show_shell_output(output, false);
@@ -1112,19 +1109,6 @@ impl App {
             }
         }
         true
-    }
-
-    fn update_existing_shell_output(&mut self, output: &[u8]) {
-        let Some(idx) = self.find_buffer(shell::OUTPUT_BUFFER) else {
-            return;
-        };
-        self.update_shell_output(idx, output, false);
-        let view = capture_view(&self.buffers[idx].buffer);
-        for window in &mut self.windows {
-            if window.buffer == idx {
-                window.view = view;
-            }
-        }
     }
 
     fn ensure_shell_buffer(&mut self) -> usize {
@@ -9745,6 +9729,35 @@ mod tests {
         assert_eq!(app.windows.len(), 1);
         assert_eq!(app.message.as_deref(), Some("hello"));
         assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_echo_does_not_touch_an_existing_output_buffer() {
+        let dir = temp_dir("shell-echo-existing");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, many_shell_lines());
+        wait_for_shell(&mut app);
+        let idx = app.find_buffer(shell::OUTPUT_BUFFER).unwrap();
+
+        enter_shell_command(&mut app, "echo hello");
+        wait_for_shell(&mut app);
+        assert_eq!(app.message.as_deref(), Some("hello"));
+        assert_eq!(app.buffers[idx].buffer.len(), 6);
+        assert!(app.buffers[idx].buffer.line_text(0).contains("one"));
+        assert!(app.buffers[idx].buffer.line_text(5).contains("six"));
+
+        enter_shell_command(&mut app, "exit 0");
+        wait_for_shell(&mut app);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("(Shell command succeeded with no output)")
+        );
+        assert_eq!(app.buffers[idx].buffer.len(), 6);
+        assert!(app.buffers[idx].buffer.line_text(5).contains("six"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
