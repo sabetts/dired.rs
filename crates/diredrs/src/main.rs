@@ -14,6 +14,7 @@ mod keymap;
 mod killring;
 mod paste;
 mod search;
+mod shell;
 mod syntax;
 mod theme;
 mod ui;

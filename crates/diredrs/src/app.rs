@@ -23,6 +23,7 @@ use crate::keymap::{self, Action};
 use crate::killring::KillRing;
 use crate::paste;
 use crate::search::{Search, SearchDirection};
+use crate::shell;
 use crate::syntax;
 use crate::theme::Theme;
 use crate::ui;
@@ -42,6 +43,8 @@ pub enum Kind {
     File,
     /// A read-only hex viewer (Emacs `hexl-mode`).
     Hexl,
+    /// Read-only output from a shell command.
+    Shell,
 }
 
 /// One buffer.
@@ -185,6 +188,11 @@ pub enum Prompt {
         /// Highlighted completion candidate (a path), moved with Up/Down.
         selected: Option<usize>,
     },
+    /// Read a shell command (`M-!`).
+    ShellCommand {
+        input: String,
+        cursor: usize,
+    },
     /// A `yes-or-no-p` confirmation: type the answer, then `RET`.
     Confirm {
         message: String,
@@ -210,6 +218,10 @@ pub enum PendingAction {
     },
     /// Continue a Wdired commit after confirming an overwrite.
     WdiredCommit(WdiredCommit),
+    /// Kill the live shell output buffer and its process.
+    KillShellBuffer {
+        name: String,
+    },
 }
 
 /// Rename operations and pending overwrite confirmations for Wdired.
@@ -229,6 +241,19 @@ struct RenameWork {
     original: PathBuf,
     current: PathBuf,
     target: PathBuf,
+}
+
+/// A shell command whose first second is foreground and whose remaining
+/// lifetime is background.
+struct ShellJob {
+    process: shell::ShellProcess,
+    /// While set, the command is foreground and `C-g` cancels it. Once the
+    /// deadline passes, output is shown in `*Shell Command Output*`.
+    foreground_until: Option<Instant>,
+    /// The output buffer once the command has been backgrounded.
+    buffer_name: Option<String>,
+    /// How much of the output has already been rendered.
+    rendered: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +330,13 @@ const COPY_FLASH: Duration = Duration::from_millis(220);
 /// unrecognized reply before asking again.
 const CONFIRM_FLASH: Duration = Duration::from_secs(2);
 
+/// How long a shell command stays foreground before it is shown in an output
+/// buffer and allowed to continue in the background.
+const SHELL_FOREGROUND_WAIT: Duration = Duration::from_secs(1);
+
+/// How often the event loop checks on a running shell command.
+const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -368,6 +400,10 @@ pub struct App {
     human_sizes: bool,
     /// Rows of padding kept above/below point before scrolling.
     scroll_margin: usize,
+    /// The one shell command currently running, foreground or background.
+    shell_job: Option<ShellJob>,
+    /// How long a new shell command stays foreground. Tests shorten this.
+    shell_foreground_wait: Duration,
 }
 
 impl App {
@@ -418,6 +454,8 @@ impl App {
             pasting_until: None,
             human_sizes,
             scroll_margin,
+            shell_job: None,
+            shell_foreground_wait: SHELL_FOREGROUND_WAIT,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -502,6 +540,7 @@ impl App {
                 None => "Dired".to_string(),
             },
             Kind::Hexl => "Hexl".to_string(),
+            Kind::Shell => "Shell Command".to_string(),
         }
     }
 
@@ -819,6 +858,29 @@ impl App {
         self.select_window(other);
     }
 
+    /// Kill a buffer through an interactive request, asking first when it owns
+    /// a running shell process.
+    fn request_kill_buffer(&mut self, idx: usize) {
+        if idx >= self.buffers.len() {
+            return;
+        }
+        let name = self.buffers[idx].name.clone();
+        let live = self
+            .shell_job
+            .as_ref()
+            .is_some_and(|job| job.buffer_name.as_deref() == Some(name.as_str()));
+        if live {
+            self.prompt = Prompt::Confirm {
+                message: format!("Buffer {name} has a running process; kill it? (yes or no) "),
+                input: String::new(),
+                cursor: 0,
+                action: PendingAction::KillShellBuffer { name },
+            };
+        } else {
+            self.kill_buffer(idx);
+        }
+    }
+
     /// Kill a buffer. `*scratch*` cannot be killed.
     fn kill_buffer(&mut self, idx: usize) {
         if idx >= self.buffers.len() {
@@ -827,6 +889,18 @@ impl App {
         if self.buffers[idx].kind == Kind::Scratch {
             self.message = Some("Cannot kill *scratch*".to_string());
             return;
+        }
+        let name = self.buffers[idx].name.clone();
+        if self
+            .shell_job
+            .as_ref()
+            .is_some_and(|job| job.buffer_name.as_deref() == Some(name.as_str()))
+        {
+            if let Some(job) = &mut self.shell_job {
+                job.process.kill();
+            }
+            self.shell_job = None;
+            self.message = Some("Shell command killed".to_string());
         }
         let active_killed = self.current == idx;
         self.save_active_view();
@@ -861,6 +935,249 @@ impl App {
             if active_killed {
                 window.view = fallback_view;
             }
+        }
+    }
+
+    // ---- shell commands ----------------------------------------------------
+
+    /// `M-!`: read and run a shell command.
+    fn start_shell_command(&mut self) {
+        if self.shell_job.is_some() {
+            self.message = Some("A shell command is already running".to_string());
+            return;
+        }
+        self.prompt = Prompt::ShellCommand {
+            input: String::new(),
+            cursor: 0,
+        };
+    }
+
+    fn run_shell_command(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        if self.shell_job.is_some() {
+            self.message = Some("A shell command is already running".to_string());
+            return;
+        }
+        let dir = self.shell_directory();
+        match shell::ShellProcess::spawn(command, &dir) {
+            Ok(process) => {
+                self.shell_job = Some(ShellJob {
+                    process,
+                    foreground_until: Some(Instant::now() + self.shell_foreground_wait),
+                    buffer_name: None,
+                    rendered: 0,
+                });
+                self.message = Some("Shell command running (C-g to cancel)".to_string());
+            }
+            Err(err) => self.message = Some(format!("Cannot run shell command: {err}")),
+        }
+    }
+
+    fn shell_directory(&self) -> PathBuf {
+        if let Some(dired) = &self.current().dired {
+            return dired.dir.clone();
+        }
+        match self.current().kind {
+            Kind::File | Kind::Hexl => PathBuf::from(&self.current().name)
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from("."))),
+            _ => home_dir().unwrap_or_else(|| PathBuf::from(".")),
+        }
+    }
+
+    /// Cancel a shell command that has not yet moved to the background.
+    fn cancel_foreground_shell(&mut self) {
+        if let Some(mut job) = self.shell_job.take() {
+            job.process.kill();
+        }
+        self.message = Some("Shell command canceled".to_string());
+    }
+
+    /// Advance the active shell job, finalizing it or moving it to the output
+    /// buffer once its foreground grace period has elapsed.
+    fn poll_shell_job(&mut self) {
+        let Some(job) = self.shell_job.as_mut() else {
+            return;
+        };
+        job.process.pump();
+        let status = match job.process.try_finish() {
+            Ok(status) => status,
+            Err(err) => {
+                job.process.kill();
+                self.shell_job = None;
+                self.message = Some(format!("Shell command failed: {err}"));
+                return;
+            }
+        };
+        if let Some(status) = status {
+            let background = job.buffer_name.take();
+            let output = job.process.output().to_vec();
+            self.shell_job = None;
+            self.finish_shell_command(background.as_deref(), &output, status);
+            return;
+        }
+        if job
+            .foreground_until
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            job.foreground_until = None;
+            job.buffer_name = Some(shell::OUTPUT_BUFFER.to_string());
+            let output = job.process.output().to_vec();
+            job.rendered = output.len();
+            self.show_shell_output(&output, true);
+            self.message = Some("Shell command running in background".to_string());
+            return;
+        }
+        if job.buffer_name.is_some() {
+            let output = job.process.output().to_vec();
+            if output.len() != job.rendered {
+                job.rendered = output.len();
+                self.show_shell_output(&output, true);
+            }
+        }
+    }
+
+    fn finish_shell_command(
+        &mut self,
+        background: Option<&str>,
+        output: &[u8],
+        status: std::process::ExitStatus,
+    ) {
+        if output.is_empty() {
+            if background.is_some() {
+                self.show_shell_output(output, true);
+            } else if let Some(idx) = self.find_buffer(shell::OUTPUT_BUFFER) {
+                self.update_shell_output(idx, output, false);
+            }
+            self.message = Some(if status.success() {
+                "(Shell command succeeded with no output)".to_string()
+            } else {
+                shell_failure_message(status)
+            });
+            return;
+        }
+        self.show_shell_output(output, background.is_some());
+        self.message = if status.success() {
+            None
+        } else {
+            Some(shell_failure_message(status))
+        };
+    }
+
+    fn ensure_shell_buffer(&mut self) -> usize {
+        if let Some(idx) = self.find_buffer(shell::OUTPUT_BUFFER) {
+            self.buffers[idx].kind = Kind::Shell;
+            self.buffers[idx].buffer.set_read_only(true);
+            return idx;
+        }
+        let buffer = Buffer::read_only_from(vec![Line::plain("")]);
+        self.new_buffer(shell::OUTPUT_BUFFER.to_string(), Kind::Shell, buffer)
+    }
+
+    fn update_shell_output(&mut self, idx: usize, output: &[u8], follow: bool) {
+        let lines = file::to_lines(output)
+            .into_iter()
+            .map(Line::plain)
+            .collect();
+        let buffer = &mut self.buffers[idx].buffer;
+        buffer.set_content(lines);
+        buffer.set_read_only(true);
+        if follow {
+            buffer.end_of_buffer();
+        } else {
+            buffer.beginning_of_buffer();
+        }
+        self.buffers[idx].kind = Kind::Shell;
+    }
+
+    fn show_shell_output(&mut self, output: &[u8], follow: bool) {
+        let idx = self.ensure_shell_buffer();
+        self.update_shell_output(idx, output, follow);
+        if self.current == idx {
+            return;
+        }
+        if let Some(id) = self
+            .windows
+            .iter()
+            .find(|window| window.buffer == idx)
+            .map(|window| window.id)
+        {
+            let width = self.window_width(id);
+            self.buffers[idx].buffer.set_width(width);
+            if follow {
+                self.buffers[idx].buffer.end_of_buffer();
+            } else {
+                self.buffers[idx].buffer.beginning_of_buffer();
+            }
+            let view = capture_view(&self.buffers[idx].buffer);
+            if let Some(window) = self.windows.iter_mut().find(|window| window.id == id) {
+                window.view = view;
+            }
+            return;
+        }
+        self.display_buffer_in_other_window(idx, follow);
+    }
+
+    /// Show a buffer in another window without selecting it.
+    fn display_buffer_in_other_window(&mut self, idx: usize, follow: bool) {
+        if idx >= self.buffers.len() || self.current == idx {
+            return;
+        }
+        if let Some(id) = self
+            .windows
+            .iter()
+            .find(|window| window.buffer == idx)
+            .map(|window| window.id)
+        {
+            let width = self.window_width(id);
+            self.buffers[idx].buffer.set_width(width);
+            if follow {
+                self.buffers[idx].buffer.end_of_buffer();
+            } else {
+                self.buffers[idx].buffer.beginning_of_buffer();
+            }
+            let view = capture_view(&self.buffers[idx].buffer);
+            if let Some(window) = self.windows.iter_mut().find(|window| window.id == id) {
+                window.view = view;
+            }
+            return;
+        }
+        let axis = if self.windows.len() == 1 {
+            let axis = self.sensible_split_axis();
+            self.split_active_window(axis);
+            if self.windows.len() == 1 {
+                self.switch_to(idx);
+                return;
+            }
+            Some(axis)
+        } else {
+            None
+        };
+        let Some(other) = self.next_window_id() else {
+            self.switch_to(idx);
+            return;
+        };
+        self.save_active_view();
+        let width = match axis {
+            Some(SplitAxis::Right) => self.viewport_cols.saturating_sub(1) / 2,
+            Some(SplitAxis::Below) | None => self.window_width(other),
+        }
+        .max(1);
+        self.buffers[idx].buffer.set_width(width);
+        if follow {
+            self.buffers[idx].buffer.end_of_buffer();
+        } else {
+            self.buffers[idx].buffer.beginning_of_buffer();
+        }
+        let view = capture_view(&self.buffers[idx].buffer);
+        if let Some(window) = self.windows.iter_mut().find(|window| window.id == other) {
+            window.buffer = idx;
+            window.view = view;
         }
     }
 
@@ -2346,6 +2663,13 @@ impl App {
                 self.ask_wdired_conflict(commit);
                 return;
             }
+            PendingAction::KillShellBuffer { name } => {
+                if let Some(idx) = self.find_buffer(&name) {
+                    self.kill_buffer(idx);
+                    self.message = Some("Shell command killed".to_string());
+                }
+                return;
+            }
         };
         self.continue_delete(paths, index, deleted, errors, all);
     }
@@ -2504,6 +2828,7 @@ impl App {
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
+            self.poll_shell_job();
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
                 break;
@@ -2522,10 +2847,19 @@ impl App {
         let prefix_deadline = self.prefix_echo.as_ref().map(|(_, deadline)| *deadline);
         let confirm_deadline = self.confirm_flash.as_ref().map(|(_, deadline)| *deadline);
         let flash_deadline = self.copy_flash.as_ref().map(|(_, deadline)| *deadline);
-        let deadline = [prefix_deadline, confirm_deadline, flash_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let shell_deadline = self
+            .shell_job
+            .as_ref()
+            .map(|_| Instant::now() + SHELL_POLL_INTERVAL);
+        let deadline = [
+            prefix_deadline,
+            confirm_deadline,
+            flash_deadline,
+            shell_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         if let Some(deadline) = deadline {
             let now = Instant::now();
             if deadline > now && event::poll(deadline - now)? {
@@ -2699,6 +3033,18 @@ impl App {
         // ...and an overdue-but-unshown prefix hint or number overlay.
         self.prefix_echo = None;
         self.show_window_numbers = false;
+        let foreground_shell = self
+            .shell_job
+            .as_ref()
+            .is_some_and(|job| job.foreground_until.is_some());
+        if foreground_shell {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+                self.cancel_foreground_shell();
+            } else {
+                self.message = Some("Shell command running (C-g to cancel)".to_string());
+            }
+            return;
+        }
         if !matches!(self.prompt, Prompt::None) {
             self.handle_prompt_key(key);
             return;
@@ -2764,6 +3110,11 @@ impl App {
         if !ctrl && key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('g') {
             self.numeric_arg = None;
             self.start_prefix(Prefix::MetaG, "M-g-");
+            return;
+        }
+        if !ctrl && key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('!') {
+            self.numeric_arg = None;
+            self.start_shell_command();
             return;
         }
 
@@ -3081,7 +3432,7 @@ impl App {
                 let buf = &self.buffers[i];
                 let file = match buf.kind {
                     Kind::Dired | Kind::File | Kind::Hexl => buf.name.clone(),
-                    Kind::Scratch | Kind::Help | Kind::BufferMenu => String::new(),
+                    Kind::Scratch | Kind::Help | Kind::BufferMenu | Kind::Shell => String::new(),
                 };
                 BufferMenuEntry {
                     name: buf.name.clone(),
@@ -3678,7 +4029,8 @@ impl App {
             | Prompt::FindFile { .. }
             | Prompt::Rename { .. }
             | Prompt::CreateDirectory { .. }
-            | Prompt::MarkExtension { .. } => return,
+            | Prompt::MarkExtension { .. }
+            | Prompt::ShellCommand { .. } => return,
         };
         if count == 0 {
             *selected = 0;
@@ -3696,6 +4048,7 @@ impl App {
             | Prompt::Rename { input, cursor, .. }
             | Prompt::MarkExtension { input, cursor }
             | Prompt::CreateDirectory { input, cursor, .. }
+            | Prompt::ShellCommand { input, cursor }
             | Prompt::Confirm { input, cursor, .. } => (input, cursor),
             Prompt::None => return None,
         };
@@ -3710,6 +4063,7 @@ impl App {
             | Prompt::Rename { cursor, .. }
             | Prompt::MarkExtension { cursor, .. }
             | Prompt::CreateDirectory { cursor, .. }
+            | Prompt::ShellCommand { cursor, .. }
             | Prompt::Confirm { cursor, .. } => Some(*cursor),
             Prompt::None => None,
         }
@@ -4111,7 +4465,10 @@ impl App {
                 self.file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1)
             }
             Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false),
-            Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => return,
+            Prompt::None
+            | Prompt::Confirm { .. }
+            | Prompt::MarkExtension { .. }
+            | Prompt::ShellCommand { .. } => return,
         };
         if candidates.is_empty() {
             return;
@@ -4268,7 +4625,10 @@ impl App {
                 .file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1)
                 .len(),
             Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false).len(),
-            Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
+            Prompt::None
+            | Prompt::Confirm { .. }
+            | Prompt::MarkExtension { .. }
+            | Prompt::ShellCommand { .. } => 0,
         };
         use Action::*;
         let action = keymap::translate(key);
@@ -4347,12 +4707,12 @@ impl App {
             } => {
                 let candidates = self.kill_candidates(&input);
                 if let Some(&i) = candidates.get(selected) {
-                    self.kill_buffer(i);
+                    self.request_kill_buffer(i);
                 } else if let Some(i) = self.find_buffer(input.trim()) {
-                    self.kill_buffer(i);
+                    self.request_kill_buffer(i);
                 } else if input.trim().is_empty() {
                     let cur = self.current;
-                    self.kill_buffer(cur);
+                    self.request_kill_buffer(cur);
                 } else {
                     self.message = Some(format!("No such buffer: {}", input.trim()));
                 }
@@ -4416,6 +4776,7 @@ impl App {
                 self.commit_create_directory(&chosen);
             }
             Prompt::MarkExtension { input, .. } => self.mark_by_extension(&input),
+            Prompt::ShellCommand { input, .. } => self.run_shell_command(&input),
             Prompt::Confirm {
                 message,
                 input,
@@ -4587,6 +4948,15 @@ impl App {
             }
             Prompt::MarkExtension { input, cursor } => {
                 let prefix = "Mark extension: ";
+                Some((
+                    format!("{prefix}{input}"),
+                    prefix.chars().count() + *cursor,
+                    Vec::new(),
+                    0,
+                ))
+            }
+            Prompt::ShellCommand { input, cursor } => {
+                let prefix = "Shell command: ";
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
@@ -5120,6 +5490,14 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if self
+            .shell_job
+            .as_ref()
+            .is_some_and(|job| job.foreground_until.is_some())
+        {
+            self.message = Some("Shell command running (C-g to cancel)".to_string());
+            return;
+        }
         if self.confirm_flash.is_some() {
             self.resume_confirm();
         }
@@ -5514,6 +5892,13 @@ fn is_backup_file(name: &str) -> bool {
 }
 
 /// Whether a `yes-or-no-p` answer means "yes".
+fn shell_failure_message(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("Shell command failed with code {code}"),
+        None => "Shell command terminated".to_string(),
+    }
+}
+
 fn answer_is_yes(answer: &str) -> bool {
     answer.trim().eq_ignore_ascii_case("yes")
 }
@@ -5717,6 +6102,7 @@ fn scratch_lines() -> Vec<String> {
         "  C-x b          switch buffers".to_string(),
         "  C-x C-b        list buffers".to_string(),
         "  C-x 4 b        switch buffers in the other window".to_string(),
+        "  M-!            run a shell command".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
     ]
@@ -5794,6 +6180,13 @@ fn help_lines() -> Vec<String> {
         "  o                   select it in another window",
         "  v                   select it and show display-marked buffers",
         "  g / q               revert / quit the Buffer Menu",
+        "",
+        "Shell commands",
+        "  M-!                 run a shell command in the current directory",
+        "                      Output goes to *Shell Command Output*.",
+        "                      C-g cancels it during the first second.",
+        "  C-x k               kill that buffer and a running command (with",
+        "                      confirmation; answering no keeps both)",
         "",
         "Files and buffers",
         "  C-x C-f        find file (visit a file by path; TAB completes)",
@@ -5934,6 +6327,68 @@ mod tests {
             WindowTree::Split { axis, .. } => *axis,
             WindowTree::Leaf(_) => panic!("expected a split window tree"),
         }
+    }
+
+    fn enter_shell_command(app: &mut App, command: &str) {
+        alt(app, '!');
+        type_text(app, command);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn wait_for_shell(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.poll_shell_job();
+            if app.shell_job.is_none() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "shell command timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_shell_background(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            app.poll_shell_job();
+            match &app.shell_job {
+                Some(job) if job.buffer_name.is_some() => return,
+                Some(_) => {}
+                None => panic!("shell command finished before it was backgrounded"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell command never backgrounded"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn long_shell_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "echo started & ping -n 6 127.0.0.1 >nul"
+        }
+        #[cfg(not(windows))]
+        {
+            "echo started; sleep 5"
+        }
+    }
+
+    fn kill_buffer_prompt(app: &mut App, name: &str) {
+        ctrl_x(app, 'k');
+        if let Prompt::KillBuffer {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &mut app.prompt
+        {
+            *input = name.to_string();
+            *cursor = input.chars().count();
+            *selected = 0;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
     fn start_find_prompt(app: &mut App, input: &str) {
@@ -9150,6 +9605,110 @@ mod tests {
         let dired = app.current().dired.as_ref().unwrap();
         let entry = dired.entries.iter().find(|e| e.name == "c.txt").unwrap();
         assert_eq!(entry.mark, Mark::Marked);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn m_bang_opens_a_shell_command_prompt() {
+        let mut app = App::new(Config::default());
+        alt(&mut app, '!');
+        assert!(matches!(app.prompt, Prompt::ShellCommand { .. }));
+    }
+
+    #[test]
+    fn shell_command_shows_output_without_selecting_it() {
+        let dir = temp_dir("shell-output");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let origin = app.current;
+
+        enter_shell_command(&mut app, "echo hello");
+        wait_for_shell(&mut app);
+
+        let idx = app.find_buffer(shell::OUTPUT_BUFFER).unwrap();
+        assert_eq!(app.current, origin);
+        assert!(app.windows.iter().any(|window| window.buffer == idx));
+        assert_eq!(app.buffers[idx].kind, Kind::Shell);
+        assert!(!app.buffers[idx].buffer.editable());
+        assert!(app.buffers[idx].buffer.line_text(0).contains("hello"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_reports_failure_and_empty_success() {
+        let dir = temp_dir("shell-status");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, "exit 7");
+        wait_for_shell(&mut app);
+        assert!(app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("code 7")));
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+
+        enter_shell_command(&mut app, "exit 0");
+        wait_for_shell(&mut app);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("(Shell command succeeded with no output)")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_g_cancels_a_foreground_shell_command() {
+        let dir = temp_dir("shell-cancel-foreground");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, long_shell_command());
+        assert!(app.shell_job.is_some());
+        ctrl(&mut app, 'g');
+
+        assert!(app.shell_job.is_none());
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+        assert_eq!(app.message.as_deref(), Some("Shell command canceled"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn background_shell_command_survives_c_g_until_its_buffer_is_killed() {
+        let dir = temp_dir("shell-background");
+        let mut app = App::new(Config::default());
+        app.shell_foreground_wait = Duration::from_millis(20);
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, long_shell_command());
+        wait_for_shell_background(&mut app);
+        let idx = app.find_buffer(shell::OUTPUT_BUFFER).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.buffers[idx].buffer.line_text(0).contains("started") {
+            assert!(Instant::now() < deadline, "shell output never arrived");
+            app.poll_shell_job();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        ctrl(&mut app, 'g');
+        assert!(app.shell_job.is_some());
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_some());
+
+        kill_buffer_prompt(&mut app, shell::OUTPUT_BUFFER);
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        answer(&mut app, "no");
+        assert!(app.shell_job.is_some());
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_some());
+
+        kill_buffer_prompt(&mut app, shell::OUTPUT_BUFFER);
+        assert!(matches!(app.prompt, Prompt::Confirm { .. }));
+        answer(&mut app, "yes");
+        assert!(app.shell_job.is_none());
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
