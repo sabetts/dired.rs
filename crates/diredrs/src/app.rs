@@ -404,6 +404,8 @@ pub struct App {
     shell_job: Option<ShellJob>,
     /// How long a new shell command stays foreground. Tests shorten this.
     shell_foreground_wait: Duration,
+    /// Commands submitted through `M-!`.
+    shell_history: History,
 }
 
 impl App {
@@ -456,6 +458,7 @@ impl App {
             scroll_margin,
             shell_job: None,
             shell_foreground_wait: SHELL_FOREGROUND_WAIT,
+            shell_history: History::default(),
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -946,6 +949,7 @@ impl App {
             self.message = Some("A shell command is already running".to_string());
             return;
         }
+        self.shell_history.reset_navigation();
         self.prompt = Prompt::ShellCommand {
             input: String::new(),
             cursor: 0,
@@ -964,6 +968,7 @@ impl App {
         let dir = self.shell_directory();
         match shell::ShellProcess::spawn(command, &dir) {
             Ok(process) => {
+                self.shell_history.push(command);
                 self.shell_job = Some(ShellJob {
                     process,
                     foreground_until: Some(Instant::now() + self.shell_foreground_wait),
@@ -1051,8 +1056,8 @@ impl App {
         if output.is_empty() {
             if background.is_some() {
                 self.show_shell_output(output, true);
-            } else if let Some(idx) = self.find_buffer(shell::OUTPUT_BUFFER) {
-                self.update_shell_output(idx, output, false);
+            } else {
+                self.update_existing_shell_output(output);
             }
             self.message = Some(if status.success() {
                 "(Shell command succeeded with no output)".to_string()
@@ -1061,12 +1066,54 @@ impl App {
             });
             return;
         }
-        self.show_shell_output(output, background.is_some());
-        self.message = if status.success() {
-            None
+
+        if background.is_some() {
+            self.show_shell_output(output, true);
+            self.message = (!status.success()).then(|| shell_failure_message(status));
+            return;
+        }
+
+        let text = file::to_lines(output).join("\n");
+        let mut echo = text.clone();
+        if !status.success() {
+            echo.push('\n');
+            echo.push_str(&shell_failure_message(status));
+        }
+        if self.shell_output_echoes(&echo) {
+            self.update_existing_shell_output(output);
+            self.message = Some(echo);
         } else {
-            Some(shell_failure_message(status))
+            self.show_shell_output(output, false);
+            self.message = (!status.success()).then(|| shell_failure_message(status));
+        }
+    }
+
+    /// Whether shell output can fit in the echo area, using Emacs's default
+    /// `max-mini-window-height` of one quarter of the frame.
+    fn shell_output_echoes(&self, text: &str) -> bool {
+        let limit = (self.viewport_rows / 4).max(1);
+        let width = self.viewport_cols.max(1);
+        let mut rows = 0;
+        for line in text.split('\n') {
+            rows += line.chars().count().max(1).div_ceil(width);
+            if rows > limit {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn update_existing_shell_output(&mut self, output: &[u8]) {
+        let Some(idx) = self.find_buffer(shell::OUTPUT_BUFFER) else {
+            return;
         };
+        self.update_shell_output(idx, output, false);
+        let view = capture_view(&self.buffers[idx].buffer);
+        for window in &mut self.windows {
+            if window.buffer == idx {
+                window.view = view;
+            }
+        }
     }
 
     fn ensure_shell_buffer(&mut self) -> usize {
@@ -4182,6 +4229,35 @@ impl App {
         }
     }
 
+    fn prompt_history_prev(&mut self) {
+        if !matches!(self.prompt, Prompt::ShellCommand { .. }) {
+            return;
+        }
+        let current = match &self.prompt {
+            Prompt::ShellCommand { input, .. } => input.clone(),
+            _ => return,
+        };
+        if let Some(text) = self.shell_history.prev(&current) {
+            self.set_shell_prompt_input(text);
+        }
+    }
+
+    fn prompt_history_next(&mut self) {
+        if !matches!(self.prompt, Prompt::ShellCommand { .. }) {
+            return;
+        }
+        if let Some(text) = self.shell_history.next() {
+            self.set_shell_prompt_input(text);
+        }
+    }
+
+    fn set_shell_prompt_input(&mut self, text: String) {
+        if let Prompt::ShellCommand { input, cursor } = &mut self.prompt {
+            *cursor = text.chars().count();
+            *input = text;
+        }
+    }
+
     fn prompt_insert(&mut self, c: char) {
         let mut buf = [0u8; 4];
         self.prompt_insert_str(c.encode_utf8(&mut buf));
@@ -4635,6 +4711,11 @@ impl App {
         if action != DabbrevExpand {
             self.dabbrev = Option::None;
         }
+        if matches!(self.prompt, Prompt::ShellCommand { .. })
+            && !matches!(action, HistoryPrev | HistoryNext)
+        {
+            self.shell_history.reset_navigation();
+        }
         let prev = self.last_command;
         self.last_command = LastCommand::Other;
         match action {
@@ -4666,6 +4747,8 @@ impl App {
             }
             PrevLine => self.prompt_move(count, -1),
             NextLine => self.prompt_move(count, 1),
+            HistoryPrev => self.prompt_history_prev(),
+            HistoryNext => self.prompt_history_next(),
             _ => {}
         }
     }
@@ -4985,12 +5068,19 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Height of the minibuffer area, expanded to show prompt candidates.
+    /// Height of the minibuffer area, expanded to show prompt candidates or
+    /// multi-line shell output in the echo area.
     pub fn minibuffer_height(&mut self) -> u16 {
-        let desired = self
-            .prompt_view()
-            .map(|(_, _, candidates, _)| (1 + candidates.len().min(5)) as u16)
-            .unwrap_or(1);
+        let desired = if let Some((_, _, candidates, _)) = self.prompt_view() {
+            (1 + candidates.len().min(5)) as u16
+        } else if self.search.active {
+            1
+        } else {
+            self.message
+                .as_deref()
+                .map(|message| message.split('\n').count().max(1) as u16)
+                .unwrap_or(1)
+        };
         self.minibuffer_rows = if matches!(self.prompt, Prompt::None) {
             desired
         } else {
@@ -6183,7 +6273,9 @@ fn help_lines() -> Vec<String> {
         "",
         "Shell commands",
         "  M-!                 run a shell command in the current directory",
-        "                      Output goes to *Shell Command Output*.",
+        "  M-p / M-n           previous / next shell command (in the prompt)",
+        "                      Short output stays in the echo area; longer",
+        "                      output goes to *Shell Command Output*.",
         "                      C-g cancels it during the first second.",
         "  C-x k               kill that buffer and a running command (with",
         "                      confirmation; answering no keeps both)",
@@ -6372,6 +6464,17 @@ mod tests {
         #[cfg(not(windows))]
         {
             "echo started; sleep 5"
+        }
+    }
+
+    fn many_shell_lines() -> &'static str {
+        #[cfg(windows)]
+        {
+            "echo one& echo two& echo three& echo four& echo five& echo six"
+        }
+        #[cfg(not(windows))]
+        {
+            "echo one; echo two; echo three; echo four; echo five; echo six"
         }
     }
 
@@ -9617,8 +9720,8 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_shows_output_without_selecting_it() {
-        let dir = temp_dir("shell-output");
+    fn shell_command_echoes_short_output() {
+        let dir = temp_dir("shell-echo");
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
         let origin = app.current;
@@ -9626,12 +9729,58 @@ mod tests {
         enter_shell_command(&mut app, "echo hello");
         wait_for_shell(&mut app);
 
+        assert_eq!(app.current, origin);
+        assert_eq!(app.windows.len(), 1);
+        assert_eq!(app.message.as_deref(), Some("hello"));
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_shows_long_output_without_selecting_it() {
+        let dir = temp_dir("shell-output");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let origin = app.current;
+
+        enter_shell_command(&mut app, many_shell_lines());
+        wait_for_shell(&mut app);
+
         let idx = app.find_buffer(shell::OUTPUT_BUFFER).unwrap();
         assert_eq!(app.current, origin);
         assert!(app.windows.iter().any(|window| window.buffer == idx));
         assert_eq!(app.buffers[idx].kind, Kind::Shell);
         assert!(!app.buffers[idx].buffer.editable());
-        assert!(app.buffers[idx].buffer.line_text(0).contains("hello"));
+        assert!(app.buffers[idx].buffer.line_text(0).contains("one"));
+        assert!(app.buffers[idx].buffer.line_text(5).contains("six"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_uses_its_own_history() {
+        let dir = temp_dir("shell-history");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, "echo one");
+        wait_for_shell(&mut app);
+        alt(&mut app, '!');
+        assert!(matches!(app.prompt, Prompt::ShellCommand { .. }));
+
+        alt(&mut app, 'p');
+        let Prompt::ShellCommand { input, cursor } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "echo one");
+        assert_eq!(*cursor, input.chars().count());
+
+        alt(&mut app, 'n');
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert!(input.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9656,6 +9805,19 @@ mod tests {
             app.message.as_deref(),
             Some("(Shell command succeeded with no output)")
         );
+
+        #[cfg(windows)]
+        let failing = "echo bad & exit 3";
+        #[cfg(not(windows))]
+        let failing = "echo bad; exit 3";
+        enter_shell_command(&mut app, failing);
+        wait_for_shell(&mut app);
+        assert!(app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("bad") && message.contains("code 3")));
+        assert!(app.find_buffer(shell::OUTPUT_BUFFER).is_none());
+        assert_eq!(app.minibuffer_height(), 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

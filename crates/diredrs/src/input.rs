@@ -25,6 +25,12 @@ impl History {
         }
     }
 
+    /// Stop navigating history, so the next `prev` starts from the newest entry.
+    pub fn reset_navigation(&mut self) {
+        self.index = None;
+        self.draft.clear();
+    }
+
     /// Move to the previous entry, remembering `current` as the draft.
     pub fn prev(&mut self, current: &str) -> Option<String> {
         if self.items.is_empty() {
