@@ -3437,7 +3437,11 @@ impl App {
         if !matches!(self.prompt, Prompt::None) || self.search.active {
             return;
         }
-        if self.message_cursor.is_some() {
+        if self.message_cursor.is_some()
+            || self.numeric_arg.is_some()
+            || self.prefix != Prefix::None
+            || self.prefix_echo.is_some()
+        {
             return;
         }
         let Some(message) = self.message.clone() else {
@@ -8174,6 +8178,35 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("End of buffer [2 times]"), "{text:?}");
+    }
+
+    #[test]
+    fn numeric_argument_echo_is_not_logged() {
+        let mut app = App::new(Config::default());
+
+        ctrl(&mut app, 'u');
+        assert_eq!(app.message.as_deref(), Some("C-u 4-"));
+        app.capture_echo_message();
+
+        ctrl_h(&mut app, 'e');
+        let idx = app.find_buffer("*Messages*").unwrap();
+        let text: String = (0..app.buffers[idx].buffer.len())
+            .map(|row| app.buffers[idx].buffer.line_text(row))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("C-u 4-"), "{text:?}");
+    }
+
+    #[test]
+    fn pending_prefix_hint_is_not_logged() {
+        let mut app = App::new(Config::default());
+
+        ctrl(&mut app, 'x');
+        app.echo_pending_prefix(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.message.as_deref(), Some("C-x-"));
+        app.capture_echo_message();
+
+        assert!(app.message_log.is_empty());
     }
 
     #[test]
