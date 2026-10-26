@@ -414,6 +414,9 @@ pub struct App {
     /// A pending prefix key or numeric-argument hint (`C-c-`, `C-u`), shown
     /// after an idle delay the way Emacs's `echo-keystrokes` does.
     prefix_echo: Option<(String, Instant)>,
+    /// Whether this key follows an already-shown prefix echo, so the next
+    /// hint in the sequence should update immediately instead of waiting.
+    echo_immediate: bool,
     /// A confirmation waiting behind an invalid-answer message: the prompt to
     /// restore, and when to restore it if no key arrives first.
     confirm_flash: Option<(Prompt, Instant)>,
@@ -485,6 +488,7 @@ impl App {
             minibuffer_had_prompt: false,
             prefix: Prefix::None,
             prefix_echo: None,
+            echo_immediate: false,
             confirm_flash: None,
             copy_flash: None,
             numeric_arg: None,
@@ -3116,7 +3120,12 @@ impl App {
         }
         // Any keystroke cancels a pending `M-w` indication.
         self.copy_flash = None;
-        // ...and an overdue-but-unshown prefix hint or number overlay.
+        // If the current prefix was already echoed, keep subsequent hints in
+        // that sequence immediate instead of clearing and waiting again.
+        self.echo_immediate = self.prefix_echo.is_none()
+            && self.message.is_some()
+            && (self.prefix != Prefix::None || self.numeric_arg.is_some());
+        // Any keystroke cancels an overdue-but-unshown prefix hint or overlay.
         self.prefix_echo = None;
         self.show_window_numbers = false;
         let foreground_shell = self
@@ -3349,7 +3358,19 @@ impl App {
     }
 
     fn start_echo_after(&mut self, hint: &str, delay: Duration) {
-        self.prefix_echo = Some((hint.to_string(), Instant::now() + delay));
+        if self.echo_immediate {
+            self.show_echo_hint(hint);
+        } else {
+            self.prefix_echo = Some((hint.to_string(), Instant::now() + delay));
+        }
+    }
+
+    fn show_echo_hint(&mut self, hint: &str) {
+        self.prefix_echo = None;
+        self.message = Some(hint.to_string());
+        if self.prefix == Prefix::MetaG {
+            self.show_window_numbers = true;
+        }
     }
 
     /// Show the pending prefix hint once its delay has elapsed.
@@ -3357,11 +3378,7 @@ impl App {
         if let Some((hint, deadline)) = &self.prefix_echo {
             if *deadline <= now {
                 let hint = hint.clone();
-                self.prefix_echo = None;
-                self.message = Some(hint);
-                if self.prefix == Prefix::MetaG {
-                    self.show_window_numbers = true;
-                }
+                self.show_echo_hint(&hint);
             }
         }
     }
@@ -8233,6 +8250,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!text.contains("C-u"), "{text:?}");
+    }
+
+    #[test]
+    fn echoed_numeric_argument_updates_immediately() {
+        let mut app = App::new(Config::default());
+
+        ctrl(&mut app, 'u');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u"));
+
+        press(&mut app, '3');
+        assert_eq!(app.message.as_deref(), Some("C-u 3"));
+        assert!(app.prefix_echo.is_none());
+
+        press(&mut app, '4');
+        assert_eq!(app.message.as_deref(), Some("C-u 34"));
+        assert!(app.prefix_echo.is_none());
+    }
+
+    #[test]
+    fn echoed_prefix_updates_immediately() {
+        let mut app = App::new(Config::default());
+
+        ctrl(&mut app, 'x');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-x-"));
+
+        press(&mut app, '4');
+        assert_eq!(app.prefix, Prefix::CtrlX4);
+        assert_eq!(app.message.as_deref(), Some("C-x 4-"));
+        assert!(app.prefix_echo.is_none());
     }
 
     #[test]
