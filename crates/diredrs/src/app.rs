@@ -166,6 +166,8 @@ pub enum Prompt {
         cursor: usize,
         /// `true` for `C-x d` (a directory listing), `false` for a file.
         dired: bool,
+        /// `C-x 4 d`: show the directory in the other window.
+        other_window: bool,
         /// Highlighted completion candidate, moved with Up/Down. `None` means
         /// the typed `input` is used as-is (the default).
         selected: Option<usize>,
@@ -275,7 +277,7 @@ enum Prefix {
     #[default]
     None,
     CtrlX,
-    /// `C-x 4` (`C-x 4 b`).
+    /// `C-x 4` (`C-x 4 b`, `C-x 4 d`).
     CtrlX4,
     /// `M-g` (window movement and numbering).
     MetaG,
@@ -1275,10 +1277,23 @@ impl App {
 
     /// Open (or switch to) a Dired buffer for `dir`.
     fn open_dired(&mut self, dir: PathBuf) {
+        if let Some(idx) = self.find_or_create_dired(dir) {
+            self.switch_to(idx);
+        }
+    }
+
+    /// Show (or switch to) a Dired buffer for `dir` in another window, like
+    /// Emacs's `dired-other-window` (`C-x 4 d`).
+    fn open_dired_other_window(&mut self, dir: PathBuf) {
+        if let Some(idx) = self.find_or_create_dired(dir) {
+            self.switch_buffer_in_other_window(idx);
+        }
+    }
+
+    fn find_or_create_dired(&mut self, dir: PathBuf) -> Option<usize> {
         let name = dir.display().to_string();
         if let Some(idx) = self.find_buffer(&name) {
-            self.switch_to(idx);
-            return;
+            return Some(idx);
         }
         match Dired::read(&dir, self.config.ui.show_hidden, self.human_sizes) {
             Ok(dired) => {
@@ -1287,10 +1302,11 @@ impl App {
                 let idx = self.new_buffer(name, Kind::Dired, buffer);
                 self.buffers[idx].dired = Some(dired);
                 self.goto_first_file(idx);
-                self.switch_to(idx);
+                Some(idx)
             }
             Err(err) => {
                 self.message = Some(format!("Cannot read {}: {err}", dir.display()));
+                None
             }
         }
     }
@@ -3401,14 +3417,15 @@ impl App {
                 KeyCode::Char('b') => self.start_switch_buffer(false),
                 KeyCode::Char('k') => self.start_kill_buffer(),
                 KeyCode::Char('x') if ctrl => self.exchange_point_and_mark(),
-                KeyCode::Char('f') if ctrl => self.start_find_file(false),
-                KeyCode::Char('d') => self.start_find_file(true),
+                KeyCode::Char('f') if ctrl => self.start_find_file(false, false),
+                KeyCode::Char('d') => self.start_find_file(true, false),
                 KeyCode::Char('q') if self.current().kind == Kind::Dired => self.wdired_toggle(),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x", key),
             },
             Prefix::CtrlX4 => match key.code {
                 KeyCode::Char('b') => self.start_switch_buffer(true),
+                KeyCode::Char('d') => self.start_find_file(true, true),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x 4", key),
             },
@@ -4086,7 +4103,7 @@ impl App {
         };
     }
 
-    fn start_find_file(&mut self, dired: bool) {
+    fn start_find_file(&mut self, dired: bool, other_window: bool) {
         let mut input = self.default_directory().display().to_string();
         if !input.ends_with(std::path::MAIN_SEPARATOR) {
             input.push(std::path::MAIN_SEPARATOR);
@@ -4095,6 +4112,7 @@ impl App {
             cursor: input.chars().count(),
             input,
             dired,
+            other_window,
             selected: None,
         };
     }
@@ -4936,6 +4954,7 @@ impl App {
             Prompt::FindFile {
                 input,
                 dired,
+                other_window,
                 selected,
                 ..
             } => {
@@ -4952,7 +4971,11 @@ impl App {
                 }
                 if dired || path.is_dir() {
                     if path.is_dir() {
-                        self.open_dired(path);
+                        if other_window {
+                            self.open_dired_other_window(path);
+                        } else {
+                            self.open_dired(path);
+                        }
                     } else {
                         self.message = Some(format!("Not a directory: {}", path.display()));
                     }
@@ -5121,6 +5144,7 @@ impl App {
                 cursor,
                 dired,
                 selected,
+                ..
             } => {
                 let prefix = if *dired {
                     "Dired (directory): "
@@ -6331,6 +6355,7 @@ fn scratch_lines() -> Vec<String> {
         "  C-x b          switch buffers".to_string(),
         "  C-x C-b        list buffers".to_string(),
         "  C-x 4 b        switch buffers in the other window".to_string(),
+        "  C-x 4 d        open a directory in Dired in the other window".to_string(),
         "  M-!            run a shell command".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
@@ -6422,6 +6447,7 @@ fn help_lines() -> Vec<String> {
         "Files and buffers",
         "  C-x C-f        find file (visit a file by path; TAB completes)",
         "  C-x d          open a directory in Dired",
+        "  C-x 4 d        open a directory in Dired in the other window",
         "  C-x b          switch buffer",
         "  C-x C-b        list buffers",
         "  C-x k          kill buffer",
@@ -6655,6 +6681,7 @@ mod tests {
             input: input.to_string(),
             cursor: 0,
             dired: false,
+            other_window: false,
             selected: None,
         };
     }
@@ -7144,6 +7171,47 @@ mod tests {
         assert_eq!(app.active_window, other);
         assert_eq!(app.current().kind, Kind::Scratch);
         assert_eq!(app.window(first).unwrap().buffer, dired);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn c_x_4_d_opens_dired_in_the_other_window() {
+        let dir = temp_dir("dired-other-window");
+        std::fs::write(dir.join("x"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(100, 20);
+        let first = app.active_window;
+        let first_buffer = app.current;
+
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'd');
+        assert!(matches!(
+            app.prompt,
+            Prompt::FindFile {
+                dired: true,
+                other_window: true,
+                ..
+            }
+        ));
+        assert!(app
+            .prompt_view()
+            .unwrap()
+            .0
+            .starts_with("Dired (directory): "));
+        if let Prompt::FindFile { input, cursor, .. } = &mut app.prompt {
+            *input = String::new();
+            *cursor = 0;
+        }
+        type_into_prompt(&mut app, &dir.display().to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(only_split_axis(&app), SplitAxis::Right);
+        assert_ne!(app.active_window, first);
+        assert_eq!(app.current().kind, Kind::Dired);
+        assert_eq!(app.current().name, dir.display().to_string());
+        assert_eq!(app.window(first).unwrap().buffer, first_buffer);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9399,6 +9467,7 @@ mod tests {
             input: "hello world".to_string(),
             cursor: 11,
             dired: false,
+            other_window: false,
             selected: None,
         };
         app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
@@ -9441,6 +9510,7 @@ mod tests {
             input: input.clone(),
             cursor: input.chars().count(),
             dired: true,
+            other_window: false,
             selected: Some(1),
         };
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -9487,6 +9557,7 @@ mod tests {
             input,
             cursor: directory_input(&dir).chars().count(),
             dired: true,
+            other_window: false,
             selected: Some(0),
         };
         // Tab completes the highlighted directory but does not submit it.
@@ -9510,6 +9581,7 @@ mod tests {
             input: "hello world".to_string(),
             cursor: 11,
             dired: false,
+            other_window: false,
             selected: None,
         };
         ctrl(&mut app, ' ');
@@ -9530,6 +9602,7 @@ mod tests {
             input: "hello".to_string(),
             cursor: 5,
             dired: false,
+            other_window: false,
             selected: None,
         };
         ctrl(&mut app, ' ');
