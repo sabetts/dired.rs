@@ -299,6 +299,32 @@ impl ArgState {
         let mag = self.magnitude.min(i32::MAX as u32) as i32;
         self.sign * mag
     }
+
+    /// Emacs's `universal-argument--description`: a bare `C-u` for 4, repeated
+    /// `C-u` words for its powers, and explicit numbers for typed arguments.
+    fn description(self) -> String {
+        if self.digits {
+            return format!("C-u {}", self.value());
+        }
+        if self.sign < 0 {
+            return if self.magnitude == 1 {
+                "C-u -".to_string()
+            } else {
+                format!("C-u -{}", self.magnitude)
+            };
+        }
+        let mut n = self.magnitude;
+        let mut description = String::from("C-u");
+        while n > 4 && n % 4 == 0 {
+            description.push_str(" C-u");
+            n /= 4;
+        }
+        if n == 4 {
+            description
+        } else {
+            format!("C-u {n}")
+        }
+    }
 }
 
 /// The kind of the previous editing command, for kill/yank chaining.
@@ -385,8 +411,8 @@ pub struct App {
     /// prompt can shrink after a multi-line echo message.
     minibuffer_had_prompt: bool,
     prefix: Prefix,
-    /// A pending prefix key hint (`C-c-`), shown after an idle delay the way
-    /// Emacs's `echo-keystrokes` does.
+    /// A pending prefix key or numeric-argument hint (`C-c-`, `C-u`), shown
+    /// after an idle delay the way Emacs's `echo-keystrokes` does.
     prefix_echo: Option<(String, Instant)>,
     /// A confirmation waiting behind an invalid-answer message: the prompt to
     /// restore, and when to restore it if no key arrives first.
@@ -3294,8 +3320,9 @@ impl App {
     }
 
     fn show_argument(&mut self) {
+        self.message = None;
         if let Some(arg) = self.numeric_arg {
-            self.message = Some(format!("C-u {}-", arg.value()));
+            self.start_echo(&arg.description());
         }
     }
 
@@ -8181,12 +8208,23 @@ mod tests {
     }
 
     #[test]
-    fn numeric_argument_echo_is_not_logged() {
+    fn numeric_argument_echo_waits_and_matches_emacs() {
         let mut app = App::new(Config::default());
 
         ctrl(&mut app, 'u');
-        assert_eq!(app.message.as_deref(), Some("C-u 4-"));
+        assert_eq!(app.message, None);
+        assert!(app.prefix_echo.is_some());
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u"));
         app.capture_echo_message();
+
+        ctrl(&mut app, 'u');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u C-u"));
+
+        ctrl(&mut app, 'u');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u C-u C-u"));
 
         ctrl_h(&mut app, 'e');
         let idx = app.find_buffer("*Messages*").unwrap();
@@ -8194,7 +8232,25 @@ mod tests {
             .map(|row| app.buffers[idx].buffer.line_text(row))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!text.contains("C-u 4-"), "{text:?}");
+        assert!(!text.contains("C-u"), "{text:?}");
+    }
+
+    #[test]
+    fn typed_numeric_arguments_echo_as_numbers() {
+        let mut app = App::new(Config::default());
+
+        ctrl(&mut app, 'u');
+        press(&mut app, '3');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u 3"));
+
+        let mut app = App::new(Config::default());
+        alt(&mut app, '-');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u -"));
+        press(&mut app, '2');
+        app.echo_pending_prefix(Instant::now() + PREFIX_ECHO_DELAY);
+        assert_eq!(app.message.as_deref(), Some("C-u -2"));
     }
 
     #[test]
