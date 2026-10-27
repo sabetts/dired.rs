@@ -4675,6 +4675,17 @@ impl App {
         self.prompt_mark = None;
         self.prompt_last_yank = None;
         self.last_command = LastCommand::Other;
+        let typed = match &self.prompt {
+            Prompt::SwitchBuffer { input, .. }
+            | Prompt::KillBuffer { input, .. }
+            | Prompt::FindFile { input, .. }
+            | Prompt::Rename { input, .. }
+            | Prompt::CreateDirectory { input, .. } => input.clone(),
+            Prompt::None
+            | Prompt::Confirm { .. }
+            | Prompt::MarkExtension { .. }
+            | Prompt::ShellCommand { .. } => return,
+        };
         let candidates = match &self.prompt {
             Prompt::SwitchBuffer { input, .. } => self
                 .switch_candidates(input)
@@ -4713,7 +4724,7 @@ impl App {
                 if candidates.len() == 1 {
                     candidates[0].clone()
                 } else {
-                    common_prefix(&candidates)
+                    completion_prefix(&typed, &candidates)
                 }
             });
         match &mut self.prompt {
@@ -6306,20 +6317,46 @@ fn snippet(text: &str) -> String {
     }
 }
 
-fn common_prefix(items: &[String]) -> String {
-    let Some(first) = items.first() else {
-        return String::new();
+/// Extend `typed` with the part shared by every candidate after it. Matching
+/// is case-insensitive, as in `file_candidates`, but the already-typed text is
+/// preserved rather than replaced by a differently-cased common prefix.
+fn completion_prefix(typed: &str, candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else {
+        return typed.to_string();
     };
-    let mut end = first.chars().count();
-    for item in &items[1..] {
-        let limit = first
-            .chars()
-            .zip(item.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-        end = end.min(limit);
+    if !candidates
+        .iter()
+        .all(|candidate| starts_with_ignore_case(candidate, typed))
+    {
+        return typed.to_string();
     }
-    first.chars().take(end).collect()
+    let typed_len = typed.chars().count();
+    let mut extension_len = first.chars().count() - typed_len;
+    for candidate in &candidates[1..] {
+        let shared = first
+            .chars()
+            .skip(typed_len)
+            .zip(candidate.chars().skip(typed_len))
+            .take_while(|(a, b)| chars_eq_ignore_case(*a, *b))
+            .count();
+        extension_len = extension_len.min(shared);
+    }
+    let mut completion = typed.to_string();
+    completion.extend(first.chars().skip(typed_len).take(extension_len));
+    completion
+}
+
+fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    let mut chars = text.chars();
+    prefix.chars().all(|expected| {
+        chars
+            .next()
+            .is_some_and(|c| chars_eq_ignore_case(c, expected))
+    })
+}
+
+fn chars_eq_ignore_case(a: char, b: char) -> bool {
+    a.to_lowercase().eq(b.to_lowercase())
 }
 
 /// The OSC 52 escape sequence that sets the system clipboard to `text`.
@@ -9570,6 +9607,52 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(prompt_text(&app).0, directory_input(&alpha.join("inner")));
         assert!(matches!(app.prompt, Prompt::FindFile { .. }));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_tab_extends_to_the_next_divergence() {
+        let dir = temp_dir("prompt-tab-divergence");
+        std::fs::create_dir(dir.join("alpha")).unwrap();
+        std::fs::create_dir(dir.join("alpine")).unwrap();
+        let input = directory_input(&dir);
+        let expected = format!("{}alp", input);
+        let mut app = App::new(Config::default());
+
+        app.prompt = Prompt::FindFile {
+            input: input.clone(),
+            cursor: input.chars().count(),
+            dired: true,
+            other_window: false,
+            selected: None,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            prompt_text(&app),
+            (expected.clone(), expected.chars().count())
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_tab_keeps_case_different_typed_text() {
+        let dir = temp_dir("prompt-tab-case");
+        std::fs::create_dir(dir.join("Alice")).unwrap();
+        std::fs::create_dir(dir.join("anna")).unwrap();
+        let input = format!("{}a", directory_input(&dir));
+        let mut app = App::new(Config::default());
+
+        app.prompt = Prompt::FindFile {
+            input: input.clone(),
+            cursor: input.chars().count(),
+            dired: true,
+            other_window: false,
+            selected: None,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(prompt_text(&app), (input.clone(), input.chars().count()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
