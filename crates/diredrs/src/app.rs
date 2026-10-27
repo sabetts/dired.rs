@@ -387,6 +387,10 @@ pub struct App {
     /// Whether the idle `M-g` number overlay is showing.
     show_window_numbers: bool,
     next_window_id: WindowId,
+    /// The active buffer index last painted, so a switch can force a full
+    /// repaint instead of trusting ratatui's diff against a possibly-drifted
+    /// terminal screen.
+    drawn_buffer: Option<usize>,
     /// Monotonic counter for the most recent buffer visit, for list ordering.
     visit_seq: u64,
     pub history: History,
@@ -474,6 +478,7 @@ impl App {
             divider_drag: None,
             show_window_numbers: false,
             next_window_id: 1,
+            drawn_buffer: None,
             visit_seq: 0,
             history: History::default(),
             search: Search::default(),
@@ -962,6 +967,9 @@ impl App {
         let active_killed = self.current == idx;
         self.save_active_view();
         self.buffers.remove(idx);
+        // Removing a buffer shifts indices, so the painted index no longer
+        // identifies the same buffer.
+        self.drawn_buffer = None;
         for window in &mut self.windows {
             if window.buffer > idx {
                 window.buffer -= 1;
@@ -2932,9 +2940,25 @@ impl App {
 
     // ---- the loop ----------------------------------------------------------
 
+    /// Force a full repaint when the active buffer changes. The terminal's real
+    /// contents can drift from ratatui's previous frame (for example with
+    /// ambiguous-width glyphs), and a diff-only redraw then leaves fragments of
+    /// the old buffer visible after switching back to a shorter one.
+    fn clear_for_buffer_switch<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+    ) -> std::io::Result<()> {
+        if self.drawn_buffer != Some(self.current) {
+            terminal.clear()?;
+            self.drawn_buffer = Some(self.current);
+        }
+        Ok(())
+    }
+
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
             self.poll_shell_job();
+            self.clear_for_buffer_switch(terminal)?;
             terminal.draw(|frame| ui::draw(frame, self))?;
             if self.should_quit {
                 break;
@@ -9387,6 +9411,41 @@ mod tests {
                 assert_eq!(buf[(x, y)].symbol(), " ", "leftover at ({x},{y})");
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switching_back_to_dired_forces_a_full_repaint() {
+        use ratatui::backend::{Backend as _, TestBackend};
+        use ratatui::buffer::Cell;
+        use ratatui::Terminal;
+        let dir = temp_dir("switch-back");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        app.clear_for_buffer_switch(&mut terminal).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.open_file(file);
+        app.clear_for_buffer_switch(&mut terminal).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+
+        // Simulate the screen drifting from ratatui's model. Both the file and
+        // Dired frames are blank at this cell, so a diff-only repaint would
+        // leave the corruption in place.
+        let corrupt = Cell::new("X");
+        terminal
+            .backend_mut()
+            .draw([(0, 7, &corrupt)].into_iter())
+            .unwrap();
+
+        app.open_dired(dir.clone());
+        app.clear_for_buffer_switch(&mut terminal).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 7)].symbol(), " ");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
