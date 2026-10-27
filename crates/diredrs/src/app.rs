@@ -2156,6 +2156,47 @@ impl App {
         true
     }
 
+    fn wdired_kill_region(&mut self, prev: LastCommand) -> bool {
+        let Some((start, end)) = self.current().buffer.region() else {
+            self.message = Some("The mark is not set now, so there is no region".to_string());
+            return true;
+        };
+        if start == end {
+            return true;
+        }
+        let Some((i, name_start, name_end)) = ({
+            let buf = self.current();
+            let edit = buf.dired_edit.as_ref();
+            let dired = buf.dired.as_ref();
+            edit.zip(dired).and_then(|(edit, dired)| {
+                let i = dired.entry_index_at(start.row)?;
+                let name_start = dired.filename_col(start.row)?;
+                let name_end = name_start + edit.names.get(i)?.chars().count();
+                Some((i, name_start, name_end))
+            })
+        }) else {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        };
+        if start.row != end.row || start.col < name_start || end.col > name_end {
+            self.message = Some("Text is read-only".to_string());
+            return true;
+        }
+        let idx = self.current;
+        let mut chars: Vec<char> = self.buffers[idx].dired_edit.as_ref().unwrap().names[i]
+            .chars()
+            .collect();
+        let from = start.col - name_start;
+        let to = end.col - name_start;
+        let killed: String = chars[from..to].iter().collect();
+        chars.drain(from..to);
+        self.buffers[idx].buffer.clear_mark();
+        self.wdired_store_name(i, name_start, &chars, from);
+        self.kill_new(&killed, prev == LastCommand::Kill);
+        self.last_command = LastCommand::Kill;
+        true
+    }
+
     fn wdired_kill_word(&mut self, backward: bool, prev: LastCommand) -> bool {
         let Some((i, start, _)) = self.wdired_name_range() else {
             self.message = Some("Text is read-only".to_string());
@@ -2217,6 +2258,7 @@ impl App {
             Action::DeleteBackward => self.wdired_delete_backward(),
             Action::DeleteForward => self.wdired_delete_forward(),
             Action::KillLine => self.wdired_kill_line(prev),
+            Action::KillRegion => self.wdired_kill_region(prev),
             Action::BackwardKillWord => self.wdired_kill_word(true, prev),
             Action::KillWord => self.wdired_kill_word(false, prev),
             Action::Yank => self.wdired_yank(),
@@ -5334,14 +5376,14 @@ impl App {
             ForwardChar => self.move_chars(n),
             BackwardChar => self.move_chars(-n),
             NextLine => {
-                if self.current().kind == Kind::Dired {
+                if self.current().kind == Kind::Dired && !self.wdired_active() {
                     self.dired_move(1, n.unsigned_abs() as i32);
                 } else {
                     self.move_lines(n);
                 }
             }
             PrevLine => {
-                if self.current().kind == Kind::Dired {
+                if self.current().kind == Kind::Dired && !self.wdired_active() {
                     self.dired_move(-1, n.unsigned_abs() as i32);
                 } else {
                     self.move_lines(-n);
@@ -10037,6 +10079,92 @@ mod tests {
         assert!(app.current().buffer.line_text(row).contains("Xa.txt"));
         assert!(dir.join("a.txt").exists());
         assert!(!dir.join("Xa.txt").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_vertical_motion_keeps_the_column() {
+        let dir = temp_dir("wdired-column");
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(dir.join("beta.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        ctrl_x(&mut app, 'q');
+
+        let (first, second, col) = {
+            let dired = app.current().dired.as_ref().unwrap();
+            let first = dired.row_of(0);
+            (
+                first,
+                dired.row_of(1),
+                dired.filename_col(first).unwrap() + 3,
+            )
+        };
+        app.current_mut().buffer.set_point(Pos::new(first, col));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.current().buffer.point(), Pos::new(second, col));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.current().buffer.point(), Pos::new(first, col));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_kill_region_deletes_only_the_file_name() {
+        let dir = temp_dir("wdired-kill-region");
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        ctrl_x(&mut app, 'q');
+
+        let (row, start) = {
+            let dired = app.current().dired.as_ref().unwrap();
+            let row = dired.row_of(0);
+            (row, dired.filename_col(row).unwrap())
+        };
+        app.current_mut().buffer.set_point(Pos::new(row, start + 1));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        app.current_mut().buffer.set_point(Pos::new(row, start + 3));
+        ctrl(&mut app, 'w');
+
+        assert_eq!(
+            app.current().dired_edit.as_ref().unwrap().names[0],
+            "aha.txt"
+        );
+        assert!(app.current().buffer.line_text(row).contains("aha.txt"));
+        assert_eq!(app.current().buffer.point(), Pos::new(row, start + 1));
+        assert!(app.current().buffer.region().is_none());
+        assert_eq!(app.kill_ring.current().as_deref(), Some("lp"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wdired_kill_region_refuses_to_touch_protected_text() {
+        let dir = temp_dir("wdired-kill-protected");
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        ctrl_x(&mut app, 'q');
+
+        let (row, start) = {
+            let dired = app.current().dired.as_ref().unwrap();
+            let row = dired.row_of(0);
+            (row, dired.filename_col(row).unwrap())
+        };
+        app.current_mut().buffer.set_point(Pos::new(row, start - 2));
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        app.current_mut().buffer.set_point(Pos::new(row, start + 2));
+        ctrl(&mut app, 'w');
+
+        assert_eq!(
+            app.current().dired_edit.as_ref().unwrap().names[0],
+            "alpha.txt"
+        );
+        assert_eq!(app.message.as_deref(), Some("Text is read-only"));
+        assert!(app.current().buffer.line_text(row).contains("alpha.txt"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
