@@ -220,6 +220,12 @@ struct ShellCompletion {
     candidates: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionPathStyle {
+    Native,
+    GitBash,
+}
+
 /// A deferred action awaiting confirmation.
 #[derive(Debug, Clone)]
 pub enum PendingAction {
@@ -4273,6 +4279,15 @@ impl App {
 
     /// Resolve a user-entered path against `base`, expanding a leading `~`.
     fn expand_path_in(&self, input: &str, base: &Path) -> PathBuf {
+        self.expand_path_in_style(input, base, CompletionPathStyle::Native)
+    }
+
+    fn expand_path_in_style(
+        &self,
+        input: &str,
+        base: &Path,
+        style: CompletionPathStyle,
+    ) -> PathBuf {
         let trimmed = input.trim();
         if let Some(rest) = trimmed.strip_prefix('~') {
             if let Some(home) = home_dir() {
@@ -4284,8 +4299,18 @@ impl App {
                 };
             }
         }
-        let path = PathBuf::from(trimmed);
-        if path.is_absolute() || trimmed.is_empty() {
+        if style == CompletionPathStyle::GitBash {
+            if let Some(path) = git_bash_path(trimmed) {
+                return path;
+            }
+        }
+        let input = if style == CompletionPathStyle::GitBash {
+            trimmed.replace('\\', "/")
+        } else {
+            trimmed.to_string()
+        };
+        let path = PathBuf::from(&input);
+        if path.is_absolute() || input.is_empty() {
             path
         } else {
             base.join(path)
@@ -4300,6 +4325,16 @@ impl App {
 
     /// Completion candidates for `input` relative to `base_dir`.
     fn file_candidates_in(&self, input: &str, dirs_only: bool, base_dir: &Path) -> Vec<String> {
+        self.file_candidates_in_style(input, dirs_only, base_dir, CompletionPathStyle::Native)
+    }
+
+    fn file_candidates_in_style(
+        &self,
+        input: &str,
+        dirs_only: bool,
+        base_dir: &Path,
+        style: CompletionPathStyle,
+    ) -> Vec<String> {
         let (dir_part, prefix) = match input.rfind(['/', '\\']) {
             Some(i) => (&input[..=i], &input[i + 1..]),
             None => ("", input),
@@ -4307,9 +4342,19 @@ impl App {
         let base = if dir_part.is_empty() {
             base_dir.to_path_buf()
         } else {
-            self.expand_path_in(dir_part, base_dir)
+            self.expand_path_in_style(dir_part, base_dir, style)
         };
         let prefix_lower = prefix.to_lowercase();
+        let dir_part = if style == CompletionPathStyle::GitBash {
+            dir_part.replace('\\', "/")
+        } else {
+            dir_part.to_string()
+        };
+        let separator = if style == CompletionPathStyle::GitBash {
+            '/'
+        } else {
+            std::path::MAIN_SEPARATOR
+        };
         let mut out = Vec::new();
         if let Ok(read) = fs::read_dir(&base) {
             for entry in read.flatten() {
@@ -4321,7 +4366,7 @@ impl App {
                 // Match the typed component case-insensitively.
                 if name.to_lowercase().starts_with(&prefix_lower) {
                     let sep = if is_dir {
-                        std::path::MAIN_SEPARATOR.to_string()
+                        separator.to_string()
                     } else {
                         String::new()
                     };
@@ -4346,10 +4391,15 @@ impl App {
             .collect::<String>();
         let command_position = shell_command_position(input, start);
         let path_like = token.starts_with('~') || token.chars().any(|c| matches!(c, '/' | '\\'));
+        let path_style = if self.config.shell.program == shell::ShellProgram::GitBash {
+            CompletionPathStyle::GitBash
+        } else {
+            CompletionPathStyle::Native
+        };
         let candidates = if command_position && !path_like {
             self.command_candidates(&token)
         } else {
-            self.file_candidates_in(&token, false, &self.shell_directory())
+            self.file_candidates_in_style(&token, false, &self.shell_directory(), path_style)
         };
         ShellCompletion {
             start,
@@ -4383,10 +4433,51 @@ impl App {
             out.truncate(50);
             return out;
         }
+        if self.config.shell.program == shell::ShellProgram::GitBash {
+            let mut seen = HashSet::new();
+            let mut out: Vec<String> = self
+                .git_bash_command_candidates(prefix)
+                .into_iter()
+                .filter(|name| seen.insert(name.to_lowercase()))
+                .collect();
+            for mut name in self.path_command_candidates(prefix, false) {
+                if name.to_lowercase().ends_with(".exe") {
+                    name.truncate(name.len() - 4);
+                }
+                if seen.insert(name.to_lowercase()) {
+                    out.push(name);
+                }
+            }
+            out.sort();
+            out.truncate(50);
+            return out;
+        }
         self.path_command_candidates(
             prefix,
             self.config.shell.program == shell::ShellProgram::Cmd,
         )
+    }
+
+    fn git_bash_command_candidates(&self, prefix: &str) -> Vec<String> {
+        let prefix_lower = prefix.to_lowercase();
+        let mut out = Vec::new();
+        for dir in shell::git_bash_command_dirs() {
+            if let Ok(read) = fs::read_dir(dir) {
+                for entry in read.flatten() {
+                    if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    let mut name = entry.file_name().to_string_lossy().into_owned();
+                    if name.to_lowercase().ends_with(".exe") {
+                        name.truncate(name.len() - 4);
+                    }
+                    if name.to_lowercase().starts_with(&prefix_lower) {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Executable names on `PATH`, optionally including the shell directory.
@@ -6747,6 +6838,33 @@ fn completion_is_directory(candidate: &str) -> bool {
     candidate.ends_with(['/', '\\'])
 }
 
+/// Convert a Git Bash path into the corresponding Windows path.
+fn git_bash_path(input: &str) -> Option<PathBuf> {
+    let input = input.replace('\\', "/");
+    if let Some(root) = shell::git_bash_root() {
+        for (prefix, directory) in [("/usr/", "usr"), ("/mingw64/", "mingw64")] {
+            if let Some(rest) = input.strip_prefix(prefix) {
+                return Some(root.join(directory).join(rest));
+            }
+        }
+    }
+    if let Some(rest) = input.strip_prefix('/') {
+        if let Some((drive, tail)) = rest.split_once('/') {
+            if drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic() {
+                return Some(PathBuf::from(format!(
+                    "{}:/{tail}",
+                    drive.to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return Some(PathBuf::from(input));
+    }
+    None
+}
+
 #[cfg(windows)]
 fn is_executable_file(path: &Path) -> bool {
     let extension = path
@@ -6941,6 +7059,7 @@ fn help_lines() -> Vec<String> {
         "  M-!                 run a shell command in the current directory",
         "                      TAB completes command names and file paths;",
         "                      Shell profile: [shell] program in the config.",
+        "                      Values: cmd, powershell, unix, or gitbash.",
         "                      Short output stays in the echo area; longer",
         "                      output goes to *Shell Command Output*.",
         "                      C-g cancels it during the first second.",
@@ -11100,6 +11219,78 @@ mod tests {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "Compress-Archive ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_uses_git_bash_paths() {
+        let dir = temp_dir("shell-complete-gitbash-paths");
+        let docs = dir.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("manual.txt"), b"x").unwrap();
+        let mut config = Config::default();
+        config.shell.program = shell::ShellProgram::GitBash;
+        let mut app = App::new(config);
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "cat do");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand {
+            input, candidates, ..
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat docs/");
+        assert_eq!(candidates, &["docs/manual.txt"]);
+
+        type_text(&mut app, "ma");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat docs/manual.txt ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_drive_paths_convert_to_windows() {
+        assert_eq!(
+            git_bash_path("/c/Users/sabetts"),
+            Some(PathBuf::from("C:/Users/sabetts"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_git_bash_commands() {
+        if shell::git_bash_root().is_none() {
+            return;
+        }
+        let dir = temp_dir("shell-complete-gitbash-commands");
+        let mut config = Config::default();
+        config.shell.program = shell::ShellProgram::GitBash;
+        let mut app = App::new(config);
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "gre");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand {
+            input, candidates, ..
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert!(
+            input == "grep " || candidates.iter().any(|candidate| candidate == "grep"),
+            "input={input:?} candidates={candidates:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

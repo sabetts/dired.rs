@@ -18,7 +18,8 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct ShellConfig {
-    /// The shell profile used by `M-!`: `"cmd"`, `"powershell"`, or `"unix"`.
+    /// The shell profile used by `M-!`: `"cmd"`, `"powershell"`, `"unix"`,
+    /// or `"gitbash"`.
     pub program: ShellProgram,
 }
 
@@ -74,7 +75,7 @@ cursor_bg = "yellow"    # cursor background color
 
 # Shell used by M-! (defaults to "powershell" on Windows, "unix" elsewhere).
 # [shell]
-# program = "powershell"  # "cmd", "powershell", or "unix"
+# program = "powershell"  # "cmd", "powershell", "unix", or "gitbash"
 "##;
 
 impl Config {
@@ -156,6 +157,7 @@ mod tests {
             ("cmd", ShellProgram::Cmd),
             ("powershell", ShellProgram::Powershell),
             ("unix", ShellProgram::Unix),
+            ("gitbash", ShellProgram::GitBash),
         ] {
             let cfg: Config = toml::from_str(&format!("[shell]\nprogram = \"{name}\"\n")).unwrap();
             assert_eq!(cfg.shell.program, expected);
