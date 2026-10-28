@@ -1,11 +1,37 @@
 //! Running shell commands and collecting their output.
 
+use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+
+/// The shell profile used by `M-!`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellProgram {
+    Cmd,
+    Powershell,
+    Unix,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ShellProgram {
+    fn default() -> Self {
+        #[cfg(windows)]
+        {
+            Self::Powershell
+        }
+        #[cfg(not(windows))]
+        {
+            Self::Unix
+        }
+    }
+}
 
 /// The buffer shown for `shell-command` output.
 pub const OUTPUT_BUFFER: &str = "*Shell Command Output*";
@@ -23,9 +49,19 @@ pub struct ShellProcess {
 }
 
 impl ShellProcess {
-    /// Start `command` in `dir`, merging stderr into stdout.
+    /// Start `command` in `dir` using the platform-default shell profile.
+    #[cfg(test)]
     pub fn spawn(command: &str, dir: &Path) -> io::Result<Self> {
-        let mut command = shell_command(command);
+        Self::spawn_with_profile(command, dir, ShellProgram::default())
+    }
+
+    /// Start `command` in `dir` using `profile`, merging stderr into stdout.
+    pub fn spawn_with_profile(
+        command: &str,
+        dir: &Path,
+        profile: ShellProgram,
+    ) -> io::Result<Self> {
+        let mut command = profile.command(command);
         let mut child = command
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -123,25 +159,38 @@ fn read_stream(mut stream: impl Read + Send + 'static, tx: Sender<Vec<u8>>) {
     });
 }
 
-/// Build the platform shell invocation.
-fn shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let shell = std::env::var_os("COMSPEC")
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "cmd.exe".into());
-        let mut process = Command::new(shell);
-        process.arg("/C").arg(command);
-        process
-    }
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "/bin/sh".to_string());
-        let mut process = Command::new(shell);
-        process.arg("-c").arg(command);
+impl ShellProgram {
+    /// Build the hidden program and argument prefix for this profile.
+    fn command(self, command: &str) -> Command {
+        let (program, prefix): (OsString, &[&str]) = match self {
+            Self::Cmd => (
+                std::env::var_os("COMSPEC")
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "cmd.exe".into()),
+                &["/C"],
+            ),
+            Self::Powershell => {
+                #[cfg(windows)]
+                let program = OsString::from("powershell.exe");
+                #[cfg(not(windows))]
+                let program = OsString::from("pwsh");
+                (
+                    program,
+                    &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
+                )
+            }
+            Self::Unix => {
+                let fallback = if cfg!(windows) { "sh" } else { "/bin/sh" };
+                (
+                    std::env::var_os("SHELL")
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| fallback.into()),
+                    &["-c"],
+                )
+            }
+        };
+        let mut process = Command::new(program);
+        process.args(prefix).arg(command);
         process
     }
 }
@@ -178,9 +227,36 @@ mod tests {
     }
 
     #[test]
+    fn profiles_use_the_expected_command_prefixes() {
+        let args = |profile: ShellProgram| {
+            profile
+                .command("run me")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(ShellProgram::Cmd), ["/C", "run me"]);
+        assert_eq!(
+            args(ShellProgram::Powershell),
+            [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "run me"
+            ]
+        );
+        assert_eq!(args(ShellProgram::Unix), ["-c", "run me"]);
+    }
+
+    #[test]
     fn captures_output_and_status() {
         let dir = temp_dir("echo");
-        let mut process = ShellProcess::spawn("echo hello", &dir).unwrap();
+        #[cfg(windows)]
+        let command = "Write-Output hello";
+        #[cfg(not(windows))]
+        let command = "echo hello";
+        let mut process = ShellProcess::spawn(command, &dir).unwrap();
         let status = wait(&mut process);
         assert!(status.success());
         assert!(String::from_utf8_lossy(process.output()).contains("hello"));
@@ -191,7 +267,7 @@ mod tests {
     fn merges_stderr_into_output() {
         let dir = temp_dir("stderr");
         #[cfg(windows)]
-        let command = "echo out & echo err 1>&2";
+        let command = "Write-Output out; [Console]::Error.WriteLine('err')";
         #[cfg(not(windows))]
         let command = "echo out; echo err 1>&2";
         let mut process = ShellProcess::spawn(command, &dir).unwrap();
@@ -216,7 +292,7 @@ mod tests {
     fn runs_in_the_requested_directory() {
         let dir = temp_dir("cwd");
         #[cfg(windows)]
-        let command = "cd";
+        let command = "(Get-Location).Path";
         #[cfg(not(windows))]
         let command = "pwd";
         let mut process = ShellProcess::spawn(command, &dir).unwrap();
@@ -225,6 +301,29 @@ mod tests {
         let output = String::from_utf8_lossy(process.output());
         let actual = Path::new(output.trim()).canonicalize().unwrap();
         assert_eq!(actual, dir.canonicalize().unwrap());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_profiles_run_with_their_own_syntax() {
+        let dir = temp_dir("profiles");
+        let mut powershell =
+            ShellProcess::spawn_with_profile("Write-Output ps", &dir, ShellProgram::Powershell)
+                .unwrap();
+        let status = wait(&mut powershell);
+        assert!(status.success());
+        assert!(String::from_utf8_lossy(powershell.output()).contains("ps"));
+
+        let mut cmd =
+            ShellProcess::spawn_with_profile("echo one& echo two", &dir, ShellProgram::Cmd)
+                .unwrap();
+        let status = wait(&mut cmd);
+        assert!(status.success());
+        let output = String::from_utf8_lossy(cmd.output());
+        assert!(output.contains("one"), "{output:?}");
+        assert!(output.contains("two"), "{output:?}");
+
         fs::remove_dir_all(dir).ok();
     }
 }

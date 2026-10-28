@@ -376,7 +376,12 @@ const CONFIRM_FLASH: Duration = Duration::from_secs(2);
 
 /// How long a shell command stays foreground before it is shown in an output
 /// buffer and allowed to continue in the background.
+#[cfg(not(test))]
 const SHELL_FOREGROUND_WAIT: Duration = Duration::from_secs(1);
+/// Tests that need backgrounding set their own short wait; keeping other test
+/// commands foreground avoids races with slower shell startup.
+#[cfg(test)]
+const SHELL_FOREGROUND_WAIT: Duration = Duration::from_secs(30);
 
 /// How often the event loop checks on a running shell command.
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1046,7 +1051,7 @@ impl App {
             return;
         }
         let dir = self.shell_directory();
-        match shell::ShellProcess::spawn(command, &dir) {
+        match shell::ShellProcess::spawn_with_profile(command, &dir, self.config.shell.program) {
             Ok(process) => {
                 self.shell_history.push(command);
                 self.shell_job = Some(ShellJob {
@@ -6894,6 +6899,7 @@ fn help_lines() -> Vec<String> {
         "Shell commands",
         "  M-!                 run a shell command in the current directory",
         "                      TAB completes command names and file paths;",
+        "                      Shell profile: [shell] program in the config.",
         "                      Short output stays in the echo area; longer",
         "                      output goes to *Shell Command Output*.",
         "                      C-g cancels it during the first second.",
@@ -7086,7 +7092,7 @@ mod tests {
     fn long_shell_command() -> &'static str {
         #[cfg(windows)]
         {
-            "echo started & ping -n 6 127.0.0.1 >nul"
+            "Write-Output started; Start-Sleep -Seconds 5"
         }
         #[cfg(not(windows))]
         {
@@ -7097,7 +7103,7 @@ mod tests {
     fn five_shell_lines() -> &'static str {
         #[cfg(windows)]
         {
-            "echo one& echo two& echo three& echo four& echo five"
+            "Write-Output one; Write-Output two; Write-Output three; Write-Output four; Write-Output five"
         }
         #[cfg(not(windows))]
         {
@@ -7108,7 +7114,7 @@ mod tests {
     fn many_shell_lines() -> &'static str {
         #[cfg(windows)]
         {
-            "echo one& echo two& echo three& echo four& echo five& echo six"
+            "Write-Output one; Write-Output two; Write-Output three; Write-Output four; Write-Output five; Write-Output six"
         }
         #[cfg(not(windows))]
         {
@@ -11037,6 +11043,25 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn m_bang_uses_the_configured_shell_profile() {
+        let dir = temp_dir("shell-profile");
+        let mut config = Config::default();
+        config.shell.program = shell::ShellProgram::Cmd;
+        let mut app = App::new(config);
+        app.open_dired(dir.clone());
+
+        enter_shell_command(&mut app, "echo one& echo two");
+        wait_for_shell(&mut app);
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("one"), "{message:?}");
+        assert!(message.contains("two"), "{message:?}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn shell_command_echoes_short_output() {
         let dir = temp_dir("shell-echo");
@@ -11207,7 +11232,7 @@ mod tests {
         );
 
         #[cfg(windows)]
-        let failing = "echo bad & exit 3";
+        let failing = "Write-Output bad; exit 3";
         #[cfg(not(windows))]
         let failing = "echo bad; exit 3";
         enter_shell_command(&mut app, failing);

@@ -5,12 +5,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::shell::ShellProgram;
 use crate::theme::Background;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub ui: UiConfig,
+    pub shell: ShellConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// The shell profile used by `M-!`: `"cmd"`, `"powershell"`, or `"unix"`.
+    pub program: ShellProgram,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +71,10 @@ window_number_delay_ms = 250  # M-g overlay delay in milliseconds
 mouse = true            # capture mouse events for divider dragging
 cursor_fg = "black"     # cursor text color (name or #rrggbb)
 cursor_bg = "yellow"    # cursor background color
+
+# Shell used by M-! (defaults to "powershell" on Windows, "unix" elsewhere).
+# [shell]
+# program = "powershell"  # "cmd", "powershell", or "unix"
 "##;
 
 impl Config {
@@ -106,9 +119,12 @@ mod tests {
         assert!(cfg.ui.mouse);
         assert_eq!(cfg.ui.cursor_fg, "black");
         assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert_eq!(cfg.shell.program, default_shell_program());
         assert!(TEMPLATE.contains("window_number_delay_ms"));
         assert!(TEMPLATE.contains("mouse"));
         assert!(TEMPLATE.contains("cursor_bg"));
+        assert!(TEMPLATE.contains("[shell]"));
+        assert!(TEMPLATE.contains("program = \"powershell\""));
     }
 
     #[test]
@@ -122,7 +138,29 @@ mod tests {
         assert!(cfg.ui.mouse);
         assert_eq!(cfg.ui.cursor_fg, "black");
         assert_eq!(cfg.ui.cursor_bg, "yellow");
+        assert_eq!(cfg.shell.program, default_shell_program());
         assert!(TEMPLATE.contains("window_number_delay_ms"));
+    }
+
+    fn default_shell_program() -> ShellProgram {
+        if cfg!(windows) {
+            ShellProgram::Powershell
+        } else {
+            ShellProgram::Unix
+        }
+    }
+
+    #[test]
+    fn shell_profile_is_configurable() {
+        for (name, expected) in [
+            ("cmd", ShellProgram::Cmd),
+            ("powershell", ShellProgram::Powershell),
+            ("unix", ShellProgram::Unix),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[shell]\nprogram = \"{name}\"\n")).unwrap();
+            assert_eq!(cfg.shell.program, expected);
+        }
+        assert!(toml::from_str::<Config>("[shell]\nprogram = \"bash\"\n").is_err());
     }
 
     #[test]
