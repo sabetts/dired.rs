@@ -4391,6 +4391,12 @@ impl App {
             .collect::<String>();
         let command_position = shell_command_position(input, start);
         let path_like = token.starts_with('~') || token.chars().any(|c| matches!(c, '/' | '\\'));
+        let quoted = token.starts_with('"') || token.starts_with('\'');
+        let previous_is_parameter = shell_previous_word(input, start)
+            .is_some_and(|word| word.starts_with('-') && word.chars().count() > 1);
+        let powershell_argument = self.config.shell.program == shell::ShellProgram::Powershell
+            && !command_position
+            && (token.starts_with('-') || quoted || (previous_is_parameter && !path_like));
         let path_style = if self.config.shell.program == shell::ShellProgram::GitBash {
             CompletionPathStyle::GitBash
         } else {
@@ -4398,6 +4404,16 @@ impl App {
         };
         let candidates = if command_position && !path_like {
             self.command_candidates(&token)
+        } else if powershell_argument {
+            self.powershell_argument_candidates(input, cursor)
+                .unwrap_or_else(|| {
+                    self.file_candidates_in_style(
+                        &token,
+                        false,
+                        &self.shell_directory(),
+                        path_style,
+                    )
+                })
         } else {
             self.file_candidates_in_style(&token, false, &self.shell_directory(), path_style)
         };
@@ -4456,6 +4472,30 @@ impl App {
             prefix,
             self.config.shell.program == shell::ShellProgram::Cmd,
         )
+    }
+
+    /// Completions from PowerShell's own engine for arguments and their values.
+    fn powershell_argument_candidates(&self, input: &str, cursor: usize) -> Option<Vec<String>> {
+        let completions =
+            shell::powershell_completions(input, cursor, &self.shell_directory()).ok()?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for completion in completions {
+            let mut text = completion.text;
+            if completion
+                .result_type
+                .eq_ignore_ascii_case("ProviderContainer")
+            {
+                text = completion_directory(&text);
+            }
+            if seen.insert(text.to_lowercase()) {
+                out.push(text);
+            }
+            if out.len() == 50 {
+                break;
+            }
+        }
+        Some(out)
     }
 
     fn git_bash_command_candidates(&self, prefix: &str) -> Vec<String> {
@@ -6807,20 +6847,61 @@ fn snippet(text: &str) -> String {
     }
 }
 
-/// The char range of the shell word containing `cursor`.
+/// Whether a char separates shell words.
+fn is_shell_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>')
+}
+
+/// The char range of the shell word containing `cursor`, keeping quoted words
+/// such as `"C:\Program Files"` together.
 fn shell_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
     let chars: Vec<char> = input.chars().collect();
     let cursor = cursor.min(chars.len());
-    let is_boundary = |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>');
-    let mut start = cursor;
-    while start > 0 && !is_boundary(chars[start - 1]) {
-        start -= 1;
+    let mut start = 0;
+    let mut quote = None;
+    for (index, &c) in chars[..cursor].iter().enumerate() {
+        if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+        } else if (c == '"' || c == '\'') && index == start {
+            quote = Some(c);
+        } else if is_shell_boundary(c) {
+            start = index + 1;
+        }
     }
     let mut end = cursor;
-    while end < chars.len() && !is_boundary(chars[end]) {
+    while end < chars.len() {
+        let c = chars[end];
+        if let Some(active) = quote {
+            if c == active {
+                quote = None;
+            }
+        } else if (c == '"' || c == '\'') && end == start {
+            quote = Some(c);
+        } else if is_shell_boundary(c) {
+            break;
+        }
         end += 1;
     }
     (start, end)
+}
+
+/// The word immediately before the token starting at `start`.
+fn shell_previous_word(input: &str, start: usize) -> Option<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut end = start.min(chars.len());
+    while end > 0 && chars[end - 1].is_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut begin = end;
+    while begin > 0 && !is_shell_boundary(chars[begin - 1]) {
+        begin -= 1;
+    }
+    Some(chars[begin..end].iter().collect())
 }
 
 /// Whether the word at `start` is the command rather than an argument.
@@ -6835,7 +6916,26 @@ fn shell_command_position(input: &str, start: usize) -> bool {
 
 /// Whether a completed path token names a directory.
 fn completion_is_directory(candidate: &str) -> bool {
-    candidate.ends_with(['/', '\\'])
+    let unquoted = candidate
+        .strip_suffix('"')
+        .or_else(|| candidate.strip_suffix('\''))
+        .unwrap_or(candidate);
+    unquoted.ends_with(['/', '\\'])
+}
+
+/// Add a path separator to a directory completion, before a closing quote.
+fn completion_directory(candidate: &str) -> String {
+    if candidate.ends_with(['/', '\\']) {
+        return candidate.to_string();
+    }
+    let separator = std::path::MAIN_SEPARATOR;
+    if let Some(prefix) = candidate.strip_suffix('"') {
+        format!("{prefix}{separator}\"")
+    } else if let Some(prefix) = candidate.strip_suffix('\'') {
+        format!("{prefix}{separator}'")
+    } else {
+        format!("{candidate}{separator}")
+    }
 }
 
 /// Convert a Git Bash path into the corresponding Windows path.
@@ -11051,6 +11151,28 @@ mod tests {
     }
 
     #[test]
+    fn shell_token_bounds_keep_quoted_arguments_together() {
+        let input = r#"Get-ChildItem -Path "C:\Program Files"#;
+        let start = input.find('"').unwrap();
+        let end = input.chars().count();
+        assert_eq!(shell_token_bounds(input, end), (start, end));
+        assert_eq!(
+            shell_token_bounds(input, input.find("Files").unwrap()),
+            (start, end)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn quoted_directory_completion_keeps_the_separator_inside_quotes() {
+        assert!(completion_is_directory(r#""C:\Program Files\""#));
+        assert_eq!(
+            completion_directory(r#""C:\Program Files""#),
+            r#""C:\Program Files\""#
+        );
+    }
+
+    #[test]
     fn m_bang_opens_a_shell_command_prompt() {
         let mut app = App::new(Config::default());
         alt(&mut app, '!');
@@ -11219,6 +11341,66 @@ mod tests {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "Compress-Archive ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_powershell_parameters() {
+        let dir = temp_dir("shell-complete-powershell-parameter");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "Get-ChildItem -Pa");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "Get-ChildItem -Path ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_powershell_parameter_values() {
+        let dir = temp_dir("shell-complete-powershell-value");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "Get-ChildItem -ErrorAction Si");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "Get-ChildItem -ErrorAction SilentlyContinue ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_quoted_powershell_paths() {
+        let dir = temp_dir("shell-complete-powershell-quoted");
+        let spaced = dir.join("space dir");
+        std::fs::create_dir(&spaced).unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(
+            &mut app,
+            &format!("Get-ChildItem -Path \"{}", spaced.display()),
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let expected = format!("Get-ChildItem -Path \"{}", spaced.display());
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, &format!("{expected}\\\""));
 
         std::fs::remove_dir_all(&dir).ok();
     }

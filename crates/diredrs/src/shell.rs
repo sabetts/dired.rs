@@ -2,13 +2,14 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde::Deserialize;
 
 /// The shell profile used by `M-!`.
@@ -41,6 +42,25 @@ pub const OUTPUT_BUFFER: &str = "*Shell Command Output*";
 /// How long to wait for the reader thread to deliver the last bytes after the
 /// child process exits.
 const FINAL_READ: Duration = Duration::from_millis(100);
+
+/// How long argument completion may take before the prompt gives up.
+const POWERSHELL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PowerShell's own completion engine, fed the prompt through stdin. The
+/// cursor and text are the first two input lines; matches come back as
+/// base64-encoded text plus the completion result type.
+const POWERSHELL_COMPLETION_SCRIPT: &str = "\
+$ProgressPreference='SilentlyContinue'; \
+[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
+$reader=[Console]::In; \
+$cursor=[int]$reader.ReadLine(); \
+$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reader.ReadLine())); \
+$result=[System.Management.Automation.CommandCompletion]::CompleteInput($text,$cursor,$null); \
+$result.CompletionMatches | Select-Object -First 100 | ForEach-Object { \
+  $completed=if ($null -eq $_.CompletionText) { '' } else { [string]$_.CompletionText }; \
+  $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($completed)); \
+  Write-Output ($encoded + \"`t\" + $_.ResultType) \
+}";
 
 /// A child shell process whose stdout is collected on a worker thread.
 pub struct ShellProcess {
@@ -295,6 +315,92 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// One match from PowerShell's completion engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowershellCompletion {
+    pub text: String,
+    pub result_type: String,
+}
+
+/// Ask PowerShell's completion engine about `input` at char index `cursor`.
+pub fn powershell_completions(
+    input: &str,
+    cursor: usize,
+    dir: &Path,
+) -> io::Result<Vec<PowershellCompletion>> {
+    let cursor = input
+        .chars()
+        .take(cursor)
+        .map(char::len_utf16)
+        .sum::<usize>();
+    let payload = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
+    let mut process = ShellProgram::Powershell.command(POWERSHELL_COMPLETION_SCRIPT)?;
+    let mut child = process
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let written = (|| -> io::Result<()> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("PowerShell completion has no stdin pipe"))?;
+        writeln!(stdin, "{cursor}")?;
+        writeln!(stdin, "{payload}")?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
+
+    let deadline = Instant::now() + POWERSHELL_COMPLETION_TIMEOUT;
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                return Err(io::Error::other("PowerShell completion failed"));
+            }
+            return Ok(parse_powershell_completions(&output.stdout));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "PowerShell completion timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn parse_powershell_completions(output: &[u8]) -> Vec<PowershellCompletion> {
+    let mut completions = Vec::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let line = line.trim_end_matches('\r');
+        let Some((encoded, result_type)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if text.is_empty() || text.contains('\r') || text.contains('\n') {
+            continue;
+        }
+        completions.push(PowershellCompletion {
+            text,
+            result_type: result_type.to_string(),
+        });
+    }
+    completions
+}
+
 /// Names of commands available to the PowerShell profile.
 pub fn powershell_command_names() -> io::Result<Vec<String>> {
     let script = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
@@ -460,6 +566,53 @@ mod tests {
         assert!(names
             .iter()
             .any(|name| name.eq_ignore_ascii_case("Compress-Archive")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_completions_include_parameters_and_values() {
+        let dir = temp_dir("powershell-completion");
+        let input = "Get-ChildItem -Pa";
+        let completions = powershell_completions(input, input.len(), &dir).unwrap();
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.text == "-Path" && item.result_type == "ParameterName"),
+            "{completions:?}"
+        );
+
+        let input = "Get-ChildItem -ErrorAction Si";
+        let completions = powershell_completions(input, input.len(), &dir).unwrap();
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.text == "SilentlyContinue"
+                    && item.result_type == "ParameterValue"),
+            "{completions:?}"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_completions_keep_quoted_paths_with_spaces() {
+        let dir = temp_dir("powershell-quoted");
+        let spaced = dir.join("space dir");
+        fs::create_dir(&spaced).unwrap();
+        let input = format!("Get-ChildItem -Path \"{}", spaced.display());
+        let completions = powershell_completions(&input, input.chars().count(), &dir).unwrap();
+        assert!(
+            completions.iter().any(|item| {
+                item.result_type == "ProviderContainer"
+                    && item.text.starts_with('"')
+                    && item.text.ends_with('"')
+                    && item.text.contains("space dir")
+            }),
+            "{completions:?}"
+        );
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]
