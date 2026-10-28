@@ -11,6 +11,7 @@ use crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
+use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{transpose_chars_at, transpose_words_at, Buffer, Color, Line, Pos, Style};
 use crate::buffer_menu::{BufferMenu, BufferMenuEntry, MenuMark};
@@ -2991,22 +2992,64 @@ impl App {
     /// contents can drift from ratatui's previous frame (for example with
     /// ambiguous-width glyphs), and a diff-only redraw then leaves fragments of
     /// the old buffer visible after switching back to a shorter one.
-    fn clear_for_buffer_switch<B: Backend>(
-        &mut self,
-        terminal: &mut Terminal<B>,
-    ) -> std::io::Result<()> {
+    ///
+    /// Invalidate ratatui's previous frame instead of clearing the terminal:
+    /// the next draw emits every cell, but the physical screen is never blanked
+    /// first. `Terminal::draw` leaves the current buffer empty after its
+    /// buffer swap, so swapping again immediately before drawing is safe.
+    fn repaint_for_buffer_switch<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> bool {
         if self.drawn_buffer != Some(self.current) {
-            terminal.clear()?;
+            terminal.swap_buffers();
             self.drawn_buffer = Some(self.current);
+            return true;
+        }
+        false
+    }
+
+    /// Draw one frame, repairing cells a normal diff cannot see. After
+    /// [`Self::repaint_for_buffer_switch`] resets ratatui's previous buffer,
+    /// non-blank cells are emitted by the diff, but blank cells already match
+    /// the reset buffer and are skipped. Write those blanks directly so the
+    /// whole frame is refreshed without first clearing the screen.
+    fn render_frame<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+        let full_repaint = self.repaint_for_buffer_switch(terminal);
+        let buffer = {
+            let frame = terminal.draw(|frame| ui::draw(frame, self))?;
+            full_repaint.then(|| frame.buffer.clone())
+        };
+        if let Some(buffer) = buffer {
+            let backend = terminal.backend_mut();
+            Self::paint_missing_blank_cells(backend, &buffer)?;
+            backend.flush()?;
         }
         Ok(())
+    }
+
+    fn paint_missing_blank_cells<B: Backend>(
+        backend: &mut B,
+        buffer: &ratatui::buffer::Buffer,
+    ) -> std::io::Result<()> {
+        let width = buffer.area.width as usize;
+        if width == 0 {
+            return Ok(());
+        }
+        let mut updates = Vec::new();
+        let mut to_skip = 0usize;
+        for (i, cell) in buffer.content().iter().enumerate() {
+            if to_skip == 0 && !cell.skip && *cell == ratatui::buffer::Cell::EMPTY {
+                let x = buffer.area.x + (i % width) as u16;
+                let y = buffer.area.y + (i / width) as u16;
+                updates.push((x, y, cell));
+            }
+            to_skip = cell.symbol().width().saturating_sub(1);
+        }
+        backend.draw(updates.into_iter())
     }
 
     pub fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
             self.poll_shell_job();
-            self.clear_for_buffer_switch(terminal)?;
-            terminal.draw(|frame| ui::draw(frame, self))?;
+            self.render_frame(terminal)?;
             if self.should_quit {
                 break;
             }
@@ -9592,11 +9635,9 @@ mod tests {
         let mut app = App::new(Config::default());
         app.open_dired(dir.clone());
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        app.clear_for_buffer_switch(&mut terminal).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.render_frame(&mut terminal).unwrap();
         app.open_file(file);
-        app.clear_for_buffer_switch(&mut terminal).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.render_frame(&mut terminal).unwrap();
 
         // Simulate the screen drifting from ratatui's model. Both the file and
         // Dired frames are blank at this cell, so a diff-only repaint would
@@ -9608,9 +9649,36 @@ mod tests {
             .unwrap();
 
         app.open_dired(dir.clone());
-        app.clear_for_buffer_switch(&mut terminal).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        app.render_frame(&mut terminal).unwrap();
         assert_eq!(terminal.backend().buffer()[(0, 7)].symbol(), " ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn buffer_switch_repaint_does_not_clear_the_screen() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = temp_dir("switch-noclear");
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "one\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        app.render_frame(&mut terminal).unwrap();
+
+        app.open_file(file);
+        assert!(app.repaint_for_buffer_switch(&mut terminal));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() != " "),
+            "buffer switch blanked the screen before drawing"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
