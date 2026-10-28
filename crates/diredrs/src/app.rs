@@ -394,6 +394,8 @@ pub struct App {
     /// Monotonic counter for the most recent buffer visit, for list ordering.
     visit_seq: u64,
     pub history: History,
+    /// Paths submitted through file-related prompts.
+    file_history: History,
     pub search: Search,
     pub message: Option<String>,
     /// Where to draw point in a non-prompt echo-area message (used while a
@@ -481,6 +483,7 @@ impl App {
             drawn_buffer: None,
             visit_seq: 0,
             history: History::default(),
+            file_history: History::default(),
             search: Search::default(),
             message: None,
             message_cursor: None,
@@ -2525,6 +2528,7 @@ impl App {
     }
 
     fn start_transfer(&mut self, copy: bool) {
+        self.file_history.reset_navigation();
         // A copy and a group rename ask for a target directory. Rename starts
         // from the current directory plus the file name when one file is
         // involved.
@@ -2699,6 +2703,7 @@ impl App {
     /// Prompt for a directory to create (`+`), defaulting to the current
     /// directory.
     fn start_create_directory(&mut self) {
+        self.file_history.reset_navigation();
         let mut input = self.default_directory().display().to_string();
         if !input.ends_with(std::path::MAIN_SEPARATOR) {
             input.push(std::path::MAIN_SEPARATOR);
@@ -4153,6 +4158,7 @@ impl App {
     // ---- prompts -----------------------------------------------------------
 
     fn start_switch_buffer(&mut self, other_window: bool) {
+        self.history.reset_navigation();
         self.prompt = Prompt::SwitchBuffer {
             input: String::new(),
             cursor: 0,
@@ -4162,6 +4168,7 @@ impl App {
     }
 
     fn start_kill_buffer(&mut self) {
+        self.history.reset_navigation();
         self.prompt = Prompt::KillBuffer {
             input: String::new(),
             cursor: 0,
@@ -4170,6 +4177,7 @@ impl App {
     }
 
     fn start_find_file(&mut self, dired: bool, other_window: bool) {
+        self.file_history.reset_navigation();
         let mut input = self.default_directory().display().to_string();
         if !input.ends_with(std::path::MAIN_SEPARATOR) {
             input.push(std::path::MAIN_SEPARATOR);
@@ -4446,32 +4454,59 @@ impl App {
     }
 
     fn prompt_history_prev(&mut self) {
-        if !matches!(self.prompt, Prompt::ShellCommand { .. }) {
+        let Some((current, shell, file)) = self.prompt_history_input() else {
             return;
-        }
-        let current = match &self.prompt {
-            Prompt::ShellCommand { input, .. } => input.clone(),
-            _ => return,
         };
-        if let Some(text) = self.shell_history.prev(&current) {
-            self.set_shell_prompt_input(text);
+        let text = if shell {
+            self.shell_history.prev(&current)
+        } else if file {
+            self.file_history.prev(&current)
+        } else {
+            self.history.prev(&current)
+        };
+        if let Some(text) = text {
+            self.set_prompt_input(text);
         }
     }
 
     fn prompt_history_next(&mut self) {
-        if !matches!(self.prompt, Prompt::ShellCommand { .. }) {
+        let Some((_, shell, file)) = self.prompt_history_input() else {
             return;
-        }
-        if let Some(text) = self.shell_history.next() {
-            self.set_shell_prompt_input(text);
+        };
+        let text = if shell {
+            self.shell_history.next()
+        } else if file {
+            self.file_history.next()
+        } else {
+            self.history.next()
+        };
+        if let Some(text) = text {
+            self.set_prompt_input(text);
         }
     }
 
-    fn set_shell_prompt_input(&mut self, text: String) {
-        if let Prompt::ShellCommand { input, cursor } = &mut self.prompt {
-            *cursor = text.chars().count();
+    /// The current prompt input and which history it navigates, if any.
+    fn prompt_history_input(&self) -> Option<(String, bool, bool)> {
+        let (input, shell, file) = match &self.prompt {
+            Prompt::ShellCommand { input, .. } => (input, true, false),
+            Prompt::FindFile { input, .. }
+            | Prompt::Rename { input, .. }
+            | Prompt::CreateDirectory { input, .. } => (input, false, true),
+            Prompt::SwitchBuffer { input, .. } | Prompt::KillBuffer { input, .. } => {
+                (input, false, false)
+            }
+            Prompt::None | Prompt::MarkExtension { .. } | Prompt::Confirm { .. } => return None,
+        };
+        Some((input.clone(), shell, file))
+    }
+
+    fn set_prompt_input(&mut self, text: String) {
+        let len = text.chars().count();
+        self.prompt_edit(|input, cursor| {
             *input = text;
-        }
+            *cursor = len;
+        });
+        self.prompt_reset_selection();
     }
 
     fn prompt_insert(&mut self, c: char) {
@@ -4938,9 +4973,9 @@ impl App {
         if action != DabbrevExpand {
             self.dabbrev = Option::None;
         }
-        if matches!(self.prompt, Prompt::ShellCommand { .. })
-            && !matches!(action, HistoryPrev | HistoryNext)
-        {
+        if !matches!(action, HistoryPrev | HistoryNext) {
+            self.history.reset_navigation();
+            self.file_history.reset_navigation();
             self.shell_history.reset_navigation();
         }
         let prev = self.last_command;
@@ -5061,7 +5096,7 @@ impl App {
                 } else {
                     self.message = Some(format!("No such file: {}", path.display()));
                 }
-                self.history.push(&chosen);
+                self.file_history.push(&chosen);
             }
             Prompt::Rename {
                 input,
@@ -5074,6 +5109,7 @@ impl App {
                     Some(i) => candidates.get(i).cloned().unwrap_or(input),
                     None => input,
                 };
+                self.file_history.push(&chosen);
                 if copy {
                     self.commit_copy(&chosen);
                 } else {
@@ -5088,6 +5124,7 @@ impl App {
                     Some(i) => candidates.get(i).cloned().unwrap_or(input),
                     None => input,
                 };
+                self.file_history.push(&chosen);
                 self.commit_create_directory(&chosen);
             }
             Prompt::MarkExtension { input, .. } => self.mark_by_extension(&input),
@@ -5778,10 +5815,20 @@ impl App {
             KeyCode::Char('g') if ctrl => self.cancel_search(),
             KeyCode::Char('s') if ctrl => {
                 self.search.direction = SearchDirection::Forward;
+                if self.search.query.is_empty() {
+                    if let Some(last) = self.search.last_query.clone() {
+                        self.search.query = last;
+                    }
+                }
                 self.search_run(true);
             }
             KeyCode::Char('r') if ctrl => {
                 self.search.direction = SearchDirection::Backward;
+                if self.search.query.is_empty() {
+                    if let Some(last) = self.search.last_query.clone() {
+                        self.search.query = last;
+                    }
+                }
                 self.search_run(true);
             }
             KeyCode::Char(c) if !ctrl && !alt => {
@@ -6479,6 +6526,7 @@ fn help_lines() -> Vec<String> {
         "  M-< / M->      beginning / end of buffer",
         "  C-v / M-v      scroll up / down a screen",
         "  C-s / C-r      incremental search forward / backward",
+        "  C-s C-s        repeat the last search",
         "",
         "Editing (in writable buffers)",
         "  RET            insert a newline",
@@ -6538,9 +6586,11 @@ fn help_lines() -> Vec<String> {
         "  v                   select it and show display-marked buffers",
         "  g / q               revert / quit the Buffer Menu",
         "",
+        "Prompts",
+        "  M-p / M-n           previous / next history entry",
+        "",
         "Shell commands",
         "  M-!                 run a shell command in the current directory",
-        "  M-p / M-n           previous / next shell command (in the prompt)",
         "                      Short output stays in the echo area; longer",
         "                      output goes to *Shell Command Output*.",
         "                      C-g cancels it during the first second.",
@@ -8183,6 +8233,27 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     }
 
+    fn clear_prompt_input(app: &mut App) {
+        if let Prompt::FindFile { input, cursor, .. } = &mut app.prompt {
+            input.clear();
+            *cursor = 0;
+        }
+    }
+
+    fn enter_find_file(app: &mut App, path: &Path) {
+        ctrl_x_ctrl(app, 'f');
+        clear_prompt_input(app);
+        type_into_prompt(app, &path.display().to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn enter_dired(app: &mut App, path: &Path) {
+        ctrl_x(app, 'd');
+        clear_prompt_input(app);
+        type_into_prompt(app, &path.display().to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
     #[cfg(unix)]
     fn try_symlink(target: &Path, link: &Path, _is_dir: bool) -> bool {
         std::os::unix::fs::symlink(target, link).expect("create symlink");
@@ -8232,6 +8303,59 @@ mod tests {
         type_into_prompt(&mut app, &path.display().to_string());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.current().kind, Kind::File);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_file_prompt_navigates_file_history() {
+        let dir = temp_dir("ff-history");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        enter_find_file(&mut app, &a);
+        enter_find_file(&mut app, &b);
+
+        ctrl_x_ctrl(&mut app, 'f');
+        let draft = prompt_text(&app).0;
+        alt(&mut app, 'p');
+        assert_eq!(prompt_text(&app).0, b.display().to_string());
+        alt(&mut app, 'p');
+        assert_eq!(prompt_text(&app).0, a.display().to_string());
+        alt(&mut app, 'n');
+        assert_eq!(prompt_text(&app).0, b.display().to_string());
+        alt(&mut app, 'n');
+        assert_eq!(prompt_text(&app).0, draft);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dired_prompt_navigates_file_history() {
+        let dir = temp_dir("dired-history");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        enter_dired(&mut app, &sub);
+        let scratch = app
+            .buffers
+            .iter()
+            .position(|b| b.kind == Kind::Scratch)
+            .unwrap();
+        app.switch_to(scratch);
+
+        ctrl_x(&mut app, 'd');
+        let draft = prompt_text(&app).0;
+        alt(&mut app, 'p');
+        assert_eq!(prompt_text(&app).0, sub.display().to_string());
+        alt(&mut app, 'n');
+        assert_eq!(prompt_text(&app).0, draft);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -10042,6 +10166,36 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.search.active);
         assert_eq!(app.current().buffer.point(), Pos::new(1, 4));
+    }
+
+    #[test]
+    fn c_s_c_s_repeats_the_last_search() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut().buffer.set_content(vec![
+            Line::plain("alpha"),
+            Line::plain("needle one"),
+            Line::plain("middle"),
+            Line::plain("needle two"),
+        ]);
+        app.current_mut().buffer.beginning_of_buffer();
+
+        ctrl(&mut app, 's');
+        type_text(&mut app, "needle");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.current().buffer.point(), Pos::new(1, 6));
+
+        ctrl(&mut app, 's');
+        ctrl(&mut app, 's');
+        assert!(app.search.active);
+        assert_eq!(app.search.query, "needle");
+        assert_eq!(app.current().buffer.point(), Pos::new(3, 0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.search.active);
+        assert_eq!(app.current().buffer.point(), Pos::new(3, 6));
     }
 
     #[test]
