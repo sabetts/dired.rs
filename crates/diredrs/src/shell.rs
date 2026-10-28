@@ -1,5 +1,6 @@
 //! Running shell commands and collecting their output.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::Path;
@@ -195,6 +196,31 @@ impl ShellProgram {
     }
 }
 
+/// Names of commands available to the PowerShell profile.
+pub fn powershell_command_names() -> io::Result<Vec<String>> {
+    let script = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
+                  Get-Command -CommandType Cmdlet,Function,Filter,Alias \
+                  -ErrorAction SilentlyContinue | ForEach-Object Name";
+    let output = ShellProgram::Powershell
+        .command(script)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for name in String::from_utf8_lossy(&output.stdout).lines() {
+        let name = name.trim();
+        if !name.is_empty() && seen.insert(name.to_lowercase()) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +328,15 @@ mod tests {
         let actual = Path::new(output.trim()).canonicalize().unwrap();
         assert_eq!(actual, dir.canonicalize().unwrap());
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_command_names_include_cmdlets() {
+        let names = powershell_command_names().unwrap();
+        assert!(names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("Compress-Archive")));
     }
 
     #[cfg(windows)]

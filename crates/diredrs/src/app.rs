@@ -474,6 +474,8 @@ pub struct App {
     shell_foreground_wait: Duration,
     /// Commands submitted through `M-!`.
     shell_history: History,
+    /// PowerShell command names, loaded on the first command-position Tab.
+    powershell_commands: Option<Vec<String>>,
 }
 
 impl App {
@@ -534,6 +536,7 @@ impl App {
             shell_job: None,
             shell_foreground_wait: SHELL_FOREGROUND_WAIT,
             shell_history: History::default(),
+            powershell_commands: None,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -4334,7 +4337,7 @@ impl App {
     /// Complete the shell token at `cursor`. The first word of a command
     /// completes executable names; arguments and path-like command words
     /// complete files relative to the shell's working directory.
-    fn shell_completion(&self, input: &str, cursor: usize) -> ShellCompletion {
+    fn shell_completion(&mut self, input: &str, cursor: usize) -> ShellCompletion {
         let (start, end) = shell_token_bounds(input, cursor);
         let token = input
             .chars()
@@ -4355,13 +4358,45 @@ impl App {
         }
     }
 
-    /// Executable names on `PATH` (and in the shell directory on Windows).
-    fn command_candidates(&self, prefix: &str) -> Vec<String> {
+    /// Command names for the active shell profile.
+    fn command_candidates(&mut self, prefix: &str) -> Vec<String> {
+        if self.config.shell.program == shell::ShellProgram::Powershell {
+            if self.powershell_commands.is_none() {
+                self.powershell_commands =
+                    Some(shell::powershell_command_names().unwrap_or_default());
+            }
+            let prefix_lower = prefix.to_lowercase();
+            let names = self.powershell_commands.as_ref().expect("just loaded");
+            let mut seen = HashSet::new();
+            let mut out: Vec<String> = names
+                .iter()
+                .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
+                .filter(|name| seen.insert(name.to_lowercase()))
+                .cloned()
+                .collect();
+            for name in self.path_command_candidates(prefix, false) {
+                if seen.insert(name.to_lowercase()) {
+                    out.push(name);
+                }
+            }
+            out.sort();
+            out.truncate(50);
+            return out;
+        }
+        self.path_command_candidates(
+            prefix,
+            self.config.shell.program == shell::ShellProgram::Cmd,
+        )
+    }
+
+    /// Executable names on `PATH`, optionally including the shell directory.
+    fn path_command_candidates(&self, prefix: &str, include_shell_dir: bool) -> Vec<String> {
         let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
             .map(|paths| std::env::split_paths(&paths).collect())
             .unwrap_or_default();
-        #[cfg(windows)]
-        dirs.push(self.shell_directory());
+        if cfg!(windows) && include_shell_dir {
+            dirs.push(self.shell_directory());
+        }
 
         let prefix_lower = prefix.to_lowercase();
         let mut seen = HashSet::new();
@@ -4421,15 +4456,18 @@ impl App {
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
-        let shell_candidates = match &self.prompt {
+        let shell_input = match &self.prompt {
             Prompt::ShellCommand {
                 input,
                 cursor,
                 candidates,
                 ..
-            } if candidates.is_empty() => self.shell_completion(input, *cursor).candidates,
-            _ => Vec::new(),
+            } if candidates.is_empty() => Some((input.clone(), *cursor)),
+            _ => None,
         };
+        let shell_candidates = shell_input
+            .map(|(input, cursor)| self.shell_completion(&input, cursor).candidates)
+            .unwrap_or_default();
         if let Prompt::ShellCommand {
             selected,
             candidates,
@@ -4942,14 +4980,17 @@ impl App {
         self.prompt_mark = None;
         self.prompt_last_yank = None;
         self.last_command = LastCommand::Other;
-        if let Prompt::ShellCommand {
-            input,
-            cursor,
-            selected,
-            ..
-        } = &self.prompt
-        {
-            let completion = self.shell_completion(input, *cursor);
+        let shell_prompt = match &self.prompt {
+            Prompt::ShellCommand {
+                input,
+                cursor,
+                selected,
+                ..
+            } => Some((input.clone(), *cursor, *selected)),
+            _ => None,
+        };
+        if let Some((input, cursor, selected)) = shell_prompt {
+            let completion = self.shell_completion(&input, cursor);
             let start = completion.start;
             let end = completion.end;
             let candidates = completion.candidates;
@@ -4982,25 +5023,25 @@ impl App {
             let is_directory = unique && completion_is_directory(&completed);
             let new_cursor = start + completed.chars().count();
             if let Prompt::ShellCommand {
-                input,
-                cursor,
-                selected,
+                input: prompt_input,
+                cursor: prompt_cursor,
+                selected: prompt_selected,
                 candidates: shown,
             } = &mut self.prompt
             {
-                let from = char_to_byte(input, start);
-                let to = char_to_byte(input, end);
-                input.replace_range(from..to, &completed);
-                *cursor = new_cursor;
-                *selected = None;
+                let from = char_to_byte(prompt_input, start);
+                let to = char_to_byte(prompt_input, end);
+                prompt_input.replace_range(from..to, &completed);
+                *prompt_cursor = new_cursor;
+                *prompt_selected = None;
                 *shown = if unique && !is_directory {
                     Vec::new()
                 } else {
                     candidates
                 };
                 if unique && !is_directory {
-                    input.insert(char_to_byte(input, new_cursor), ' ');
-                    *cursor = new_cursor + 1;
+                    prompt_input.insert(char_to_byte(prompt_input, new_cursor), ' ');
+                    *prompt_cursor = new_cursor + 1;
                 }
             }
             if is_directory {
@@ -11029,7 +11070,9 @@ mod tests {
     fn shell_command_tab_completes_commands_in_the_shell_directory() {
         let dir = temp_dir("shell-complete-command");
         std::fs::write(dir.join("mytool.cmd"), b"@echo off\r\n").unwrap();
-        let mut app = App::new(Config::default());
+        let mut config = Config::default();
+        config.shell.program = shell::ShellProgram::Cmd;
+        let mut app = App::new(config);
         app.open_dired(dir.clone());
 
         alt(&mut app, '!');
@@ -11039,6 +11082,24 @@ mod tests {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "mytool.cmd ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_powershell_cmdlets() {
+        let dir = temp_dir("shell-complete-powershell");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "Compress-Ar");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "Compress-Archive ");
 
         std::fs::remove_dir_all(&dir).ok();
     }
