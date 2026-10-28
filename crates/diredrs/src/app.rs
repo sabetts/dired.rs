@@ -198,6 +198,10 @@ pub enum Prompt {
     ShellCommand {
         input: String,
         cursor: usize,
+        /// Highlighted completion candidate, moved with Up/Down.
+        selected: Option<usize>,
+        /// Candidates from the last Tab, shown until the prompt changes.
+        candidates: Vec<String>,
     },
     /// A `yes-or-no-p` confirmation: type the answer, then `RET`.
     Confirm {
@@ -206,6 +210,14 @@ pub enum Prompt {
         cursor: usize,
         action: PendingAction,
     },
+}
+
+/// A completion for the shell-command prompt. `start` and `end` are char
+/// indices of the token to replace, and candidates are replacement tokens.
+struct ShellCompletion {
+    start: usize,
+    end: usize,
+    candidates: Vec<String>,
 }
 
 /// A deferred action awaiting confirmation.
@@ -1019,6 +1031,8 @@ impl App {
         self.prompt = Prompt::ShellCommand {
             input: String::new(),
             cursor: 0,
+            selected: None,
+            candidates: Vec::new(),
         };
     }
 
@@ -4246,6 +4260,11 @@ impl App {
     /// Resolve a user-entered path against the default directory, expanding a
     /// leading `~`.
     fn expand_path(&self, input: &str) -> PathBuf {
+        self.expand_path_in(input, &self.default_directory())
+    }
+
+    /// Resolve a user-entered path against `base`, expanding a leading `~`.
+    fn expand_path_in(&self, input: &str, base: &Path) -> PathBuf {
         let trimmed = input.trim();
         if let Some(rest) = trimmed.strip_prefix('~') {
             if let Some(home) = home_dir() {
@@ -4261,21 +4280,26 @@ impl App {
         if path.is_absolute() || trimmed.is_empty() {
             path
         } else {
-            self.default_directory().join(path)
+            base.join(path)
         }
     }
 
     /// Completion candidates for the last path component of `input`. With
     /// `dirs_only` (the `C-x d` prompt) only directories are listed.
     fn file_candidates(&self, input: &str, dirs_only: bool) -> Vec<String> {
+        self.file_candidates_in(input, dirs_only, &self.default_directory())
+    }
+
+    /// Completion candidates for `input` relative to `base_dir`.
+    fn file_candidates_in(&self, input: &str, dirs_only: bool, base_dir: &Path) -> Vec<String> {
         let (dir_part, prefix) = match input.rfind(['/', '\\']) {
             Some(i) => (&input[..=i], &input[i + 1..]),
             None => ("", input),
         };
         let base = if dir_part.is_empty() {
-            self.default_directory()
+            base_dir.to_path_buf()
         } else {
-            self.expand_path(dir_part)
+            self.expand_path_in(dir_part, base_dir)
         };
         let prefix_lower = prefix.to_lowercase();
         let mut out = Vec::new();
@@ -4294,6 +4318,69 @@ impl App {
                         String::new()
                     };
                     out.push(format!("{dir_part}{name}{sep}"));
+                }
+            }
+        }
+        out.sort();
+        out.truncate(50);
+        out
+    }
+
+    /// Complete the shell token at `cursor`. The first word of a command
+    /// completes executable names; arguments and path-like command words
+    /// complete files relative to the shell's working directory.
+    fn shell_completion(&self, input: &str, cursor: usize) -> ShellCompletion {
+        let (start, end) = shell_token_bounds(input, cursor);
+        let token = input
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect::<String>();
+        let command_position = shell_command_position(input, start);
+        let path_like = token.starts_with('~') || token.chars().any(|c| matches!(c, '/' | '\\'));
+        let candidates = if command_position && !path_like {
+            self.command_candidates(&token)
+        } else {
+            self.file_candidates_in(&token, false, &self.shell_directory())
+        };
+        ShellCompletion {
+            start,
+            end,
+            candidates,
+        }
+    }
+
+    /// Executable names on `PATH` (and in the shell directory on Windows).
+    fn command_candidates(&self, prefix: &str) -> Vec<String> {
+        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).collect())
+            .unwrap_or_default();
+        #[cfg(windows)]
+        dirs.push(self.shell_directory());
+
+        let prefix_lower = prefix.to_lowercase();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for dir in dirs {
+            let dir = if dir.is_absolute() {
+                dir
+            } else {
+                self.shell_directory().join(dir)
+            };
+            if let Ok(read) = fs::read_dir(&dir) {
+                for entry in read.flatten() {
+                    if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !name.to_lowercase().starts_with(&prefix_lower)
+                        || !is_executable_file(&entry.path())
+                    {
+                        continue;
+                    }
+                    if seen.insert(name.to_lowercase()) {
+                        out.push(name);
+                    }
                 }
             }
         }
@@ -4329,6 +4416,29 @@ impl App {
     }
 
     fn prompt_move(&mut self, count: usize, delta: isize) {
+        let shell_candidates = match &self.prompt {
+            Prompt::ShellCommand {
+                input,
+                cursor,
+                candidates,
+                ..
+            } if candidates.is_empty() => self.shell_completion(input, *cursor).candidates,
+            _ => Vec::new(),
+        };
+        if let Prompt::ShellCommand {
+            selected,
+            candidates,
+            ..
+        } = &mut self.prompt
+        {
+            if candidates.is_empty() {
+                *candidates = shell_candidates;
+            }
+            if !candidates.is_empty() {
+                *selected = select_move(*selected, candidates.len(), delta);
+            }
+            return;
+        }
         if let Prompt::FindFile { selected, .. }
         | Prompt::Rename { selected, .. }
         | Prompt::CreateDirectory { selected, .. } = &mut self.prompt
@@ -4362,7 +4472,7 @@ impl App {
             | Prompt::Rename { input, cursor, .. }
             | Prompt::MarkExtension { input, cursor }
             | Prompt::CreateDirectory { input, cursor, .. }
-            | Prompt::ShellCommand { input, cursor }
+            | Prompt::ShellCommand { input, cursor, .. }
             | Prompt::Confirm { input, cursor, .. } => (input, cursor),
             Prompt::None => return None,
         };
@@ -4492,6 +4602,14 @@ impl App {
             Prompt::FindFile { selected, .. }
             | Prompt::Rename { selected, .. }
             | Prompt::CreateDirectory { selected, .. } => *selected = None,
+            Prompt::ShellCommand {
+                selected,
+                candidates,
+                ..
+            } => {
+                *selected = None;
+                candidates.clear();
+            }
             _ => {}
         }
     }
@@ -4819,6 +4937,82 @@ impl App {
         self.prompt_mark = None;
         self.prompt_last_yank = None;
         self.last_command = LastCommand::Other;
+        if let Prompt::ShellCommand {
+            input,
+            cursor,
+            selected,
+            ..
+        } = &self.prompt
+        {
+            let completion = self.shell_completion(input, *cursor);
+            let start = completion.start;
+            let end = completion.end;
+            let candidates = completion.candidates;
+            if candidates.is_empty() {
+                if let Prompt::ShellCommand {
+                    selected,
+                    candidates,
+                    ..
+                } = &mut self.prompt
+                {
+                    *selected = None;
+                    candidates.clear();
+                }
+                return;
+            }
+            let typed = input
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>();
+            let selected_candidate = selected.and_then(|i| candidates.get(i).cloned());
+            let unique = selected_candidate.is_some() || candidates.len() == 1;
+            let completed = selected_candidate.unwrap_or_else(|| {
+                if candidates.len() == 1 {
+                    candidates[0].clone()
+                } else {
+                    completion_prefix(&typed, &candidates)
+                }
+            });
+            let is_directory = unique && completion_is_directory(&completed);
+            let new_cursor = start + completed.chars().count();
+            if let Prompt::ShellCommand {
+                input,
+                cursor,
+                selected,
+                candidates: shown,
+            } = &mut self.prompt
+            {
+                let from = char_to_byte(input, start);
+                let to = char_to_byte(input, end);
+                input.replace_range(from..to, &completed);
+                *cursor = new_cursor;
+                *selected = None;
+                *shown = if unique && !is_directory {
+                    Vec::new()
+                } else {
+                    candidates
+                };
+                if unique && !is_directory {
+                    input.insert(char_to_byte(input, new_cursor), ' ');
+                    *cursor = new_cursor + 1;
+                }
+            }
+            if is_directory {
+                let (input, cursor) = match &self.prompt {
+                    Prompt::ShellCommand { input, cursor, .. } => (input.clone(), *cursor),
+                    _ => return,
+                };
+                let candidates = self.shell_completion(&input, cursor).candidates;
+                if let Prompt::ShellCommand {
+                    candidates: shown, ..
+                } = &mut self.prompt
+                {
+                    *shown = candidates;
+                }
+            }
+            return;
+        }
         let typed = match &self.prompt {
             Prompt::SwitchBuffer { input, .. }
             | Prompt::KillBuffer { input, .. }
@@ -5006,10 +5200,8 @@ impl App {
                 .file_candidates(input, *copy || self.dired_paths(Mark::Marked).len() > 1)
                 .len(),
             Prompt::CreateDirectory { input, .. } => self.file_candidates(input, false).len(),
-            Prompt::None
-            | Prompt::Confirm { .. }
-            | Prompt::MarkExtension { .. }
-            | Prompt::ShellCommand { .. } => 0,
+            Prompt::ShellCommand { candidates, .. } => candidates.len(),
+            Prompt::None | Prompt::Confirm { .. } | Prompt::MarkExtension { .. } => 0,
         };
         use Action::*;
         let action = keymap::translate(key);
@@ -5351,13 +5543,18 @@ impl App {
                     0,
                 ))
             }
-            Prompt::ShellCommand { input, cursor } => {
+            Prompt::ShellCommand {
+                input,
+                cursor,
+                selected,
+                candidates,
+            } => {
                 let prefix = "Shell command: ";
                 Some((
                     format!("{prefix}{input}"),
                     prefix.chars().count() + *cursor,
-                    Vec::new(),
-                    0,
+                    candidates.clone(),
+                    selected.unwrap_or(usize::MAX),
                 ))
             }
             Prompt::Confirm {
@@ -6473,6 +6670,68 @@ fn snippet(text: &str) -> String {
     }
 }
 
+/// The char range of the shell word containing `cursor`.
+fn shell_token_bounds(input: &str, cursor: usize) -> (usize, usize) {
+    let chars: Vec<char> = input.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let is_boundary = |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>');
+    let mut start = cursor;
+    while start > 0 && !is_boundary(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < chars.len() && !is_boundary(chars[end]) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Whether the word at `start` is the command rather than an argument.
+fn shell_command_position(input: &str, start: usize) -> bool {
+    input
+        .chars()
+        .take(start)
+        .filter(|c| !c.is_whitespace())
+        .last()
+        .is_none_or(|c| matches!(c, ';' | '|' | '&'))
+}
+
+/// Whether a completed path token names a directory.
+fn completion_is_directory(candidate: &str) -> bool {
+    candidate.ends_with(['/', '\\'])
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|candidate| !candidate.trim().is_empty())
+        .any(|candidate| {
+            candidate
+                .trim()
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(extension)
+        })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 /// Extend `typed` with the part shared by every candidate after it. Matching
 /// is case-insensitive, as in `file_candidates`, but the already-typed text is
 /// preserved rather than replaced by a differently-cased common prefix.
@@ -6549,7 +6808,7 @@ fn scratch_lines() -> Vec<String> {
         "  C-x C-b        list buffers".to_string(),
         "  C-x 4 b        switch buffers in the other window".to_string(),
         "  C-x 4 d        open a directory in Dired in the other window".to_string(),
-        "  M-!            run a shell command".to_string(),
+        "  M-!            run a shell command (TAB completes)".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
     ]
@@ -6634,6 +6893,7 @@ fn help_lines() -> Vec<String> {
         "",
         "Shell commands",
         "  M-!                 run a shell command in the current directory",
+        "                      TAB completes command names and file paths;",
         "                      Short output stays in the echo area; longer",
         "                      output goes to *Shell Command Output*.",
         "                      C-g cancels it during the first second.",
@@ -10632,6 +10892,152 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_tab_completes_file_arguments() {
+        let dir = temp_dir("shell-complete-file");
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(dir.join("alpine.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "cat al");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        let Prompt::ShellCommand {
+            input,
+            cursor,
+            selected,
+            candidates,
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat alp");
+        assert_eq!(*cursor, input.chars().count());
+        assert_eq!(*selected, None);
+        assert_eq!(candidates, &["alpha.txt", "alpine.txt"]);
+
+        press(&mut app, 'h');
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand {
+            input,
+            cursor,
+            selected,
+            candidates,
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat alpha.txt ");
+        assert_eq!(*cursor, input.chars().count());
+        assert_eq!(*selected, None);
+        assert!(candidates.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_tab_completes_relative_paths() {
+        let dir = temp_dir("shell-complete-path");
+        let docs = dir.join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("manual.txt"), b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "cat do");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let completed_dir = format!("cat docs{}", std::path::MAIN_SEPARATOR);
+        let Prompt::ShellCommand {
+            input,
+            cursor,
+            candidates,
+            ..
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, &completed_dir);
+        assert_eq!(*cursor, completed_dir.chars().count());
+        assert_eq!(
+            candidates,
+            &[format!("docs{}manual.txt", std::path::MAIN_SEPARATOR)]
+        );
+
+        type_text(&mut app, "ma");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(
+            input,
+            &format!("cat docs{}manual.txt ", std::path::MAIN_SEPARATOR)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_tab_selection_and_path_like_command_words() {
+        let dir = temp_dir("shell-complete-selection");
+        std::fs::write(dir.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(dir.join("beta.txt"), b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "cat ");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand {
+            input, candidates, ..
+        } = &app.prompt
+        else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat ");
+        assert_eq!(candidates, &["alpha.txt", "beta.txt"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "cat alpha.txt ");
+
+        press(&mut app, 'x');
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'k');
+        type_text(&mut app, "./al");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "./alpha.txt ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_completes_commands_in_the_shell_directory() {
+        let dir = temp_dir("shell-complete-command");
+        std::fs::write(dir.join("mytool.cmd"), b"@echo off\r\n").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        type_text(&mut app, "myt");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { input, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert_eq!(input, "mytool.cmd ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn shell_command_echoes_short_output() {
         let dir = temp_dir("shell-echo");
         let mut app = App::new(Config::default());
@@ -10764,7 +11170,7 @@ mod tests {
         assert!(matches!(app.prompt, Prompt::ShellCommand { .. }));
 
         alt(&mut app, 'p');
-        let Prompt::ShellCommand { input, cursor } = &app.prompt else {
+        let Prompt::ShellCommand { input, cursor, .. } = &app.prompt else {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "echo one");
