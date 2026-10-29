@@ -50,20 +50,43 @@ const POWERSHELL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 const POWERSHELL_COMPLETION_BEGIN: &str = "__DIREDRS_COMPLETE_BEGIN__";
 const POWERSHELL_COMPLETION_END: &str = "__DIREDRS_COMPLETE_END__";
 
-/// A persistent PowerShell completion loop. Requests are tab-separated:
-/// UTF-16 cursor, then `x`-prefixed base64 cwd and input. Responses are framed
-/// by the markers above, with base64 text plus the result type per match.
-const POWERSHELL_COMPLETION_SCRIPT: &str = "\
+/// A persistent PowerShell completion loop. Requests are tab-separated and
+/// start with an operation: `C` completes a prompt, `N` lists command names.
+/// Responses are framed by the markers above, with base64 text plus a result
+/// type per match.
+const POWERSHELL_COMPLETION_PRELUDE: &str = "\
 $ProgressPreference='SilentlyContinue'; \
 [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
-try { $null=[System.Management.Automation.CommandCompletion]::CompleteInput('Get-ChildItem ',14,$null) } catch {}; \
+$commandNames=@(); \
+try { $null=[System.Management.Automation.CommandCompletion]::CompleteInput('Get-ChildItem ',14,$null) } catch {}; ";
+
+const POWERSHELL_COMMAND_NAMES_PRELOAD: &str = "\
+$commandNames=@(Get-Command -CommandType Cmdlet,Function,Filter,Alias \
+-ErrorAction SilentlyContinue | ForEach-Object Name); ";
+
+const POWERSHELL_COMPLETION_LOOP: &str = "\
 $reader=[Console]::In; \
 while ($null -ne ($request=$reader.ReadLine())) { \
   $parts=$request.Split(\"`t\"); \
-  if ($parts.Count -lt 3) { continue }; \
-  $cursor=[int]$parts[0]; \
-  $cwd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1].Substring(1))); \
-  $text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[2].Substring(1))); \
+  if ($parts.Count -lt 1) { continue }; \
+  if ($parts[0] -eq 'N') { \
+    if ($commandNames.Count -eq 0) { \
+      $commandNames=@(Get-Command -CommandType Cmdlet,Function,Filter,Alias \
+      -ErrorAction SilentlyContinue | ForEach-Object Name) \
+    }; \
+    [Console]::Out.WriteLine('__DIREDRS_COMPLETE_BEGIN__'); \
+    foreach ($name in $commandNames) { \
+      $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$name)); \
+      [Console]::Out.WriteLine($encoded + \"`tCommandName\") \
+    }; \
+    [Console]::Out.WriteLine('__DIREDRS_COMPLETE_END__'); \
+    [Console]::Out.Flush(); \
+    continue \
+  }; \
+  if ($parts.Count -lt 4) { continue }; \
+  $cursor=[int]$parts[1]; \
+  $cwd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[2].Substring(1))); \
+  $text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3].Substring(1))); \
   try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch {}; \
   try { $result=[System.Management.Automation.CommandCompletion]::CompleteInput($text,$cursor,$null) } catch { $result=$null }; \
   [Console]::Out.WriteLine('__DIREDRS_COMPLETE_BEGIN__'); \
@@ -345,9 +368,19 @@ pub struct PowerShellCompleter {
 }
 
 impl PowerShellCompleter {
-    /// Start a completion worker in `dir`.
-    pub fn start(dir: &Path) -> io::Result<Self> {
-        let mut process = ShellProgram::Powershell.command(POWERSHELL_COMPLETION_SCRIPT)?;
+    /// Start a completion worker in `dir`, optionally preloading command names.
+    pub fn start(dir: &Path, preload_command_names: bool) -> io::Result<Self> {
+        let script = [
+            POWERSHELL_COMPLETION_PRELUDE,
+            if preload_command_names {
+                POWERSHELL_COMMAND_NAMES_PRELOAD
+            } else {
+                ""
+            },
+            POWERSHELL_COMPLETION_LOOP,
+        ]
+        .concat();
+        let mut process = ShellProgram::Powershell.command(&script)?;
         let mut child = process
             .current_dir(dir)
             .stdin(Stdio::piped())
@@ -399,9 +432,29 @@ impl PowerShellCompleter {
         let cwd =
             base64::engine::general_purpose::STANDARD.encode(dir.to_string_lossy().as_bytes());
         let text = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
-        writeln!(self.stdin, "{cursor}\tx{cwd}\tx{text}")?;
+        writeln!(self.stdin, "C\t{cursor}\tx{cwd}\tx{text}")?;
         self.stdin.flush()?;
+        self.read_response()
+    }
 
+    /// Command names available to the PowerShell profile.
+    pub fn command_names(&mut self) -> io::Result<Vec<String>> {
+        writeln!(self.stdin, "N")?;
+        self.stdin.flush()?;
+        let completions = self.read_response()?;
+        let mut seen = HashSet::new();
+        let mut names = Vec::new();
+        for completion in completions {
+            let name = completion.text.trim();
+            if !name.is_empty() && seen.insert(name.to_lowercase()) {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn read_response(&mut self) -> io::Result<Vec<PowershellCompletion>> {
         let deadline = Instant::now() + POWERSHELL_COMPLETION_TIMEOUT;
         let mut in_response = false;
         let mut completions = Vec::new();
@@ -469,31 +522,6 @@ fn parse_powershell_completion(line: &str) -> Option<PowershellCompletion> {
         text,
         result_type: result_type.to_string(),
     })
-}
-
-/// Names of commands available to the PowerShell profile.
-pub fn powershell_command_names() -> io::Result<Vec<String>> {
-    let script = "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
-                  Get-Command -CommandType Cmdlet,Function,Filter,Alias \
-                  -ErrorAction SilentlyContinue | ForEach-Object Name";
-    let output = ShellProgram::Powershell
-        .command(script)?
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-    let mut seen = HashSet::new();
-    let mut names = Vec::new();
-    for name in String::from_utf8_lossy(&output.stdout).lines() {
-        let name = name.trim();
-        if !name.is_empty() && seen.insert(name.to_lowercase()) {
-            names.push(name.to_string());
-        }
-    }
-    names.sort();
-    Ok(names)
 }
 
 #[cfg(test)]
@@ -631,18 +659,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn powershell_command_names_include_cmdlets() {
-        let names = powershell_command_names().unwrap();
+    fn powershell_worker_lists_commands() {
+        let dir = temp_dir("powershell-commands");
+        let mut completer = PowerShellCompleter::start(&dir, true).unwrap();
+        let names = completer.command_names().unwrap();
         assert!(names
             .iter()
             .any(|name| name.eq_ignore_ascii_case("Compress-Archive")));
+
+        let names = completer.command_names().unwrap();
+        assert!(names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("Get-ChildItem")));
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]
     #[test]
     fn powershell_worker_completes_parameters_and_values() {
         let dir = temp_dir("powershell-completion");
-        let mut completer = PowerShellCompleter::start(&dir).unwrap();
+        let mut completer = PowerShellCompleter::start(&dir, false).unwrap();
         let input = "Get-ChildItem -Pa";
         let completions = completer.complete(input, input.len(), &dir).unwrap();
         assert!(
@@ -671,7 +708,7 @@ mod tests {
         let dir = temp_dir("powershell-quoted");
         let spaced = dir.join("space dir");
         fs::create_dir(&spaced).unwrap();
-        let mut completer = PowerShellCompleter::start(&dir).unwrap();
+        let mut completer = PowerShellCompleter::start(&dir, false).unwrap();
         let input = format!("Get-ChildItem -Path \"{}", spaced.display());
         let completions = completer
             .complete(&input, input.chars().count(), &dir)
@@ -696,7 +733,7 @@ mod tests {
         let work = dir.join("work");
         fs::create_dir(&work).unwrap();
         fs::write(work.join("needle.txt"), b"x").unwrap();
-        let mut completer = PowerShellCompleter::start(&dir).unwrap();
+        let mut completer = PowerShellCompleter::start(&dir, false).unwrap();
         let input = "Get-ChildItem -Path n";
         let completions = completer.complete(input, input.len(), &work).unwrap();
         assert!(

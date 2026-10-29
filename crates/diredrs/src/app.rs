@@ -480,7 +480,8 @@ pub struct App {
     shell_foreground_wait: Duration,
     /// Commands submitted through `M-!`.
     shell_history: History,
-    /// PowerShell command names, loaded on the first command-position Tab.
+    /// PowerShell command names, loaded from the warm worker on the first
+    /// command-position Tab.
     powershell_commands: Option<Vec<String>>,
     /// A warm PowerShell completion process, kept only while the `M-!` prompt
     /// is open.
@@ -1048,7 +1049,9 @@ impl App {
         self.shell_history.reset_navigation();
         self.powershell_completer = if self.config.shell.program == shell::ShellProgram::Powershell
         {
-            shell::PowerShellCompleter::start(&self.shell_directory()).ok()
+            let dir = self.shell_directory();
+            let preload = self.powershell_commands.is_none();
+            shell::PowerShellCompleter::start(&dir, preload).ok()
         } else {
             None
         };
@@ -4438,8 +4441,18 @@ impl App {
     fn command_candidates(&mut self, prefix: &str) -> Vec<String> {
         if self.config.shell.program == shell::ShellProgram::Powershell {
             if self.powershell_commands.is_none() {
-                self.powershell_commands =
-                    Some(shell::powershell_command_names().unwrap_or_default());
+                let result = self
+                    .ensure_powershell_completer()
+                    .map(|completer| completer.command_names());
+                let names = match result {
+                    Some(Ok(names)) => names,
+                    Some(Err(_)) => {
+                        self.powershell_completer = None;
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
+                self.powershell_commands = Some(names);
             }
             let prefix_lower = prefix.to_lowercase();
             let names = self.powershell_commands.as_ref().expect("just loaded");
@@ -4484,6 +4497,16 @@ impl App {
         )
     }
 
+    /// The warm PowerShell worker, started if necessary.
+    fn ensure_powershell_completer(&mut self) -> Option<&mut shell::PowerShellCompleter> {
+        if self.powershell_completer.is_none() {
+            let dir = self.shell_directory();
+            let preload = self.powershell_commands.is_none();
+            self.powershell_completer = shell::PowerShellCompleter::start(&dir, preload).ok();
+        }
+        self.powershell_completer.as_mut()
+    }
+
     /// Completions from PowerShell's own engine for arguments and their values.
     fn powershell_argument_candidates(
         &mut self,
@@ -4491,12 +4514,8 @@ impl App {
         cursor: usize,
     ) -> Option<Vec<String>> {
         let dir = self.shell_directory();
-        if self.powershell_completer.is_none() {
-            self.powershell_completer = shell::PowerShellCompleter::start(&dir).ok();
-        }
         let result = self
-            .powershell_completer
-            .as_mut()?
+            .ensure_powershell_completer()?
             .complete(input, cursor, &dir);
         let completions = match result {
             Ok(completions) => completions,
@@ -11370,6 +11389,26 @@ mod tests {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "Compress-Archive ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_tab_on_an_empty_prefix_lists_powershell_commands() {
+        let dir = temp_dir("shell-complete-powershell-empty");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Prompt::ShellCommand { candidates, .. } = &app.prompt else {
+            panic!("expected shell prompt");
+        };
+        assert!(!candidates.is_empty());
+        assert!(app.powershell_commands.as_ref().is_some_and(|names| names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("Compress-Archive"))));
 
         std::fs::remove_dir_all(&dir).ok();
     }
