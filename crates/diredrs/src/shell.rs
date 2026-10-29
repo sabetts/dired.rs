@@ -2,9 +2,9 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,23 +43,37 @@ pub const OUTPUT_BUFFER: &str = "*Shell Command Output*";
 /// child process exits.
 const FINAL_READ: Duration = Duration::from_millis(100);
 
-/// How long argument completion may take before the prompt gives up.
+/// How long one argument-completion request may take before the prompt gives
+/// up and asks for a fresh worker.
 const POWERSHELL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// PowerShell's own completion engine, fed the prompt through stdin. The
-/// cursor and text are the first two input lines; matches come back as
-/// base64-encoded text plus the completion result type.
+const POWERSHELL_COMPLETION_BEGIN: &str = "__DIREDRS_COMPLETE_BEGIN__";
+const POWERSHELL_COMPLETION_END: &str = "__DIREDRS_COMPLETE_END__";
+
+/// A persistent PowerShell completion loop. Requests are tab-separated:
+/// UTF-16 cursor, then `x`-prefixed base64 cwd and input. Responses are framed
+/// by the markers above, with base64 text plus the result type per match.
 const POWERSHELL_COMPLETION_SCRIPT: &str = "\
 $ProgressPreference='SilentlyContinue'; \
 [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); \
+try { $null=[System.Management.Automation.CommandCompletion]::CompleteInput('Get-ChildItem ',14,$null) } catch {}; \
 $reader=[Console]::In; \
-$cursor=[int]$reader.ReadLine(); \
-$text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reader.ReadLine())); \
-$result=[System.Management.Automation.CommandCompletion]::CompleteInput($text,$cursor,$null); \
-$result.CompletionMatches | Select-Object -First 100 | ForEach-Object { \
-  $completed=if ($null -eq $_.CompletionText) { '' } else { [string]$_.CompletionText }; \
-  $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($completed)); \
-  Write-Output ($encoded + \"`t\" + $_.ResultType) \
+while ($null -ne ($request=$reader.ReadLine())) { \
+  $parts=$request.Split(\"`t\"); \
+  if ($parts.Count -lt 3) { continue }; \
+  $cursor=[int]$parts[0]; \
+  $cwd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[1].Substring(1))); \
+  $text=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[2].Substring(1))); \
+  try { Set-Location -LiteralPath $cwd -ErrorAction Stop } catch {}; \
+  try { $result=[System.Management.Automation.CommandCompletion]::CompleteInput($text,$cursor,$null) } catch { $result=$null }; \
+  [Console]::Out.WriteLine('__DIREDRS_COMPLETE_BEGIN__'); \
+  if ($null -ne $result) { $result.CompletionMatches | Select-Object -First 100 | ForEach-Object { \
+    $completed=if ($null -eq $_.CompletionText) { '' } else { [string]$_.CompletionText }; \
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($completed)); \
+    [Console]::Out.WriteLine($encoded + \"`t\" + $_.ResultType) \
+  } }; \
+  [Console]::Out.WriteLine('__DIREDRS_COMPLETE_END__'); \
+  [Console]::Out.Flush() \
 }";
 
 /// A child shell process whose stdout is collected on a worker thread.
@@ -322,83 +336,139 @@ pub struct PowershellCompletion {
     pub result_type: String,
 }
 
-/// Ask PowerShell's completion engine about `input` at char index `cursor`.
-pub fn powershell_completions(
-    input: &str,
-    cursor: usize,
-    dir: &Path,
-) -> io::Result<Vec<PowershellCompletion>> {
-    let cursor = input
-        .chars()
-        .take(cursor)
-        .map(char::len_utf16)
-        .sum::<usize>();
-    let payload = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
-    let mut process = ShellProgram::Powershell.command(POWERSHELL_COMPLETION_SCRIPT)?;
-    let mut child = process
-        .current_dir(dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let written = (|| -> io::Result<()> {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("PowerShell completion has no stdin pipe"))?;
-        writeln!(stdin, "{cursor}")?;
-        writeln!(stdin, "{payload}")?;
-        Ok(())
-    })();
-    if let Err(err) = written {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
+/// A warm PowerShell process used while the `M-!` prompt is open.
+pub struct PowerShellCompleter {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<io::Result<String>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
 
-    let deadline = Instant::now() + POWERSHELL_COMPLETION_TIMEOUT;
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            if !output.status.success() {
-                return Err(io::Error::other("PowerShell completion failed"));
-            }
-            return Ok(parse_powershell_completions(&output.stdout));
-        }
-        if Instant::now() >= deadline {
+impl PowerShellCompleter {
+    /// Start a completion worker in `dir`.
+    pub fn start(dir: &Path) -> io::Result<Self> {
+        let mut process = ShellProgram::Powershell.command(POWERSHELL_COMPLETION_SCRIPT)?;
+        let mut child = process
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let Some(stdin) = child.stdin.take() else {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "PowerShell completion timed out",
-            ));
+            return Err(io::Error::other("PowerShell completion has no stdin pipe"));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other("PowerShell completion has no stdout pipe"));
+        };
+        let (tx, lines) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let sent = match line {
+                    Ok(line) => tx.send(Ok(line)),
+                    Err(err) => tx.send(Err(err)),
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin,
+            lines,
+            reader: Some(reader),
+        })
+    }
+
+    /// Complete `input` at char index `cursor`, relative to `dir`.
+    pub fn complete(
+        &mut self,
+        input: &str,
+        cursor: usize,
+        dir: &Path,
+    ) -> io::Result<Vec<PowershellCompletion>> {
+        let cursor = input
+            .chars()
+            .take(cursor)
+            .map(char::len_utf16)
+            .sum::<usize>();
+        let cwd =
+            base64::engine::general_purpose::STANDARD.encode(dir.to_string_lossy().as_bytes());
+        let text = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
+        writeln!(self.stdin, "{cursor}\tx{cwd}\tx{text}")?;
+        self.stdin.flush()?;
+
+        let deadline = Instant::now() + POWERSHELL_COMPLETION_TIMEOUT;
+        let mut in_response = false;
+        let mut completions = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(remaining) {
+                Ok(Ok(line)) => {
+                    if !in_response {
+                        if line == POWERSHELL_COMPLETION_BEGIN {
+                            in_response = true;
+                        }
+                        continue;
+                    }
+                    if line == POWERSHELL_COMPLETION_END {
+                        return Ok(completions);
+                    }
+                    if let Some(completion) = parse_powershell_completion(&line) {
+                        completions.push(completion);
+                    }
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "PowerShell completion timed out",
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "PowerShell completion process exited",
+                    ));
+                }
+            }
         }
-        thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn parse_powershell_completions(output: &[u8]) -> Vec<PowershellCompletion> {
-    let mut completions = Vec::new();
-    for line in String::from_utf8_lossy(output).lines() {
-        let line = line.trim_end_matches('\r');
-        let Some((encoded, result_type)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-            continue;
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        if text.is_empty() || text.contains('\r') || text.contains('\n') {
-            continue;
+impl Drop for PowerShellCompleter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let deadline = Instant::now() + FINAL_READ;
+            while !reader.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if reader.is_finished() {
+                let _ = reader.join();
+            }
         }
-        completions.push(PowershellCompletion {
-            text,
-            result_type: result_type.to_string(),
-        });
     }
-    completions
+}
+
+fn parse_powershell_completion(line: &str) -> Option<PowershellCompletion> {
+    let (encoded, result_type) = line.split_once('\t')?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    if text.is_empty() || text.contains('\r') || text.contains('\n') {
+        return None;
+    }
+    Some(PowershellCompletion {
+        text,
+        result_type: result_type.to_string(),
+    })
 }
 
 /// Names of commands available to the PowerShell profile.
@@ -570,10 +640,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn powershell_completions_include_parameters_and_values() {
+    fn powershell_worker_completes_parameters_and_values() {
         let dir = temp_dir("powershell-completion");
+        let mut completer = PowerShellCompleter::start(&dir).unwrap();
         let input = "Get-ChildItem -Pa";
-        let completions = powershell_completions(input, input.len(), &dir).unwrap();
+        let completions = completer.complete(input, input.len(), &dir).unwrap();
         assert!(
             completions
                 .iter()
@@ -582,7 +653,7 @@ mod tests {
         );
 
         let input = "Get-ChildItem -ErrorAction Si";
-        let completions = powershell_completions(input, input.len(), &dir).unwrap();
+        let completions = completer.complete(input, input.len(), &dir).unwrap();
         assert!(
             completions
                 .iter()
@@ -596,12 +667,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn powershell_completions_keep_quoted_paths_with_spaces() {
+    fn powershell_worker_keeps_quoted_paths_with_spaces() {
         let dir = temp_dir("powershell-quoted");
         let spaced = dir.join("space dir");
         fs::create_dir(&spaced).unwrap();
+        let mut completer = PowerShellCompleter::start(&dir).unwrap();
         let input = format!("Get-ChildItem -Path \"{}", spaced.display());
-        let completions = powershell_completions(&input, input.chars().count(), &dir).unwrap();
+        let completions = completer
+            .complete(&input, input.chars().count(), &dir)
+            .unwrap();
         assert!(
             completions.iter().any(|item| {
                 item.result_type == "ProviderContainer"
@@ -609,6 +683,26 @@ mod tests {
                     && item.text.ends_with('"')
                     && item.text.contains("space dir")
             }),
+            "{completions:?}"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_worker_completes_relative_to_the_requested_directory() {
+        let dir = temp_dir("powershell-cwd");
+        let work = dir.join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("needle.txt"), b"x").unwrap();
+        let mut completer = PowerShellCompleter::start(&dir).unwrap();
+        let input = "Get-ChildItem -Path n";
+        let completions = completer.complete(input, input.len(), &work).unwrap();
+        assert!(
+            completions
+                .iter()
+                .any(|item| item.text.contains("needle.txt")),
             "{completions:?}"
         );
 

@@ -482,6 +482,9 @@ pub struct App {
     shell_history: History,
     /// PowerShell command names, loaded on the first command-position Tab.
     powershell_commands: Option<Vec<String>>,
+    /// A warm PowerShell completion process, kept only while the `M-!` prompt
+    /// is open.
+    powershell_completer: Option<shell::PowerShellCompleter>,
 }
 
 impl App {
@@ -543,6 +546,7 @@ impl App {
             shell_foreground_wait: SHELL_FOREGROUND_WAIT,
             shell_history: History::default(),
             powershell_commands: None,
+            powershell_completer: None,
         };
         let scratch = app.new_buffer("*scratch*".to_string(), Kind::Scratch, Buffer::new());
         app.buffers[scratch]
@@ -1042,6 +1046,12 @@ impl App {
             return;
         }
         self.shell_history.reset_navigation();
+        self.powershell_completer = if self.config.shell.program == shell::ShellProgram::Powershell
+        {
+            shell::PowerShellCompleter::start(&self.shell_directory()).ok()
+        } else {
+            None
+        };
         self.prompt = Prompt::ShellCommand {
             input: String::new(),
             cursor: 0,
@@ -4475,9 +4485,26 @@ impl App {
     }
 
     /// Completions from PowerShell's own engine for arguments and their values.
-    fn powershell_argument_candidates(&self, input: &str, cursor: usize) -> Option<Vec<String>> {
-        let completions =
-            shell::powershell_completions(input, cursor, &self.shell_directory()).ok()?;
+    fn powershell_argument_candidates(
+        &mut self,
+        input: &str,
+        cursor: usize,
+    ) -> Option<Vec<String>> {
+        let dir = self.shell_directory();
+        if self.powershell_completer.is_none() {
+            self.powershell_completer = shell::PowerShellCompleter::start(&dir).ok();
+        }
+        let result = self
+            .powershell_completer
+            .as_mut()?
+            .complete(input, cursor, &dir);
+        let completions = match result {
+            Ok(completions) => completions,
+            Err(_) => {
+                self.powershell_completer = None;
+                return None;
+            }
+        };
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for completion in completions {
@@ -5288,6 +5315,7 @@ impl App {
         self.prompt_mark = None;
         self.prompt_last_yank = None;
         self.prompt_cx = false;
+        self.powershell_completer = None;
         self.message = Option::None;
     }
 
@@ -5431,6 +5459,7 @@ impl App {
         self.prompt_mark = None;
         self.prompt_last_yank = None;
         self.prompt_cx = false;
+        self.powershell_completer = None;
         self.message = Option::None;
         match std::mem::replace(&mut self.prompt, Prompt::None) {
             Prompt::None => {}
@@ -11341,6 +11370,21 @@ mod tests {
             panic!("expected shell prompt");
         };
         assert_eq!(input, "Compress-Archive ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_completion_worker_lives_only_while_the_prompt_is_open() {
+        let dir = temp_dir("shell-complete-worker");
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+
+        alt(&mut app, '!');
+        assert!(app.powershell_completer.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.powershell_completer.is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
