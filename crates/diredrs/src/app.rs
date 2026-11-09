@@ -89,12 +89,20 @@ pub struct WindowView {
 /// A stable identifier for a window.
 pub type WindowId = u64;
 
-/// One window: a buffer plus its saved view.
+/// A buffer previously shown in a window, with the view it had there.
+#[derive(Debug, Clone, Copy)]
+struct WindowHistoryEntry {
+    buffer: usize,
+    view: WindowView,
+}
+
+/// One window: a buffer plus its saved view and previous-buffer history.
 #[derive(Debug, Clone)]
 pub struct Window {
     pub id: WindowId,
     pub buffer: usize,
     pub view: WindowView,
+    prev_buffers: Vec<WindowHistoryEntry>,
 }
 
 /// How a window is divided.
@@ -167,7 +175,7 @@ pub enum Prompt {
         cursor: usize,
         /// `true` for `C-x d` (a directory listing), `false` for a file.
         dired: bool,
-        /// `C-x 4 d`: show the directory in the other window.
+        /// `C-x 4 f` / `C-x 4 d`: show it in the other window.
         other_window: bool,
         /// Highlighted completion candidate, moved with Up/Down. `None` means
         /// the typed `input` is used as-is (the default).
@@ -296,7 +304,7 @@ enum Prefix {
     #[default]
     None,
     CtrlX,
-    /// `C-x 4` (`C-x 4 b`, `C-x 4 d`).
+    /// `C-x 4` (`C-x 4 b`, `C-x 4 d`, `C-x 4 f`).
     CtrlX4,
     /// `M-g` (window movement and numbering).
     MetaG,
@@ -392,6 +400,12 @@ const SHELL_FOREGROUND_WAIT: Duration = Duration::from_secs(30);
 /// How often the event loop checks on a running shell command.
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How many completion candidates the minibuffer shows at once.
+const PROMPT_CANDIDATE_ROWS: usize = 5;
+
+/// How many previous buffers each window remembers.
+const WINDOW_HISTORY_DEPTH: usize = 16;
+
 /// Top-level application.
 pub struct App {
     pub config: Config,
@@ -476,6 +490,8 @@ pub struct App {
     scroll_margin: usize,
     /// The one shell command currently running, foreground or background.
     shell_job: Option<ShellJob>,
+    /// The directory the most recent shell command ran in, for the output buffer.
+    shell_dir: Option<PathBuf>,
     /// How long a new shell command stays foreground. Tests shorten this.
     shell_foreground_wait: Duration,
     /// Commands submitted through `M-!`.
@@ -544,6 +560,7 @@ impl App {
             human_sizes,
             scroll_margin,
             shell_job: None,
+            shell_dir: None,
             shell_foreground_wait: SHELL_FOREGROUND_WAIT,
             shell_history: History::default(),
             powershell_commands: None,
@@ -561,6 +578,7 @@ impl App {
             id,
             buffer: scratch,
             view: capture_view(&app.buffers[scratch].buffer),
+            prev_buffers: Vec::new(),
         });
         app.active_window = id;
         app.window_tree = WindowTree::Leaf(id);
@@ -685,6 +703,39 @@ impl App {
         }
     }
 
+    /// Push a window's current buffer and view onto its previous-buffer list.
+    fn record_window_buffer(&mut self, id: WindowId) {
+        let Some(pos) = self.windows.iter().position(|w| w.id == id) else {
+            return;
+        };
+        let (buffer, view) = (self.windows[pos].buffer, self.windows[pos].view);
+        if buffer >= self.buffers.len() {
+            return;
+        }
+        let history = &mut self.windows[pos].prev_buffers;
+        history.retain(|entry| entry.buffer != buffer);
+        history.insert(0, WindowHistoryEntry { buffer, view });
+        history.truncate(WINDOW_HISTORY_DEPTH);
+    }
+
+    /// Show `idx` in a window, recording the buffer it was showing before.
+    fn set_window_buffer(&mut self, id: WindowId, idx: usize, view: WindowView) {
+        if idx >= self.buffers.len() {
+            return;
+        }
+        let Some(pos) = self.windows.iter().position(|w| w.id == id) else {
+            return;
+        };
+        if self.windows[pos].buffer == idx {
+            self.windows[pos].view = view;
+            return;
+        }
+        self.record_window_buffer(id);
+        let window = &mut self.windows[pos];
+        window.buffer = idx;
+        window.view = view;
+    }
+
     fn note_buffer_visit(&mut self, idx: usize) {
         self.visit_seq += 1;
         self.buffers[idx].last_visited = self.visit_seq;
@@ -720,9 +771,6 @@ impl App {
         let old = self.current;
         self.previous = old;
         self.current = idx;
-        if let Some(window) = self.windows.iter_mut().find(|w| w.id == self.active_window) {
-            window.buffer = idx;
-        }
         self.note_buffer_visit(idx);
         let cols = self.viewport_cols;
         let height = self.viewport_rows.max(1);
@@ -730,6 +778,8 @@ impl App {
         let buf = &mut self.buffers[idx].buffer;
         buf.set_width(cols);
         buf.ensure_point_visible(height, margin);
+        let view = capture_view(&self.buffers[idx].buffer);
+        self.set_window_buffer(self.active_window, idx, view);
     }
 
     fn select_window(&mut self, id: WindowId) {
@@ -770,6 +820,7 @@ impl App {
             id: new_id,
             buffer: self.current,
             view: capture_view(&self.buffers[self.current].buffer),
+            prev_buffers: Vec::new(),
         });
         if !split_leaf(&mut self.window_tree, old, axis, new_id) {
             self.windows.pop();
@@ -941,12 +992,7 @@ impl App {
         self.save_active_view();
         let old = self.current;
         let view = capture_view(&self.buffers[idx].buffer);
-        if let Some(window) = self.windows.iter_mut().find(|w| w.id == other) {
-            if window.buffer != idx {
-                window.buffer = idx;
-                window.view = view;
-            }
-        }
+        self.set_window_buffer(other, idx, view);
         self.previous = old;
         self.select_window(other);
     }
@@ -999,42 +1045,82 @@ impl App {
             self.shell_job = None;
             self.message = Some("Shell command killed".to_string());
         }
-        let active_killed = self.current == idx;
         self.save_active_view();
+        // Choose every window's replacement from its own history before the
+        // buffer indices shift.
+        let replacements: Vec<(WindowId, Option<WindowHistoryEntry>)> = self
+            .windows
+            .iter()
+            .filter(|window| window.buffer == idx)
+            .map(|window| {
+                let entry = window
+                    .prev_buffers
+                    .iter()
+                    .find(|entry| entry.buffer != idx && entry.buffer < self.buffers.len())
+                    .copied();
+                (window.id, entry)
+            })
+            .collect();
         self.buffers.remove(idx);
         // Removing a buffer shifts indices, so the painted index no longer
         // identifies the same buffer.
         self.drawn_buffer = None;
         for window in &mut self.windows {
-            if window.buffer > idx {
-                window.buffer -= 1;
-            } else if window.buffer == idx {
-                window.buffer = usize::MAX;
+            if let Some(buffer) = index_after_removing(window.buffer, idx) {
+                window.buffer = buffer;
+            }
+            window.prev_buffers.retain(|entry| entry.buffer != idx);
+            for entry in &mut window.prev_buffers {
+                if entry.buffer > idx {
+                    entry.buffer -= 1;
+                }
             }
         }
         let fallback = idx.min(self.buffers.len().saturating_sub(1));
-        if self.current > idx {
-            self.current -= 1;
-        } else if self.current == idx {
-            self.current = fallback;
-        }
-        if self.previous > idx {
-            self.previous -= 1;
-        } else if self.previous == idx {
-            self.previous = fallback;
-        }
         let fallback_view = capture_view(&self.buffers[fallback].buffer);
-        for window in &mut self.windows {
-            if window.buffer == usize::MAX {
-                window.buffer = fallback;
-                window.view = fallback_view;
+        let mut active_replacement = None;
+        for (id, entry) in replacements {
+            let (buffer, view) = match entry {
+                Some(entry) => (
+                    index_after_removing(entry.buffer, idx).unwrap_or(fallback),
+                    entry.view,
+                ),
+                None => (fallback, fallback_view),
+            };
+            if let Some(window) = self.windows.iter_mut().find(|w| w.id == id) {
+                window.buffer = buffer;
+                window.view = view;
             }
+            if id == self.active_window {
+                active_replacement = Some((buffer, view));
+            }
+        }
+        if let Some((buffer, view)) = active_replacement {
+            self.current = buffer;
+            restore_view(&mut self.buffers[buffer].buffer, view);
+            self.note_buffer_visit(buffer);
+        } else if let Some(buffer) = index_after_removing(self.current, idx) {
+            self.current = buffer;
+        } else {
+            self.current = fallback;
         }
         if let Some(window) = self.windows.iter_mut().find(|w| w.id == self.active_window) {
             window.buffer = self.current;
-            if active_killed {
-                window.view = fallback_view;
-            }
+        }
+        self.previous = index_after_removing(self.previous, idx).unwrap_or(fallback);
+        if self.previous == self.current {
+            let history_previous = self
+                .windows
+                .iter()
+                .find(|window| window.id == self.active_window)
+                .and_then(|window| {
+                    window
+                        .prev_buffers
+                        .iter()
+                        .find(|entry| entry.buffer != self.current)
+                        .map(|entry| entry.buffer)
+                });
+            self.previous = history_previous.unwrap_or(fallback);
         }
     }
 
@@ -1073,6 +1159,7 @@ impl App {
             return;
         }
         let dir = self.shell_directory();
+        self.shell_dir = Some(dir.clone());
         match shell::ShellProcess::spawn_with_profile(command, &dir, self.config.shell.program) {
             Ok(process) => {
                 self.shell_history.push(command);
@@ -1093,16 +1180,22 @@ impl App {
     }
 
     fn shell_directory(&self) -> PathBuf {
+        self.buffer_directory()
+            .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from(".")))
+    }
+
+    /// The directory associated with the current buffer, if it has one.
+    fn buffer_directory(&self) -> Option<PathBuf> {
         if let Some(dired) = &self.current().dired {
-            return dired.dir.clone();
+            return Some(dired.dir.clone());
         }
         match self.current().kind {
             Kind::File | Kind::Hexl => PathBuf::from(&self.current().name)
                 .parent()
                 .filter(|path| !path.as_os_str().is_empty())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from("."))),
-            _ => home_dir().unwrap_or_else(|| PathBuf::from(".")),
+                .map(Path::to_path_buf),
+            Kind::Shell => self.shell_dir.clone(),
+            _ => None,
         }
     }
 
@@ -1320,10 +1413,7 @@ impl App {
             self.buffers[idx].buffer.beginning_of_buffer();
         }
         let view = capture_view(&self.buffers[idx].buffer);
-        if let Some(window) = self.windows.iter_mut().find(|window| window.id == other) {
-            window.buffer = idx;
-            window.view = view;
-        }
+        self.set_window_buffer(other, idx, view);
     }
 
     // ---- dired -------------------------------------------------------------
@@ -1366,13 +1456,26 @@ impl App {
 
     /// Open (or switch to) a read-only view of `path`.
     fn open_file(&mut self, path: PathBuf) {
+        if let Some(idx) = self.find_or_create_file(path) {
+            self.switch_to(idx);
+        }
+    }
+
+    /// Open (or switch to) a read-only view of `path` in the other window.
+    fn open_file_other_window(&mut self, path: PathBuf) {
+        if let Some(idx) = self.find_or_create_file(path) {
+            self.switch_buffer_in_other_window(idx);
+        }
+    }
+
+    /// Find or create a read-only view of `path` without selecting it.
+    fn find_or_create_file(&mut self, path: PathBuf) -> Option<usize> {
         let name = path.display().to_string();
         if let Some(idx) = self.find_buffer(&name) {
-            self.switch_to(idx);
-            return;
+            return Some(idx);
         }
         match fs::read(&path) {
-            Ok(bytes) if file::looks_binary(&bytes) => self.open_hexl(path, bytes),
+            Ok(bytes) if file::looks_binary(&bytes) => self.find_or_create_hexl(path, bytes),
             Ok(bytes) => {
                 let raw = file::to_lines(&bytes);
                 let lines = match syntax::detect(&path) {
@@ -1380,21 +1483,20 @@ impl App {
                     None => raw.into_iter().map(Line::plain).collect(),
                 };
                 let buffer = Buffer::read_only_from(lines);
-                let idx = self.new_buffer(name, Kind::File, buffer);
-                self.switch_to(idx);
+                Some(self.new_buffer(name, Kind::File, buffer))
             }
             Err(err) => {
                 self.message = Some(format!("Cannot read {}: {err}", path.display()));
+                None
             }
         }
     }
 
-    /// Open (or switch to) a read-only hex view of a binary file.
-    fn open_hexl(&mut self, path: PathBuf, bytes: Vec<u8>) {
+    /// Find or create a read-only hex view of a binary file without selecting it.
+    fn find_or_create_hexl(&mut self, path: PathBuf, bytes: Vec<u8>) -> Option<usize> {
         let name = path.display().to_string();
         if let Some(idx) = self.find_buffer(&name) {
-            self.switch_to(idx);
-            return;
+            return Some(idx);
         }
         let truncated = bytes.len() > hexl::MAX_BYTES;
         let shown = &bytes[..bytes.len().min(hexl::MAX_BYTES)];
@@ -1410,7 +1512,6 @@ impl App {
         let buffer = Buffer::read_only_from(lines);
         let idx = self.new_buffer(name, Kind::Hexl, buffer);
         self.buffers[idx].hexl_width = Some(width);
-        self.switch_to(idx);
         if truncated {
             self.message = Some(format!(
                 "{} is large; showing the first {} bytes",
@@ -1418,6 +1519,7 @@ impl App {
                 hexl::MAX_BYTES
             ));
         }
+        Some(idx)
     }
 
     /// Put point on the first file line's name.
@@ -3581,6 +3683,7 @@ impl App {
             Prefix::CtrlX4 => match key.code {
                 KeyCode::Char('b') => self.start_switch_buffer(true),
                 KeyCode::Char('d') => self.start_find_file(true, true),
+                KeyCode::Char('f') => self.start_find_file(false, true),
                 KeyCode::Char('g') if ctrl => {}
                 _ => self.undefined("C-x 4", key),
             },
@@ -3855,10 +3958,7 @@ impl App {
         .max(1);
         self.resize_buffer_menu(idx, width);
         let view = capture_view(&self.buffers[idx].buffer);
-        if let Some(window) = self.windows.iter_mut().find(|window| window.id == other) {
-            window.buffer = idx;
-            window.view = view;
-        }
+        self.set_window_buffer(other, idx, view);
     }
 
     fn window_width(&self, id: WindowId) -> usize {
@@ -4275,13 +4375,11 @@ impl App {
         };
     }
 
-    /// The directory new prompts start in: the current Dired directory, or
-    /// the home directory.
+    /// The directory new prompts start in: the current buffer's directory, or
+    /// the home directory when it has none.
     fn default_directory(&self) -> PathBuf {
-        if let Some(d) = &self.current().dired {
-            return d.dir.clone();
-        }
-        home_dir().unwrap_or_else(|| PathBuf::from("."))
+        self.buffer_directory()
+            .unwrap_or_else(|| home_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
     /// Resolve a user-entered path against the default directory, expanding a
@@ -5552,7 +5650,11 @@ impl App {
                         self.message = Some(format!("Not a directory: {}", path.display()));
                     }
                 } else if path.exists() {
-                    self.open_file(path);
+                    if other_window {
+                        self.open_file_other_window(path);
+                    } else {
+                        self.open_file(path);
+                    }
                 } else {
                     self.message = Some(format!("No such file: {}", path.display()));
                 }
@@ -5661,10 +5763,10 @@ impl App {
         }
     }
 
-    /// The active prompt as (prompt line, cursor column, candidate list,
-    /// selected index).
+    /// The active prompt as (prompt line, cursor column, visible candidate
+    /// list, selected index within that list).
     pub fn prompt_view(&self) -> Option<(String, usize, Vec<String>, usize)> {
-        match &self.prompt {
+        let view = match &self.prompt {
             Prompt::None => None,
             Prompt::SwitchBuffer {
                 input,
@@ -5793,7 +5895,11 @@ impl App {
                 Vec::new(),
                 0,
             )),
-        }
+        };
+        view.map(|(prompt, cursor, candidates, selected)| {
+            let (candidates, selected) = visible_candidates(candidates, selected);
+            (prompt, cursor, candidates, selected)
+        })
     }
 
     fn previous_buffer_name(&self) -> String {
@@ -5813,7 +5919,7 @@ impl App {
         let prompt = self.prompt_view();
         let prompt_active = prompt.is_some();
         let desired = if let Some((_, _, candidates, _)) = prompt {
-            (1 + candidates.len().min(5)) as u16
+            (1 + candidates.len().min(PROMPT_CANDIDATE_ROWS)) as u16
         } else if self.search.active {
             1
         } else {
@@ -6434,6 +6540,16 @@ fn interval_gap(start: u32, end: u32, other_start: u32, other_end: u32) -> u32 {
     }
 }
 
+/// The index a buffer has after `removed` is deleted from the buffer vector.
+/// `None` means the index referred to the removed buffer.
+fn index_after_removing(index: usize, removed: usize) -> Option<usize> {
+    match index.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(index),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(index - 1),
+    }
+}
+
 fn capture_view(buffer: &Buffer) -> WindowView {
     WindowView {
         point: buffer.point(),
@@ -6823,6 +6939,27 @@ fn select_move(selected: Option<usize>, count: usize, delta: isize) -> Option<us
     Some(next)
 }
 
+/// Trim a completion list to the visible rows around `selected`, keeping the
+/// highlight centered until it reaches either end of the list. The returned
+/// selection is an index into the trimmed list; `usize::MAX` means none.
+fn visible_candidates(candidates: Vec<String>, selected: usize) -> (Vec<String>, usize) {
+    if candidates.len() <= PROMPT_CANDIDATE_ROWS {
+        return (candidates, selected);
+    }
+    let index = (selected != usize::MAX && selected < candidates.len()).then_some(selected);
+    let offset = index
+        .map(|i| {
+            i.saturating_sub(PROMPT_CANDIDATE_ROWS / 2)
+                .min(candidates.len() - PROMPT_CANDIDATE_ROWS)
+        })
+        .unwrap_or(0);
+    let selected = index.map(|i| i - offset).unwrap_or(usize::MAX);
+    (
+        candidates[offset..offset + PROMPT_CANDIDATE_ROWS].to_vec(),
+        selected,
+    )
+}
+
 /// Whether `key` is a motion command that should leave isearch and run.
 fn isearch_motion(key: KeyEvent) -> bool {
     use Action::*;
@@ -7120,6 +7257,7 @@ fn scratch_lines() -> Vec<String> {
         "  C-x C-b        list buffers".to_string(),
         "  C-x 4 b        switch buffers in the other window".to_string(),
         "  C-x 4 d        open a directory in Dired in the other window".to_string(),
+        "  C-x 4 f        find a file in the other window".to_string(),
         "  M-!            run a shell command (TAB completes)".to_string(),
         "  C-x k          kill a buffer".to_string(),
         "  C-x C-c        quit".to_string(),
@@ -7218,6 +7356,7 @@ fn help_lines() -> Vec<String> {
         "  C-x C-f        find file (visit a file by path; TAB completes)",
         "  C-x d          open a directory in Dired",
         "  C-x 4 d        open a directory in Dired in the other window",
+        "  C-x 4 f        find a file in the other window",
         "  C-x b          switch buffer",
         "  C-x C-b        list buffers",
         "  C-x k          kill buffer",
@@ -7987,6 +8126,44 @@ mod tests {
     }
 
     #[test]
+    fn c_x_4_f_opens_a_file_in_the_other_window() {
+        let dir = temp_dir("file-other-window");
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"hello\n").unwrap();
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(100, 20);
+        let first = app.active_window;
+        let first_buffer = app.current;
+
+        ctrl_x(&mut app, '4');
+        press(&mut app, 'f');
+        assert!(matches!(
+            app.prompt,
+            Prompt::FindFile {
+                dired: false,
+                other_window: true,
+                ..
+            }
+        ));
+        assert!(app.prompt_view().unwrap().0.starts_with("Find file: "));
+        if let Prompt::FindFile { input, cursor, .. } = &mut app.prompt {
+            *input = String::new();
+            *cursor = 0;
+        }
+        type_into_prompt(&mut app, &file.display().to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.windows.len(), 2);
+        assert_eq!(only_split_axis(&app), SplitAxis::Right);
+        assert_ne!(app.active_window, first);
+        assert_eq!(app.current().kind, Kind::File);
+        assert_eq!(app.current().name, file.display().to_string());
+        assert_eq!(app.window(first).unwrap().buffer, first_buffer);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn split_windows_render_both_mode_lines() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -8073,6 +8250,107 @@ mod tests {
             .iter()
             .any(|w| app.buffers[w.buffer].name == dir.display().to_string()));
         assert_eq!(app.current, app.window(app.active_window).unwrap().buffer);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn killing_the_current_buffer_returns_to_the_previous_buffer() {
+        let dir = temp_dir("kill-previous");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.open_dired(dir.clone());
+        let dired = app.current;
+        app.open_file(file);
+        assert_eq!(app.current().kind, Kind::File);
+
+        // Create *Messages* after the file without switching away. A
+        // vector-order fallback would pick it instead of the previous buffer.
+        ctrl_h(&mut app, 'e');
+        assert_eq!(app.current().kind, Kind::File);
+
+        ctrl_x(&mut app, 'k');
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.current, dired);
+        assert_eq!(app.current().kind, Kind::Dired);
+        assert!(app.windows.iter().all(|w| w.buffer < app.buffers.len()));
+        assert_eq!(app.current, app.window(app.active_window).unwrap().buffer);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn killing_a_buffer_returns_each_window_to_its_own_previous_buffer() {
+        let dir = temp_dir("kill-per-window");
+        let file = dir.join("shared.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(100, 20);
+        app.open_dired(dir.clone());
+        let dired_name = app.current().name.clone();
+        let dired_window = app.active_window;
+
+        // Window B: Dired -> *scratch*.
+        switch_to_scratch_in_other_window(&mut app);
+        let scratch_window = app.active_window;
+        assert_eq!(app.current().kind, Kind::Scratch);
+
+        // Window A: Dired -> the file.
+        app.select_window(dired_window);
+        app.open_file(file);
+        let file = app.current;
+        assert_eq!(app.window(dired_window).unwrap().buffer, file);
+
+        // Window B: *scratch* -> the same file.
+        app.select_window(scratch_window);
+        app.switch_to(file);
+        assert_eq!(app.window(scratch_window).unwrap().buffer, file);
+        assert_eq!(app.window(dired_window).unwrap().buffer, file);
+
+        app.kill_buffer(file);
+
+        assert_eq!(
+            app.buffers[app.window(dired_window).unwrap().buffer].name,
+            dired_name
+        );
+        assert_eq!(
+            app.buffers[app.window(scratch_window).unwrap().buffer].kind,
+            Kind::Scratch
+        );
+        assert_eq!(app.current, app.window(app.active_window).unwrap().buffer);
+        assert_eq!(app.current().kind, Kind::Scratch);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn killing_a_buffer_restores_the_windows_saved_view() {
+        let dir = temp_dir("kill-view");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut app = App::new(Config::default());
+        app.prepare_active_view(80, 20);
+        app.open_dired(dir.clone());
+        let first = app
+            .current()
+            .dired
+            .as_ref()
+            .unwrap()
+            .first_file_row()
+            .unwrap();
+        app.current_mut().buffer.set_point(Pos::new(first + 1, 0));
+        let saved = app.current().buffer.point();
+
+        app.open_file(b);
+        ctrl_x(&mut app, 'k');
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.current().kind, Kind::Dired);
+        assert_eq!(app.current().buffer.point(), saved);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -9000,6 +9278,62 @@ mod tests {
     }
 
     #[test]
+    fn cx_d_defaults_to_the_current_files_directory() {
+        let dir = temp_dir("cxd-file-dir");
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, b"hi\n").unwrap();
+
+        let mut app = App::new(Config::default());
+        app.open_file(file);
+        ctrl_x(&mut app, 'd');
+        let Prompt::FindFile { input, .. } = &app.prompt else {
+            panic!("expected the find-file prompt");
+        };
+        assert_eq!(
+            input,
+            &format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cx_d_defaults_to_the_shell_output_buffers_directory() {
+        let dir = temp_dir("cxd-shell-dir");
+        // Use the lightweight platform shell rather than the default
+        // PowerShell, whose startup would compete with the completion tests.
+        #[cfg(windows)]
+        let (program, command) = (
+            shell::ShellProgram::Cmd,
+            "echo one& echo two& echo three& echo four& echo five& echo six",
+        );
+        #[cfg(not(windows))]
+        let (program, command) = (
+            shell::ShellProgram::Unix,
+            "echo one; echo two; echo three; echo four; echo five; echo six",
+        );
+        let mut config = Config::default();
+        config.shell.program = program;
+        let mut app = App::new(config);
+        app.open_dired(dir.clone());
+        enter_shell_command(&mut app, command);
+        wait_for_shell(&mut app);
+        let idx = app.find_buffer(shell::OUTPUT_BUFFER).unwrap();
+        app.switch_to(idx);
+
+        ctrl_x(&mut app, 'd');
+        let Prompt::FindFile { input, .. } = &app.prompt else {
+            panic!("expected the find-file prompt");
+        };
+        assert_eq!(
+            input,
+            &format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn select_move_clamps_at_edges() {
         assert_eq!(select_move(None, 3, 1), Some(0));
         assert_eq!(select_move(None, 3, -1), Some(2));
@@ -9007,6 +9341,68 @@ mod tests {
         assert_eq!(select_move(Some(0), 3, 1), Some(1));
         assert_eq!(select_move(Some(2), 3, 1), Some(2));
         assert_eq!(select_move(Some(1), 0, 1), None);
+    }
+
+    #[test]
+    fn visible_candidates_centers_and_clamps_the_selection() {
+        let names = |n: usize| (0..n).map(|i| format!("d{i:02}")).collect::<Vec<_>>();
+
+        let (shown, selected) = visible_candidates(names(10), usize::MAX);
+        assert_eq!(shown, names(5));
+        assert_eq!(selected, usize::MAX);
+
+        let (shown, selected) = visible_candidates(names(10), 0);
+        assert_eq!(shown, names(5));
+        assert_eq!(selected, 0);
+
+        let (_, selected) = visible_candidates(names(10), 2);
+        assert_eq!(selected, 2);
+
+        let (shown, selected) = visible_candidates(names(10), 5);
+        assert_eq!(shown, names(10)[3..8].to_vec());
+        assert_eq!(selected, 2);
+
+        let (shown, selected) = visible_candidates(names(10), 9);
+        assert_eq!(shown, names(10)[5..10].to_vec());
+        assert_eq!(selected, 4);
+
+        let (shown, selected) = visible_candidates(names(3), 1);
+        assert_eq!(shown, names(3));
+        assert_eq!(selected, 1);
+    }
+
+    #[test]
+    fn cx_d_candidate_list_scrolls_to_keep_the_selection_visible() {
+        let dir = temp_dir("cxd-scroll");
+        for i in 0..10 {
+            std::fs::create_dir(dir.join(format!("d{i:02}"))).unwrap();
+        }
+
+        let mut app = App::new(Config::default());
+        ctrl_x(&mut app, 'd');
+        if let Prompt::FindFile { input, cursor, .. } = &mut app.prompt {
+            *input = directory_input(&dir);
+            *cursor = input.chars().count();
+        }
+        for _ in 0..8 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let separator = std::path::MAIN_SEPARATOR;
+        let (_, _, candidates, selected) = app.prompt_view().unwrap();
+        assert_eq!(candidates.len(), PROMPT_CANDIDATE_ROWS);
+        assert_eq!(selected, 2);
+        assert!(candidates[0].ends_with(&format!("d05{separator}")));
+        assert!(candidates[selected].ends_with(&format!("d07{separator}")));
+
+        for _ in 0..2 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let (_, _, candidates, selected) = app.prompt_view().unwrap();
+        assert_eq!(candidates.len(), PROMPT_CANDIDATE_ROWS);
+        assert_eq!(selected, 4);
+        assert!(candidates[selected].ends_with(&format!("d09{separator}")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
