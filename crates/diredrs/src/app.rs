@@ -4542,25 +4542,24 @@ impl App {
                 let result = self
                     .ensure_powershell_completer()
                     .map(|completer| completer.command_names());
-                let names = match result {
-                    Some(Ok(names)) => names,
-                    Some(Err(_)) => {
-                        self.powershell_completer = None;
-                        Vec::new()
-                    }
-                    None => Vec::new(),
-                };
-                self.powershell_commands = Some(names);
+                match result {
+                    Some(Ok(names)) => self.powershell_commands = Some(names),
+                    Some(Err(_)) => self.powershell_completer = None,
+                    None => {}
+                }
             }
             let prefix_lower = prefix.to_lowercase();
-            let names = self.powershell_commands.as_ref().expect("just loaded");
             let mut seen = HashSet::new();
-            let mut out: Vec<String> = names
-                .iter()
-                .filter(|name| name.to_lowercase().starts_with(&prefix_lower))
-                .filter(|name| seen.insert(name.to_lowercase()))
-                .cloned()
-                .collect();
+            let mut out: Vec<String> = Vec::new();
+            if let Some(names) = &self.powershell_commands {
+                for name in names {
+                    if name.to_lowercase().starts_with(&prefix_lower)
+                        && seen.insert(name.to_lowercase())
+                    {
+                        out.push(name.clone());
+                    }
+                }
+            }
             for name in self.path_command_candidates(prefix, false) {
                 if seen.insert(name.to_lowercase()) {
                     out.push(name);

@@ -47,6 +47,10 @@ const FINAL_READ: Duration = Duration::from_millis(100);
 /// up and asks for a fresh worker.
 const POWERSHELL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the first request may take. It includes PowerShell startup, the
+/// completion-engine warmup, and any command-name preload.
+const POWERSHELL_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 const POWERSHELL_COMPLETION_BEGIN: &str = "__DIREDRS_COMPLETE_BEGIN__";
 const POWERSHELL_COMPLETION_END: &str = "__DIREDRS_COMPLETE_END__";
 
@@ -365,6 +369,8 @@ pub struct PowerShellCompleter {
     stdin: ChildStdin,
     lines: Receiver<io::Result<String>>,
     reader: Option<thread::JoinHandle<()>>,
+    /// Whether the worker has answered a request yet.
+    has_responded: bool,
 }
 
 impl PowerShellCompleter {
@@ -414,6 +420,7 @@ impl PowerShellCompleter {
             stdin,
             lines,
             reader: Some(reader),
+            has_responded: false,
         })
     }
 
@@ -455,7 +462,12 @@ impl PowerShellCompleter {
     }
 
     fn read_response(&mut self) -> io::Result<Vec<PowershellCompletion>> {
-        let deadline = Instant::now() + POWERSHELL_COMPLETION_TIMEOUT;
+        let timeout = if self.has_responded {
+            POWERSHELL_COMPLETION_TIMEOUT
+        } else {
+            POWERSHELL_STARTUP_TIMEOUT
+        };
+        let deadline = Instant::now() + timeout;
         let mut in_response = false;
         let mut completions = Vec::new();
         loop {
@@ -469,6 +481,7 @@ impl PowerShellCompleter {
                         continue;
                     }
                     if line == POWERSHELL_COMPLETION_END {
+                        self.has_responded = true;
                         return Ok(completions);
                     }
                     if let Some(completion) = parse_powershell_completion(&line) {
