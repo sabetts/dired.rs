@@ -6355,7 +6355,7 @@ impl App {
         }
         let direction = self.search.direction;
         let point = self.current().buffer.point();
-        let from = if advance {
+        let mut from = if advance {
             step_point(point, direction)
         } else if let Some(origin) = self.search.origin {
             if point == origin && self.search.failed {
@@ -6366,6 +6366,10 @@ impl App {
         } else {
             point
         };
+        if !advance && direction == SearchDirection::Backward {
+            let needle_len = query.to_lowercase().chars().count();
+            from = Pos::new(from.row, from.col + needle_len);
+        }
         let forward = direction == SearchDirection::Forward;
         match self.current().buffer.search(&query, from, forward) {
             Some((pos, len)) => {
@@ -11233,6 +11237,27 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.search.active);
         assert_eq!(app.current().buffer.point(), Pos::new(3, 6));
+    }
+
+    #[test]
+    fn backward_search_keeps_matching_when_query_extends() {
+        let mut app = App::new(Config::default());
+        if let Some(i) = app.buffers.iter().position(|b| b.kind == Kind::Scratch) {
+            app.switch_to(i);
+        }
+        app.current_mut().buffer.set_content(vec![
+            Line::plain("abbott"),
+            Line::plain("middle"),
+            Line::plain("abc"),
+        ]);
+        app.current_mut().buffer.end_of_buffer();
+        ctrl(&mut app, 'r');
+        press(&mut app, 'a');
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
+        press(&mut app, 'b');
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
+        press(&mut app, 'c');
+        assert_eq!(app.current().buffer.point(), Pos::new(2, 0));
     }
 
     #[test]
